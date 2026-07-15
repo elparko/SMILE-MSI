@@ -252,6 +252,16 @@ def _run_find_spatial(ds, inp, p):
         progress=inp.get("progress"))
 
 
+def _run_find_coherent(ds, inp, p):
+    from . import spatial
+    return spatial.find_coherent_features(
+        ds, snr=p["snr"], min_rel_intensity=p.get("min_rel_intensity", 0.0),
+        min_frequency=p["min_frequency"], min_morans=p.get("min_morans", 0.0),
+        min_quality=p["min_quality"], max_hotspot=p["max_hotspot"],
+        tol_ppm=p["tol_ppm"], norm=p["norm"], mask=inp.get("mask"),
+        progress=inp.get("progress"))
+
+
 def _run_find_peaks(ds, inp, p):
     return ds.pick_peaks(snr=p["snr"], min_rel_intensity=p.get("min_rel_intensity", 0.0),
                          max_peaks=int(p.get("max_peaks", 500)),
@@ -777,6 +787,26 @@ _register(StepDef(
     rep_ions=lambda r, n, ds=None: [(float(p["mz"]), str(p.get("label", "")),
                                      float(p.get("morans_i", 0.0) or 0.0)) for p in r.peaks[:int(n)]],
     summary=lambda r: f"{len(r.peaks)} spatial features (of {r.n_candidates} candidates)"))
+
+_register(StepDef(
+    id="find_coherent_features", name="Coherent feature extraction", category="Peaks",
+    needs=set(), produces={"peaks"}, targets={"slide"}, uses_mask=True,
+    result_kind="features", view="Ion image",
+    help="Spatial feature detection (S/N → reproducibility → Moran's I) plus an artifact-rejection quality gate (spatial-chaos morphology + hotspot concentration) that screens out delocalization / matrix-crystal ions which pass autocorrelation but aren't real. Produces a working feature set.",
+    params=[ParamSpec("snr", "Signal-to-noise", "float", 3.0, lo=0, hi=50, step=0.5),
+            ParamSpec("min_rel_intensity", "Min rel. intensity", "float", 0.002, lo=0, hi=0.1, step=0.001),
+            ParamSpec("min_frequency", "Min pixel frequency", "float", 0.01, lo=0, hi=1, step=0.01),
+            ParamSpec("min_morans", "Min Moran's I", "float", 0.0, lo=0, hi=1, step=0.01),
+            ParamSpec("min_quality", "Min quality", "float", 0.15, lo=0, hi=1, step=0.01),
+            ParamSpec("max_hotspot", "Max hotspot fraction", "float", 0.80, lo=0, hi=1, step=0.05),
+            _p_tol(10.0), _p_norm()],
+    run=_run_find_coherent,
+    peaks=lambda r: list(r.peaks),
+    produce=lambda r: {"peaks": _mz_list(r.peaks)},
+    to_table=lambda r: _df(r.peaks),
+    rep_ions=lambda r, n, ds=None: [(float(p["mz"]), str(p.get("label", "")),
+                                     float(p.get("quality", 0.0) or 0.0)) for p in r.peaks[:int(n)]],
+    summary=lambda r: f"{len(r.peaks)} coherent features (of {r.n_candidates} candidates; {r.n_after_spatial} spatial)"))
 
 _register(StepDef(
     id="find_peaks", name="Find peaks", category="Peaks",

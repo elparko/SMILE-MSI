@@ -1108,6 +1108,114 @@ def find_spatial_features(ds, snr: float = 3.0, min_rel_intensity: float = 0.0,
     return SpatialFeatures(out, len(cand), n_after_freq, n_spatial, suggested, params, n_collapsed)
 
 
+# --------------------------------------------------------------------------- #
+# Coherent feature extraction — spatial finder + artifact-rejection quality gate
+# --------------------------------------------------------------------------- #
+@dataclass
+class CoherentFeatures:
+    """Result of :func:`find_coherent_features` — spatially-coherent, artifact-screened
+    features plus the drop count at each pipeline stage (the detection funnel)."""
+    peaks: list                  # enriched dicts, descending composite quality
+    n_candidates: int            # candidate peaks detected
+    n_after_spatial: int         # survived find_spatial_features (freq + Moran's + isotope)
+    n_after_quality: int         # survived the artifact-rejection quality gate (== len(peaks))
+    suggested_ppm: float         # median auto-width of the survivors (NaN if none)
+    params: dict
+
+
+def _composite_quality(morans, chaos, hotspot) -> float:
+    """Fuse the per-ion spatial metrics into one quality score in ``[0, 1]``.
+
+    ``structure`` is the mean of the available structure signals — Moran's I
+    (autocorrelation, clipped to ``[0, 1]``) and the level-set spatial-chaos ρ
+    (morphology; ``NaN`` when the ion has too few pixels, then dropped from the mean).
+    The **hotspot** fraction (share of signal in the brightest ~1% of pixels; high = a
+    delocalization / matrix-crystallization artifact whose signal collapses onto a few
+    pixels) multiplies the structure down: a well-spread ion (hotspot≈0) keeps its
+    structure score, while an ion that clears Moran's yet dumps its signal into a handful
+    of pixels (hotspot→1) is driven toward 0. Returns ``structure * (1 - hotspot)``.
+    """
+    m = float(np.clip(morans, 0.0, 1.0))
+    parts = [m]
+    if chaos is not None and np.isfinite(chaos):
+        parts.append(float(np.clip(chaos, 0.0, 1.0)))
+    structure = float(np.mean(parts))
+    h = 0.0 if (hotspot is None or not np.isfinite(hotspot)) else float(np.clip(hotspot, 0.0, 1.0))
+    return structure * (1.0 - h)
+
+
+def find_coherent_features(ds, *, snr: float = 3.0, min_rel_intensity: float = 0.0,
+                           max_candidates: int = 2000, min_frequency: float = 0.01,
+                           min_morans: float = 0.0, min_quality: float = 0.15,
+                           max_hotspot: float = 0.80, tol_ppm: float = DEFAULT_TOL_PPM,
+                           norm: str = "tic", reduce: str = "sum", mask=None,
+                           projection: str = "mean", collapse_isotopes: bool = True,
+                           charge: int = 1, rescue_frequency: float | None = None,
+                           iso_tol_ppm: float | None = None, progress=None) -> CoherentFeatures:
+    """Coherent feature extraction — a spatially-aware peak picker that adds an
+    **artifact-rejection quality gate** on top of :func:`find_spatial_features`.
+
+    Independent implementation composed from published primitives (spatial
+    autocorrelation, frequency gating, level-set spatial-chaos, hotspot concentration,
+    isotope collapse); it is *not* a re-implementation of, and shares no code with, any
+    vendor's feature finder.
+
+    Pipeline:
+
+    1. :func:`find_spatial_features` — candidate detection (mean / skyline / both),
+       reproducibility (frequency) gate, Moran's-I spatial denoise, and isotope collapse
+       (one compound → one feature). This yields the spatially-coherent feature set.
+    2. **Artifact rejection** — score each survivor's *morphology* with the level-set
+       spatial-chaos ρ (:func:`spatial_chaos`; high = organized) and its **hotspot
+       concentration** (:func:`hotspot_fraction`; high = a delocalization / matrix
+       artifact). A smoothly-delocalized matrix ion can *pass* Moran's I — it is spatially
+       autocorrelated — yet be junk; hotspot/chaos catch what autocorrelation alone misses.
+    3. **Composite quality** in ``[0, 1]`` (:func:`_composite_quality`) fuses Moran's I,
+       chaos and the hotspot penalty; features below ``min_quality`` or above
+       ``max_hotspot`` are dropped.
+
+    Surviving ``peaks`` carry ``quality``, ``spatial_chaos`` and ``hotspot_fraction``
+    alongside every field :func:`find_spatial_features` sets, sorted by descending
+    quality and extracted **region-complete** over every pixel (the cached dense
+    ``pixels × features`` matrix — no missing values). Returns a :class:`CoherentFeatures`.
+    """
+    sf = find_spatial_features(
+        ds, snr=snr, min_rel_intensity=min_rel_intensity, max_candidates=max_candidates,
+        min_frequency=min_frequency, min_morans=min_morans, tol_ppm=tol_ppm, norm=norm,
+        reduce=reduce, mask=mask, projection=projection, rescue_frequency=rescue_frequency,
+        collapse_isotopes=collapse_isotopes, charge=charge, iso_tol_ppm=iso_tol_ppm,
+        progress=_stage(progress, 0, 70))
+    params = dict(sf.params)
+    params.update(min_quality=min_quality, max_hotspot=max_hotspot, stage="coherent")
+    survivors = sf.peaks
+    if not survivors:
+        return CoherentFeatures([], sf.n_candidates, 0, 0, float("nan"), params)
+    mzs = [float(p["mz"]) for p in survivors]
+    chaos = spatial_chaos(ds, mzs, tol_ppm=tol_ppm, norm=norm)
+    if progress is not None:
+        progress(88, 100)
+    hot = hotspot_fraction(ds, mzs, tol_ppm=tol_ppm, reduce=reduce)
+    if progress is not None:
+        progress(96, 100)
+    out, widths = [], []
+    for p, c, h in zip(survivors, chaos, hot):
+        q = _composite_quality(p.get("morans_i", 0.0), c, h)
+        if q < min_quality or (np.isfinite(h) and h > max_hotspot):
+            continue
+        d = dict(p)
+        d["spatial_chaos"] = float(c) if np.isfinite(c) else float("nan")
+        d["hotspot_fraction"] = float(h)
+        d["quality"] = float(q)
+        out.append(d)
+        if "width_ppm" in d and np.isfinite(d["width_ppm"]):
+            widths.append(float(d["width_ppm"]))
+    out.sort(key=lambda d: d["quality"], reverse=True)
+    suggested = float(np.median(widths)) if widths else sf.suggested_ppm
+    if progress is not None:
+        progress(100, 100)
+    return CoherentFeatures(out, sf.n_candidates, len(survivors), len(out), suggested, params)
+
+
 def _silhouette(scores, labels):
     from sklearn.metrics import silhouette_score
 

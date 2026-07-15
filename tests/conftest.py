@@ -99,3 +99,23 @@ def _auto_accept_confirm(monkeypatch):
         module = sys.modules.get(f"smile_msi.gui.{mod}")
         if module is not None and hasattr(module, "confirm"):
             monkeypatch.setattr(module, "confirm", lambda *a, **k: True)
+
+
+@pytest.fixture(autouse=True)
+def _close_matplotlib_figures():
+    """Close every matplotlib figure after each test.
+
+    GUI dialogs embed matplotlib canvases as ``FigureCanvasQTAgg``. When a dialog is
+    closed/gc'd its C++ canvas is destroyed, but the ``Figure`` lingers in pyplot's global
+    registry (``Gcf``); a later gc or pyplot call then touches the dead C++ object and raises
+    "Internal C++ object (FigureCanvasQTAgg) already deleted", which crashes the whole
+    per-process test batch in CI (a spurious rc≠0). Clearing the registry after each test
+    breaks that race. Runs only if pyplot was actually imported, so pure-engine tests never
+    pull matplotlib in."""
+    yield
+    plt = sys.modules.get("matplotlib.pyplot")
+    if plt is not None:
+        try:
+            plt.close("all")
+        except Exception:  # noqa: BLE001
+            pass

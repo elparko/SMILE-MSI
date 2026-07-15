@@ -1128,7 +1128,19 @@ def group_comparison(table, group_a: str, group_b: str, method: str = "mwu",
             raise ValueError("paired=True requires pair_by=<metadata key> to match samples "
                              "across the two groups")
     elif m in ("mwu", "mannwhitney", "mann-whitney", "rank"):
-        test, test_name = lambda a, b: mannwhitneyu(a, b, alternative="two-sided")[1], "Mann-Whitney U"
+        def test(a, b):
+            # When every observation across both groups is tied (a constant, detected
+            # feature with no between-group difference), the U-statistic's variance is 0.
+            # scipy's normal approximation returns p=1.0 on some versions but NaN on newer
+            # ones (≥1.16) — and a NaN here flips the feature to "untestable" (see the
+            # np.isfinite gate below), silently changing n_testable on a dependency bump.
+            # There is no evidence of a location shift, so report 1.0 deterministically.
+            a = np.asarray(a, dtype=float)
+            b = np.asarray(b, dtype=float)
+            if a.size and b.size and np.ptp(np.concatenate([a, b])) == 0.0:
+                return 1.0
+            return mannwhitneyu(a, b, alternative="two-sided")[1]
+        test_name = "Mann-Whitney U"
     elif m in ("welch", "t", "ttest", "t-test"):
         test, test_name = lambda a, b: ttest_ind(a, b, equal_var=False).pvalue, "Welch's t-test"
     elif m in ("student", "pooled", "ttest_equal"):
