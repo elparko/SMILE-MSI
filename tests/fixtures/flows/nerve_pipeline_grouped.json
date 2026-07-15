@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "name": "Grouped-ROI pipeline (fixture)",
+  "target": "slide",
+  "scope_region": "@grouped",
+  "on_error": "stop",
+  "log_to_report": true,
+  "export_bundle": false,
+  "rep_top_n": 15,
+  "bundle_dir": "",
+  "steps": [
+    {
+      "type": "find_spatial_features",
+      "enabled": true,
+      "params": {"snr": 3.0, "min_rel_intensity": 0.002, "min_frequency": 0.005,
+                 "min_morans": 0.05, "tol_ppm": 10.0, "norm": "tic"}
+    },
+    {
+      "type": "annotate",
+      "enabled": true,
+      "params": {"mode": "negative", "match_ppm": 10.0, "image_ppm": 10.0, "norm": "tic"}
+    },
+    {
+      "type": "auto_segment",
+      "enabled": true,
+      "params": {"n_clusters": 0, "spatial": true, "spatial_sigma": 1.0,
+                 "tol_ppm": 50.0, "norm": "tic"}
+    },
+    {
+      "type": "roi_comparison",
+      "enabled": true,
+      "params": {"method": "mwu", "tol_ppm": 10.0, "norm": "tic"}
+    },
+    {
+      "type": "pca",
+      "enabled": true,
+      "params": {"n_components": 5, "tol_ppm": 50.0, "norm": "tic"}
+    }
+  ]
+}

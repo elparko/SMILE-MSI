@@ -1,0 +1,86 @@
+name: build-app
+
+# Build standalone SMILE MSI desktop bundles (PyInstaller runs on each OS — it does not
+# cross-compile). Push a version tag (e.g. `git tag v0.3.1 && git push --tags`) to build
+# Windows + macOS bundles and publish them to a GitHub Release for download. A manual
+# "Run workflow" builds the same bundles and uploads them as artifacts (no release).
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write          # create the Release and upload the bundles to it
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: SMILE-MSI-windows
+          - os: macos-latest
+            asset: SMILE-MSI-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install (gui + build + embed)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gui,build,embed,shap]"  # embed = real UMAP (numba/llvmlite); shap = SHAP biomarkers, frozen in (explain.py can't self-install in a bundle)
+      - name: Freeze with PyInstaller
+        run: pyinstaller --noconfirm smile_msi.spec
+
+      # Gate: launch the FROZEN bundle headless and build the main window. Fails the build
+      # if a hidden import is missing from the bundle, before it ever reaches a release.
+      - name: Smoke-test the frozen bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          SMILE_MSI_SELFTEST: "1"
+          QT_QPA_PLATFORM: offscreen
+        # A windowed (console=False) exe detaches from the shell, so $LASTEXITCODE is
+        # unreliable — Start-Process -Wait blocks until it exits and -PassThru exposes the
+        # real code (the self-test os._exit(0)s once the import + window build succeed).
+        run: |
+          $p = Start-Process -FilePath "dist/SMILE MSI/SMILE MSI.exe" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "frozen bundle self-test failed (exit $($p.ExitCode))" }
+      - name: Smoke-test the frozen bundle (macOS)
+        if: runner.os == 'macOS'
+        env:
+          SMILE_MSI_SELFTEST: "1"
+          QT_QPA_PLATFORM: offscreen
+        # Quote the path (the block scalar passes the quotes through to bash) — the space in
+        # "SMILE MSI" would otherwise split into two non-existent words.
+        run: |
+          "dist/SMILE MSI/SMILE MSI"
+
+      - name: Zip bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/SMILE MSI" -DestinationPath "${{ matrix.asset }}.zip"
+      - name: Zip bundle (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent "dist/SMILE MSI.app" "${{ matrix.asset }}.zip"
+
+      # Always keep the build as a downloadable artifact (covers manual/non-tag runs).
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.zip
+
+      # On a version tag, attach the bundle to a GitHub Release (created if absent) so it
+      # has a permanent public download link. Both OS jobs upload to the same tag's release.
+      - name: Publish to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

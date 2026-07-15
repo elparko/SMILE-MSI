@@ -1,0 +1,118 @@
+[project]
+name = "smile-msi"
+dynamic = ["version"]            # read from smile_msi/__init__.py __version__ (see [tool.hatch.version])
+description = "Open-source MALDI-MSI analysis (a desktop imaging workspace): imzML imaging, segmentation, co-localization, exact ROI statistics, and in-silico lipid annotation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "openpyxl>=3.1",
+    "pyimzml>=1.5",
+    "scikit-learn>=1.2",
+    "matplotlib>=3.6",
+    "pillow>=9",
+    # Nested/hierarchical cohort statistics (hierstats.py): the per-feature mixed model
+    # `y ~ group * compartment + (1 | subject)` is statsmodels' MixedLM. Core, not an extra —
+    # a nested design that silently degraded to an un-nested test on the frozen Windows build
+    # would be worse than a bigger bundle.
+    "statsmodels>=0.14",
+    # UMAP is core: the embedding views/analyses default to it (the kidney atlas method),
+    # and a graceful t-SNE fallback used to silently mask it being absent. Pulls in
+    # numba+llvmlite (heavier install) but guarantees "UMAP" actually runs UMAP everywhere.
+    "umap-learn>=0.5",
+    # numba is transitive (via umap-learn) but MUST carry a floor. Without one, on Python
+    # 3.12+ the resolver prefers the newest numpy (2.5, which needs 3.12+) and, because
+    # numba<0.61 caps numpy, walks numba all the way back to 0.53.1 — whose llvmlite 0.36
+    # has no wheel past cp39, so the install tries to compile llvmlite from source and dies
+    # on any box without LLVM+MSVC (the "numba/llvmlite build fails on Windows" report).
+    # A floor keeps numba 0.66 (wheels through cp314) and lets it cap numpy to a wheel build.
+    "numba>=0.61",
+    # Chunked, lazily-read m/z cube cache (cubestore.py): the fast-ion sidecar is a Zarr
+    # ZipStore so reopening a slide reads only the chunks an ion window touches instead of
+    # materialising the whole cube in RAM. Pinned to the zarr v2 API (v3 reorganised modules
+    # and changed ZipStore semantics); numcodecs supplies the Blosc/zstd compressor.
+    "zarr>=2.17,<3",
+    "numcodecs>=0.12",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PySide6-Essentials>=6.6",
+    "pyqtgraph>=0.13",
+    # macOS only: lets us rename the menu-bar app menu / Dock from "Python" to "SMILE MSI"
+    # when running unbundled (python -m smile_msi.gui). The .app launcher uses `exec -a`.
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    "qtawesome>=1.4.2",
+]
+embed = ["umap-learn>=0.5"]
+# SHAP biomarker discovery (explain.py): supervised RandomForest + TreeExplainer.
+# Optional — heavy (numba/llvmlite, already pulled by umap) — so kept out of the core install.
+shap = ["shap>=0.44"]
+# UMAP Studio (umapstudio.py) renders its density figures with an in-house NumPy/SciPy
+# categorical compositor (no heavy dep needed). This optional extra only upgrades the
+# many-category palette to the reference perceptually-spaced glasbey sequence; without it
+# a golden-ratio fallback is used, so the feature degrades gracefully.
+studio = ["colorcet>=3.0"]
+# Standards round-trip (standards.py): submit to / pull annotations from METASPACE. Lazy-imported;
+# absent → a clear install error (no silent fallback).
+metaspace = ["metaspace2020>=2.0"]
+# Multimodal registration (registration.py): optional elastic/deformable + intensity-based path.
+# The landmark→affine core is pure NumPy and needs neither of these. Lazy-imported.
+register = ["scikit-image>=0.21", "SimpleITK>=2.3"]
+# Single-cell segmentation (singlecell.py): optional DL backends; the watershed default is
+# pure NumPy/SciPy. Lazy-imported with a clear install error.
+cells = ["cellpose>=3.0", "stardist>=0.9"]
+# 3-D volume rendering (volume3d.py): optional GL volume; numpy MIP/orthoslice is the default.
+viz3d = ["pyqtgraph>=0.13", "PyOpenGL>=3.1"]
+# Spatial multi-omics import (comap.py): optional AnnData/.h5ad reader; generic CSV is core.
+spatialomics = ["anndata>=0.10"]
+# Learned ion-image embeddings (ionembed.py): self-supervised contrastive encoder. Heavy;
+# lazy-imported and REQUIRED for colocalize(method="learned") — no silent fallback to Pearson.
+ion-embed = ["torch>=2.2"]
+build = ["pyinstaller>=6.0"]
+dev = ["pytest>=7", "pytest-timeout>=2.1", "shap>=0.44"]
+
+[project.scripts]
+smile-msi = "smile_msi.cli:main"
+smile-msi-gui = "smile_msi.gui:boot"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+# Segmented test suite so day-to-day dev never waits on the slow Qt tests.
+#   pytest -m "not gui"     → the fast pure-engine suite (no Qt) — seconds, the default dev loop
+#   pytest -m gui           → the GUI tests (build a Qt MainWindow) — slower, run before a PR
+#   pytest -m "gui and not slow"  → GUI tests minus the heavy compute (UMAP/SHAP/cohort/3D)
+#   pytest tests/test_analysis_dialog.py   → just the area you're working on
+# The `gui` / `slow` markers are applied automatically in tests/conftest.py, so no test needs
+# to be decorated by hand. A per-test timeout turns a hung offscreen-Qt test into a failure
+# (not a silent SIGKILL that takes the whole run down).
+markers = [
+    "gui: builds a Qt MainWindow (offscreen) — slower; run separately from the engine suite",
+    "slow: heavy compute (UMAP / SHAP / cohort / 3D / registration)",
+]
+timeout = 180
+timeout_method = "thread"
+addopts = "-p no:cacheprovider"
+
+[tool.hatch.version]
+path = "smile_msi/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["smile_msi"]

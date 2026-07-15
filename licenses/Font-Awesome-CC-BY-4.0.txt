@@ -1,0 +1,22 @@
+Font Awesome Free — License & Attribution
+=========================================
+
+SMILE MSI renders its toolbar/button icons via qtawesome, which bundles the
+Font Awesome 6 Free (Solid) icon set (fa6s.*).
+
+  Font Awesome Free
+  https://fontawesome.com
+  Copyright (c) Fonticons, Inc.
+
+Per the Font Awesome Free license (https://fontawesome.com/license/free):
+
+  - Icons:  CC BY 4.0 License  (attribution required — THIS NOTICE satisfies it)
+  - Fonts:  SIL OFL 1.1 License
+  - Code:   MIT License
+
+The full text of the CC BY 4.0 license is in CC-BY-4.0.txt in this folder.
+
+Other icon fonts bundled by qtawesome — Material Design Icons (Apache-2.0 /
+SIL OFL 1.1), Phosphor (MIT), Remix Icon (Apache-2.0), Elusive (SIL OFL 1.1),
+and Microsoft Codicons (CC BY 4.0) — are included by the library but only used
+if referenced by name.

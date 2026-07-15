@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "name": "Peaks → annotate → PCA & co-localization",
+  "steps": [
+    {
+      "type": "find_peaks",
+      "title": "Find peaks",
+      "params": {
+        "snr": 5.0,
+        "min_rel_intensity": 0.002,
+        "prominence": 1.0,
+        "max_peaks": 500
+      },
+      "scope": {},
+      "enabled": true
+    },
+    {
+      "type": "annotate",
+      "title": "Identify lipids",
+      "params": {
+        "mode": "negative",
+        "match_ppm": 10.0,
+        "image_ppm": 10.0,
+        "norm": "tic"
+      },
+      "scope": {},
+      "enabled": true
+    },
+    {
+      "type": "pca",
+      "title": "PCA images",
+      "params": {
+        "n_components": 5,
+        "tol_ppm": 50.0,
+        "norm": "tic"
+      },
+      "scope": {},
+      "enabled": true
+    },
+    {
+      "type": "coloc_modules",
+      "title": "Co-localization modules",
+      "params": {
+        "n_modules": 0,
+        "threshold": 0.5,
+        "method": "pearson",
+        "tol_ppm": 50.0,
+        "norm": "tic"
+      },
+      "scope": {},
+      "enabled": true
+    }
+  ],
+  "target": "slide",
+  "scope_region": "",
+  "on_error": "continue",
+  "log_to_report": true,
+  "export_bundle": true,
+  "rep_top_n": 15,
+  "bundle_dir": ""
+}

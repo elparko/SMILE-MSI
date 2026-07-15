@@ -1,0 +1,12 @@
+# Windows batch files must use CRLF or cmd.exe misparses multi-line blocks.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# macOS/Linux launchers and shell scripts stay LF.
+*.command text eol=lf
+*.sh text eol=lf
+# Binary assets: never apply text/eol conversion. Without this, autocrlf on Windows can
+# decide a binary "differs" and rewrite (corrupt) it on every checkout — a mangled .ico
+# shows up as a missing icon on the desktop shortcut.
+*.ico binary
+*.icns binary
+*.png binary

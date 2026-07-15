@@ -1,0 +1,92 @@
+# Python / envs / caches
+.venv/
+# throwaway venv created by scripts/build_windows.bat for the frozen bundle
+.venv-build/
+# build_windows.bat transcripts (regenerated every run)
+build_windows.log
+pip_install.log
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# OS / editor temp
+.DS_Store
+~$*
+*.tmp
+
+# ---- DO NOT COMMIT unpublished experimental data or results ----
+AUC_*.csv
+Lipid_markers_*.xlsx
+FINDINGS_*.md
+# internal IP / patent due-diligence — keep out of the public repo (kept in a sibling
+# private folder); they enumerate perceived exposure and shouldn't ship.
+IP_AUDIT.md
+MATH_AUDIT.md
+PATENT_*.md
+# pre-open-source readiness audit + the history-scrub helper: both ENUMERATE the sensitive
+# set (git-history leaks, the maintainer email/name, security surfaces) — never publish them.
+OSS_READINESS_AUDIT_*.md
+scripts/scrub_history_for_oss.sh
+*.slx
+*.imzML
+*.ibd
+examples/demo_report.xlsx
+
+# scratch screenshots & generated report artifacts (working-tree only)
+*.png
+# …except the app's OWN bundled branding (logo/icons) — that's source, must ship:
+!smile_msi/gui/assets/*.png
+roi_lipid_report.xlsx
+
+# ---- app-generated data exports (default save names from the Export hub) ----
+# Results the app writes on demand — analyses, not source. Add your own names here if
+# you save under a different stem; this list lives in the tracked .gitignore so it
+# persists across pulls/updates.
+MSI_report.pdf
+roi_roc_report.pdf
+roi_roc_stats.csv
+roi_statistics.csv
+statistics.csv
+discriminating_features*.csv
+region_comparison.csv
+region_comparison_spectra.csv
+region_intensities.csv
+cohort_comparison.csv
+features.csv
+feature_list.csv
+
+# ---- app-generated caches, logs & local state (never source) ----
+# NOTE: git only treats '#' as a comment at the START of a line — an inline trailing
+# comment becomes part of the pattern and silently matches nothing. Keep comments on
+# their own lines and the patterns bare.
+# fast m/z cube sidecar persisted beside a managed session
+*.cache.npz
+# best-effort perf timing log
+smile_msi_perf.log
+# ad-hoc import/profiling dumps
+import_times*.txt
+# provenance sidecar written next to an export
+*.provenance.json
+# GitHub token for the in-app feedback module — secret, never commit
+github_token.json
+# managed per-sample session store, if it ever lands in the repo tree
+.smile-msi/
+
+# generated macOS app bundle (rebuild with scripts/make_macos_app.sh — bakes in an absolute repo path)
+*.app/
+
+# local SCiLS / data comparison scratch (not source)
+Data_comparison_temp/
+
+# graphify knowledge-graph output (generated report/cache/html; rebuild with /graphify)
+graphify-out/
+
+# LIPID MAPS LMSD download (large, user-provided — never commit)
+*.sdf
+structures.sdf
+lmsd*.csv

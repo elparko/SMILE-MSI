@@ -1,0 +1,9 @@
+SMILE MSI (package: smile_msi)
+Copyright 2026 The SMILE MSI Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This software bundles or depends on third-party components distributed under
+their own licenses; see THIRD_PARTY_LICENSES.md for the full list. Notably, the
+optional desktop GUI links Qt for Python (PySide6 / shiboken6) under the
+GNU Lesser General Public License v3.0 (LGPL-3.0).

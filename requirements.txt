@@ -1,0 +1,28 @@
+# Core analysis engine (Python API: import smile_msi). The `smile-msi` command opens the
+# desktop app, which also needs the GUI packages below (or: uv pip install -e '.[gui]').
+pandas>=1.5
+numpy>=1.23
+scipy>=1.9
+openpyxl>=3.1
+pyimzml>=1.5
+scikit-learn>=1.2
+matplotlib>=3.6
+pillow>=9
+# Nested cohort statistics (hierstats.py): MixedLM for `y ~ group * compartment + (1|subject)`.
+statsmodels>=0.14
+# UMAP embedding (kidney-atlas method) — core so "UMAP" always runs UMAP, not a silent
+# t-SNE fallback. Pulls in numba+llvmlite.
+umap-learn>=0.5
+# numba floor (transitive via umap-learn). Without it, on Python 3.12+ the resolver keeps
+# the newest numpy and downgrades numba to 0.53.1, whose llvmlite 0.36 has no wheel past
+# cp39 → source build → fails on Windows. The floor keeps numba 0.66 (wheels through cp314).
+numba>=0.61
+# Chunked, lazily-read m/z cube cache (cubestore.py): the fast-ion sidecar is a Zarr
+# ZipStore, so reopening a slide reads only the chunks an ion window touches. Pinned to
+# the zarr v2 API; numcodecs supplies the Blosc/zstd compressor. Without these the cube
+# cache silently no-ops (slower reopens) — keep in sync with pyproject [dependencies].
+zarr>=2.17,<3
+numcodecs>=0.12
+# Desktop app (smile-msi gui) — install with: uv pip install -e '.[gui]'
+PySide6-Essentials>=6.6
+pyqtgraph>=0.13
