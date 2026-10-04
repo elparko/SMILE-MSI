@@ -126,6 +126,17 @@ class SetupWizard(QtWidgets.QWizard):
         self.db_external.toggled.connect(self._ext_box.setEnabled)
         # a fresh file selection invalidates a previous validation
         self.path_edit.textChanged.connect(lambda *_: setattr(self, "_loaded_db", None))
+
+        # Re-running the wizard must not silently drop an already-remembered database — restore
+        # it here so Finish (without touching this page) keeps it instead of reverting to
+        # built-in. apply()'s "Finish without Load/validate" fallback re-loads path_edit's text,
+        # so leaving _loaded_db unset (via the textChanged handler above) is fine.
+        cfg = prefs.get(self.win._LIPID_DB_PREF)
+        if isinstance(cfg, dict) and cfg.get("path"):
+            self.db_external.setChecked(True)
+            self.path_edit.setText(cfg["path"])
+            self.db_replace.setChecked(cfg.get("mode") == "replace")
+            self.msi_slice.setChecked(bool(cfg.get("categories")))
         return p
 
     def _done_page(self):

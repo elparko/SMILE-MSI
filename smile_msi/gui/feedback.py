@@ -29,7 +29,7 @@ from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .common import NoScrollComboBox
+from .common import NoScrollComboBox, install_table_export
 
 from .update_check import REPO            # single source of truth for owner/name
 
@@ -520,6 +520,7 @@ class MyRequestsDialog(QtWidgets.QDialog):
         hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
         self.table.cellDoubleClicked.connect(self._open_row)
+        install_table_export(self.table, self, stem="my_requests", title="Export requests")
         v.addWidget(self.table, 1)
 
         self.status = note("")

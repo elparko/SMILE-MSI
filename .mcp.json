@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "smile-msi": {
+      "command": ".venv/bin/python",
+      "args": ["-u", "-m", "smile_msi.mcpserver"],
+      "timeout": 600000
+    }
+  }
+}

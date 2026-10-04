@@ -17,7 +17,7 @@ import csv
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .common import confirm, fill_table, tab_page, icon
+from .common import add_copy_actions, confirm, fill_table, tab_page, icon
 from . import filedialogs
 
 
@@ -198,6 +198,8 @@ class LibraryTabMixin:
         a.setEnabled(n == 1)
         a = menu.addAction(icon("delete"), "Delete", self._lib_delete_feature_list)
         a.setEnabled(any(kind == "list" for kind, _ in metas))
+        menu.addSeparator()
+        add_copy_actions(menu, table)
         menu.exec(table.viewport().mapToGlobal(pos))
 
     def _lib_rename_feature_list(self):

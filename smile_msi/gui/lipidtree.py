@@ -17,9 +17,19 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtWidgets
 
-from .common import MUTED_QSS, button, eye_icon, icon
+from .common import MUTED_QSS, add_copy_actions, button, eye_icon, icon
 
 _ROLE = QtCore.Qt.UserRole
+
+
+class _LipidTree(QtWidgets.QTreeWidget):
+    """Same as FeatureTable: selecting an ion must not scroll the view sideways."""
+
+    def scrollTo(self, index, hint=QtWidgets.QAbstractItemView.EnsureVisible):
+        bar = self.horizontalScrollBar()
+        x = bar.value()
+        super().scrollTo(index, hint)
+        bar.setValue(x)
 
 
 class LipidTreeMixin:
@@ -28,7 +38,7 @@ class LipidTreeMixin:
         """Create the class-grouped tree (page 1 of ``feat_stack``), wrapped in a page that
         carries its Show-all / Hide-all bar. Returns the page — ``feat_stack`` only ever adds
         it, so nothing outside this module needs to know the tree grew a sibling."""
-        t = QtWidgets.QTreeWidget()
+        t = _LipidTree()
         t.setObjectName("lipidTree")
         t.setColumnCount(2)
         t.setHeaderLabels(["class · m/z", "lipid"])
@@ -350,6 +360,8 @@ class LipidTreeMixin:
             menu.addAction("View this ion", lambda: self.set_active_mz(float(val))).setIcon(icon("navigate"))
             menu.addAction("Set colour…", lambda: self._recolour_lipid_ion(float(val))).setIcon(icon("settings"))
             menu.addAction("Rename label…", lambda: self._rename_feature_label(float(val))).setIcon(icon("settings"))
+        menu.addSeparator()
+        add_copy_actions(menu, t)
         menu.exec(t.viewport().mapToGlobal(pos))
 
     def _recolour_lipid_class(self, cls):

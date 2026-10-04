@@ -59,7 +59,7 @@ def build_session(*, source, settings, peaks, active_mz=None, labels=None,
                   flow=None,   # retired (plan 24): the Flow designer is gone; kept as a no-op
                   lipid_lists=None, provenance=None, studio_plan=None,
                   acquisition_meta=None, calibration_models=None, msms_lib=None,
-                  analysis_runs=None) -> dict:
+                  analysis_runs=None, preprocessing=None, calibration=None) -> dict:
     """Assemble a JSON-serializable session dict from analysis state.
 
     ``n_pixels`` / ``dataset_fingerprint`` (from
@@ -84,6 +84,11 @@ def build_session(*, source, settings, peaks, active_mz=None, labels=None,
     return {
         "version": VERSION,
         "source": source,
+        # the per-spectrum preprocessing pipeline config the analysis was done with
+        # (preprocess.build_pipeline dict) — re-applied before any pass on reopen — and the
+        # lock-mass calibration state the Calibration check dialog reports
+        "preprocessing": (dict(preprocessing) if preprocessing else None),
+        "calibration": (dict(calibration) if calibration else None),
         "n_pixels": (int(n_pixels) if n_pixels is not None else None),
         "dataset_fingerprint": (str(dataset_fingerprint) if dataset_fingerprint else None),
         "settings": dict(settings),
@@ -459,8 +464,37 @@ def load_parse_cache(imzml_path: str) -> dict | None:
                 "pixel_size_um": (None if np.isnan(pix) else pix),
                 "pixel_size_source": (src or None),
                 "shared": (z["shared"] if "shared" in z.files else None),
+                "mz_bounds": (z["mz_bounds"] if "mz_bounds" in z.files else None),
             }
     except Exception:  # noqa: BLE001 — a corrupt/partial cache must never be fatal
+        return None
+
+
+def amend_parse_cache(imzml_path: str, **extra) -> str | None:
+    """Add or replace arrays in an existing, still-valid parse sidecar (e.g. the m/z bounds
+    once a first pass has measured them) without re-parsing. No-op when the sidecar is
+    missing or stale. Atomic like :func:`save_parse_cache`; best-effort."""
+    path = parse_cache_path(imzml_path)
+    if not os.path.exists(path):
+        return None
+    ibd = os.path.splitext(str(imzml_path))[0] + ".ibd"
+    key = _parse_stat_key(imzml_path, ibd)
+    if key is None:
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            if not np.array_equal(z["stat_key"], np.asarray(key, dtype=np.int64)):
+                return None
+            arrs = {k: z[k] for k in z.files}
+        arrs.update({k: np.asarray(v) for k, v in extra.items()})
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            np.savez(f, **arrs)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return path
+    except Exception:  # noqa: BLE001 — caching is best-effort, never fatal
         return None
 
 
@@ -655,6 +689,138 @@ def list_managed() -> list[dict]:
         "n_features": len(data.get("peaks", []) or []),
         "active_mz": data.get("active_mz"),
     })
+
+
+# --------------------------------------------------------------------------- #
+# cache inventory — what the managed store holds and what can go
+# --------------------------------------------------------------------------- #
+def _path_size(path: str) -> int:
+    if os.path.isdir(path):
+        total = 0
+        for dirpath, _dirs, files in os.walk(path):
+            for fn in files:
+                try:
+                    total += os.stat(os.path.join(dirpath, fn)).st_size
+                except OSError:
+                    pass
+        return total
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return 0
+
+
+_COMPANION_SUFFIXES = (".cube.zarr", ".cache.npz", ".runs", "__thumbs")
+
+
+def cache_inventory(directory: str | None = None) -> list[dict]:
+    """Every file and folder in the managed store with what it is and whether it can go.
+
+    Rows are ``{path, name, kind, status, size, removable, stem}``. Kinds: ``session``
+    (the JSON), ``cube`` (``.cube.zarr``), ``legacy cube`` (``.cache.npz``), ``runs``,
+    ``thumbnails``, ``temporary`` (``.tmp`` / ``.cube_spill_*``) and ``other``. A companion
+    whose session JSON is gone is *orphaned*; a session that is an older-fingerprint copy of
+    a slide that also has a richer/newer session is a *duplicate* (its companions with it);
+    a legacy npz that already has a Zarr cube beside it is *superseded*; leftovers of an
+    interrupted build are *temporary*. Only those are marked removable — a session whose
+    imzML is missing is reported (``source missing``) but kept, since it holds the ROIs."""
+    from . import library
+    d = directory or sessions_dir()
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    sessions: dict[str, dict] = {}          # stem -> loaded JSON (+ path/mtime)
+    rows: list[dict] = []
+    for fn in names:
+        path = os.path.join(d, fn)
+        if fn.endswith(".json"):
+            stem = fn[:-5]
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                sessions[stem] = {"data": data, "path": path, "mtime": os.stat(path).st_mtime}
+            except (OSError, json.JSONDecodeError, ValueError):
+                rows.append({"path": path, "name": fn, "kind": "session", "stem": stem,
+                             "status": "unreadable", "size": _path_size(path),
+                             "removable": True})
+    # duplicates: same slide (basename + stable geometry) saved under several fingerprints
+    groups: dict[tuple, list[str]] = {}
+    for stem, rec in sessions.items():
+        data = rec["data"]
+        src = data.get("source", "")
+        fp = data.get("dataset_fingerprint") or ""
+        geo = stable_fingerprint(fp) if (fp and _fingerprint_coordhash(fp)) else f"n={data.get('n_pixels')}"
+        groups.setdefault((library.dataset_key(src), geo), []).append(stem)
+    dup: set[str] = set()
+    for stems in groups.values():
+        if len(stems) < 2:
+            continue
+        keep = max(stems, key=lambda st: (len(sessions[st]["data"].get("named_regions") or []),
+                                          sessions[st]["mtime"]))
+        dup.update(st for st in stems if st != keep)
+    for stem, rec in sessions.items():
+        src = rec["data"].get("source", "")
+        if stem in dup:
+            status, removable = "duplicate (older fingerprint of the same slide)", True
+        elif src and src != "synthetic" and not os.path.exists(src):
+            status, removable = "source missing (ROIs kept)", False
+        else:
+            status, removable = "in use", False
+        rows.append({"path": rec["path"], "name": stem + ".json", "kind": "session",
+                     "stem": stem, "status": status, "size": _path_size(rec["path"]),
+                     "removable": removable})
+    for fn in names:
+        path = os.path.join(d, fn)
+        if fn.endswith(".json"):
+            continue
+        if fn.startswith(".cube_spill_") or fn.endswith(".tmp"):
+            rows.append({"path": path, "name": fn, "kind": "temporary", "stem": "",
+                         "status": "leftover from an interrupted build",
+                         "size": _path_size(path), "removable": True})
+            continue
+        kind, stem = "other", ""
+        for suf in _COMPANION_SUFFIXES:
+            if fn.endswith(suf):
+                stem = fn[: -len(suf)]
+                kind = {".cube.zarr": "cube", ".cache.npz": "legacy cube",
+                        ".runs": "runs", "__thumbs": "thumbnails"}[suf]
+                break
+        if kind == "other":
+            rows.append({"path": path, "name": fn, "kind": kind, "stem": "",
+                         "status": "not managed here", "size": _path_size(path),
+                         "removable": False})
+            continue
+        if stem not in sessions:
+            status, removable = "orphaned (no session)", True
+        elif stem in dup:
+            status, removable = "belongs to a duplicate session", True
+        elif kind == "legacy cube" and (stem + ".cube.zarr") in names:
+            status, removable = "superseded by the Zarr cube", True
+        elif kind == "legacy cube":
+            status, removable = "legacy (migrates on next open)", False
+        else:
+            status, removable = "in use", False
+        rows.append({"path": path, "name": fn, "kind": kind, "stem": stem,
+                     "status": status, "size": _path_size(path), "removable": removable})
+    rows.sort(key=lambda r: (r["stem"] or r["name"], r["kind"]))
+    return rows
+
+
+def delete_cache_paths(paths) -> tuple[list[str], list[str]]:
+    """Remove the given store entries (files or folders). Returns ``(deleted, failed)``."""
+    import shutil
+    deleted, failed = [], []
+    for p in paths:
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+            deleted.append(p)
+        except OSError:
+            failed.append(p)
+    return deleted, failed
 
 
 def unique_feature_list_name(existing, base: str) -> str:

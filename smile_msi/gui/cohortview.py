@@ -818,9 +818,11 @@ class CohortMixin:
 
     def _cohort_tree_menu(self, pos):
         keys = self._selected_sample_keys(at=pos)
-        if not keys:
-            return
-        self._cohort_group_menu(keys).exec(self.sample_tree.viewport().mapToGlobal(pos))
+        menu = self._cohort_group_menu(keys) if keys else QtWidgets.QMenu(self.sample_tree)
+        if keys:
+            menu.addSeparator()
+        common.add_copy_actions(menu, self.sample_tree)
+        menu.exec(self.sample_tree.viewport().mapToGlobal(pos))
 
     def _cohort_set_group(self, keys, group):
         if group is None:                            # prompt for a new label
@@ -1775,6 +1777,8 @@ class CohortMixin:
         preview.setHorizontalHeaderLabels(["m/z", "lipid", "log2 FC", "q"])
         preview.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         preview.setMinimumSize(460, 300)
+        common.install_table_export(preview, dlg, stem="feature_list_preview",
+                                    title="Export preview")
         v.addWidget(preview, 1)
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
         v.addWidget(bb)

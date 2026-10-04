@@ -19,7 +19,7 @@ from PySide6 import QtCore, QtWidgets
 from .. import export, imaging, prefs, studio, stylelib
 from .. import annotations as annot
 from .common import (PALETTE, MUTED_QSS, RangeSliderField, icon, CheckList, NoScrollComboBox,
-                     NoScrollDoubleSpinBox, NoScrollSpinBox)
+                     NoScrollDoubleSpinBox, NoScrollSpinBox, fig_to_pixmap)
 from . import filedialogs
 
 # label-content choices for the in-image legend (value = annotations mode; shared source)
@@ -53,6 +53,10 @@ TABLE_EXT = [("CSV", "csv"), ("TSV", "tsv"), ("Excel (.xlsx)", "xlsx"),
 STATS_EXT = [("Excel report (formatted, charts)", "xlsx"), ("CSV (raw values)", "csv")]
 BOOK_EXT = [("PDF report", "pdf")]
 
+PREVIEW_SCOPES = ("ion", "overlay", "gallery", "component", "specfig", "seg")
+PREVIEW_DPI = 100
+PREVIEW_WIDTH = 560
+
 
 class ExportDialog(QtWidgets.QDialog):
     """The export hub. Collects options and calls ``win.run_export(scope, opts)``."""
@@ -72,7 +76,15 @@ class ExportDialog(QtWidgets.QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        outer.addWidget(scroll, 1)
+        scroll.setMinimumWidth(540)
+        # Options on the left, a live preview of the image on the right (image scopes only).
+        self._split = split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.addWidget(scroll)
+        split.addWidget(self._build_preview_pane())
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        outer.addWidget(split, 1)
         content = QtWidgets.QWidget()
         scroll.setWidget(content)
         root = QtWidgets.QVBoxLayout(content)
@@ -172,8 +184,13 @@ class ExportDialog(QtWidgets.QDialog):
                                       "for the selected region. Non-destructive — the crop is "
                                       "saved on the region, not the data, and reopens here.")
         self.crop_edit_btn.clicked.connect(self._edit_crop_clicked)
+        self.chk_crop_outline = QtWidgets.QCheckBox("Outline region")
+        self.chk_crop_outline.setChecked(True)
+        self.chk_crop_outline.setToolTip("Trace the cropped region's border in its colour. "
+                                         "Untick for a close-up with no outline.")
         crop_row = QtWidgets.QHBoxLayout()
         crop_row.addWidget(self.crop_combo, 1)
+        crop_row.addWidget(self.chk_crop_outline)
         crop_row.addWidget(self.crop_edit_btn)
 
         # Split the original single "Show" HBox into a primary pair (Annotations + Scale bar,
@@ -485,13 +502,111 @@ class ExportDialog(QtWidgets.QDialog):
             if i >= 0:
                 self.scope_combo.setCurrentIndex(i)
         self._scope_changed()
+        self._wire_preview(content)
 
         # Open at a comfortable size and never taller than the screen — a very tall scope
         # (book) then scrolls inside the dialog instead of overflowing off the bottom.
         scr = QtWidgets.QApplication.primaryScreen()
         avail_h = scr.availableGeometry().height() if scr is not None else 900
         self.setMaximumHeight(avail_h)
-        self.resize(600, min(760, avail_h - 80))
+        avail_w = scr.availableGeometry().width() if scr is not None else 1400
+        w = 600 + (PREVIEW_WIDTH if not self.preview_pane.isHidden() else 0)
+        self.resize(min(w, avail_w - 40), min(760, avail_h - 80))
+        split.setSizes([600, PREVIEW_WIDTH])
+        self._sized = True
+
+    # ----- live preview ----------------------------------------------------- #
+    def _build_preview_pane(self):
+        self.preview_pane = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(self.preview_pane)
+        v.setContentsMargins(8, 8, 8, 8)
+        head = QtWidgets.QLabel("Preview — what will be saved")
+        head.setWordWrap(True)
+        head.setStyleSheet(MUTED_QSS)
+        v.addWidget(head)
+        self.preview_img = QtWidgets.QLabel()
+        self.preview_img.setAlignment(QtCore.Qt.AlignCenter)
+        self.preview_img.setWordWrap(True)
+        self.preview_img.setMinimumSize(320, 280)
+        # Ignored: the pixmap must follow the pane's size, never set it
+        self.preview_img.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
+        self.preview_img.installEventFilter(self)
+        v.addWidget(self.preview_img, 1)
+        self.preview_caption = QtWidgets.QLabel("")
+        self.preview_caption.setWordWrap(True)
+        self.preview_caption.setStyleSheet(MUTED_QSS)
+        v.addWidget(self.preview_caption)
+        self._preview_pixmap = None
+        self._sized = False
+        self._wide_width = 0
+        self._preview_timer = QtCore.QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(250)
+        self._preview_timer.timeout.connect(self._render_preview)
+        return self.preview_pane
+
+    def _wire_preview(self, content):
+        """Redraw the preview after any option change (debounced)."""
+        for w in content.findChildren(QtWidgets.QComboBox):
+            w.currentIndexChanged.connect(self._schedule_preview)
+        for w in content.findChildren(QtWidgets.QCheckBox):
+            w.toggled.connect(self._schedule_preview)
+        for cls in (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox):
+            for w in content.findChildren(cls):
+                w.valueChanged.connect(self._schedule_preview)
+        for w in content.findChildren(RangeSliderField):
+            w.editingFinished.connect(self._schedule_preview)
+        for w in content.findChildren(CheckList):
+            w.changed.connect(self._schedule_preview)
+        self._schedule_preview()
+
+    def _schedule_preview(self, *_):
+        if not self.preview_pane.isHidden():
+            self._preview_timer.start()
+
+    def _set_preview_visible(self, show):
+        if self.preview_pane.isHidden() != show:
+            return
+        if self._sized:                    # after construction: grow/shrink by the pane's width
+            if show:
+                self.preview_pane.setVisible(True)
+                self.resize(max(self.width() + PREVIEW_WIDTH, self._wide_width), self.height())
+            else:
+                self._wide_width = self.width()
+                self.preview_pane.setVisible(False)
+                self.resize(self.width() - self.preview_pane.width(), self.height())
+        else:
+            self.preview_pane.setVisible(show)
+
+    def _render_preview(self):
+        key = self.scope_combo.currentData()
+        if self.preview_pane.isHidden() or key not in PREVIEW_SCOPES:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            fig, caption = self.win.export_preview(key, self.options())
+            self._preview_pixmap = fig_to_pixmap(fig) if fig is not None else None
+        except Exception as e:  # noqa: BLE001 — a bad option combination must not break the dialog
+            self._preview_pixmap, caption = None, f"Could not draw the preview: {e}"
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if self._preview_pixmap is None:
+            self.preview_img.clear()
+            self.preview_img.setText(caption)
+            self.preview_caption.setText("")
+        else:
+            self.preview_caption.setText(caption)
+            self._fit_preview()
+
+    def _fit_preview(self):
+        if self._preview_pixmap is not None:
+            self.preview_img.setPixmap(self._preview_pixmap.scaled(
+                self.preview_img.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+
+    def eventFilter(self, obj, event):
+        if obj is self.preview_img and event.type() == QtCore.QEvent.Resize:
+            self._fit_preview()
+        return super().eventFilter(obj, event)
 
     @staticmethod
     def _wrap(layout):
@@ -508,6 +623,7 @@ class ExportDialog(QtWidgets.QDialog):
         full image and not the every-region batch."""
         data = self.crop_combo.currentData()
         self.crop_edit_btn.setEnabled(bool(data) and data != "__each__")
+        self.chk_crop_outline.setEnabled(bool(data))
 
     def _edit_crop_clicked(self):
         """Open the Crop Studio for the region chosen in 'Crop to region', so its close-up crop
@@ -519,6 +635,7 @@ class ExportDialog(QtWidgets.QDialog):
                    if r.get("name") == name), None)
         if rg is not None:
             self.win._open_crop_studio(rg)
+            self._schedule_preview()
 
     # ----- batch feature picker (gallery scope) ---------------------------- #
     def _populate_feature_list(self):
@@ -699,6 +816,8 @@ class ExportDialog(QtWidgets.QDialog):
         self.b_export.setEnabled(ok)
         if not ok:
             self.hint.setText(why)
+        self._set_preview_visible(ok and key in PREVIEW_SCOPES)
+        self._schedule_preview()
 
     def _initial_export_window(self):
         """Seed the export intensity window from the active feature's dock window (so the
@@ -734,6 +853,7 @@ class ExportDialog(QtWidgets.QDialog):
             "window_override": (self.window_slider.values()
                                 if self.chk_window.isChecked() else None),
             "crop_region": self.crop_combo.currentData(),
+            "crop_outline": self.chk_crop_outline.isChecked(),
             "batch_peaks": self._selected_peaks(),
             "spec_xauto": self.chk_xauto.isChecked(),
             "spec_xmin": float(self.xmin_spin.value()),
@@ -843,6 +963,7 @@ class ExportDialog(QtWidgets.QDialog):
             "scalebar_on": self.chk_scale.isChecked(),
             "title": self.chk_title.isChecked(),
             "roi_outline": self.chk_roi.isChecked(),
+            "crop_outline": self.chk_crop_outline.isChecked(),
             "dpi": int(self.dpi_spin.value()),
             "width": float(self.width_spin.value()),
             "window_override_on": self.chk_window.isChecked(),
@@ -883,6 +1004,7 @@ class ExportDialog(QtWidgets.QDialog):
             for key, chk in (("card", self.chk_card), ("spectrum", self.chk_spec),
                              ("colorbar", self.chk_cbar), ("scalebar_on", self.chk_scale),
                              ("title", self.chk_title), ("roi_outline", self.chk_roi),
+                             ("crop_outline", self.chk_crop_outline),
                              ("bundle", self.chk_bundle), ("spec_xauto", self.chk_xauto),
                              ("spec_peaks", self.chk_peaks),
                              ("spec_active", self.chk_active),
@@ -1013,6 +1135,45 @@ class ExportMixin:
             QtWidgets.QMessageBox.critical(self, "Export failed", f"{type(e).__name__}: {e}")
             return False
 
+    def export_preview(self, scope, opts):
+        """``(figure, caption)`` for the hub's preview: the first file the export would write,
+        drawn by the same render code at a screen resolution. ``(None, reason)`` when there is
+        nothing to draw. Never opens the Crop Studio — an unsaved crop previews as the region's
+        bounding box."""
+        opts = {**opts, "dpi": PREVIEW_DPI}
+        targets = self._crop_targets(opts)
+        rg = targets[0]
+        many = f"{rg['name']} — 1 of {len(targets)} files, one per region" if len(targets) > 1 else ""
+        with export.active_style(opts.get("style_spec")):
+            if scope == "ion":
+                return self._ion_render(opts)(rg), many
+            if scope == "overlay":
+                render = self._overlay_render(opts)
+                return (render(rg), many) if render else (None, "No visible features to overlay.")
+            if scope == "component":
+                made = self._component_render(opts)
+                return (made[0](rg), many) if made else (None, "Run PCA or NMF first.")
+            if scope == "seg":
+                return self._seg_render(opts)(rg), many
+            if scope == "gallery":
+                peaks = opts.get("batch_peaks") or self._visible_peaks()
+                if not peaks:
+                    return None, "No features ticked."
+                p = peaks[0]
+                n = len(peaks) * len(targets)
+                return (self._gallery_figure(
+                    p, rg, self._crop_kwargs(rg, opts.get("crop_outline", True)), opts),
+                        f"m/z {float(p['mz']):.4f} — 1 of {n} images")
+            if scope == "specfig":
+                spectra = self._gather_spectra(opts)
+                if not spectra:
+                    return None, "No spectra ticked."
+                render = self._spectrum_render(opts, spectra)
+                if opts.get("spec_layout") == "separate":
+                    return render(spectra[0]), f"{spectra[0][0]} — 1 of {len(spectra)} files"
+                return render(None), ""
+        return None, ""
+
     # ----- shared helpers -------------------------------------------------- #
     def _save_path(self, title, default, fmt):
         flt = f"{fmt.upper()} (*.{fmt})"
@@ -1090,9 +1251,9 @@ class ExportMixin:
         the Report tab via the composed window)."""
         return studio.safe_name(name)
 
-    def _crop_kwargs(self, rg):
+    def _crop_kwargs(self, rg, outline=True):
         """Render kwargs that zoom a panel in on region ``rg``: crop to its bounds, trace its
-        boundary in its own colour, and fade the surround. The whole-slide side spectrum is
+        boundary in its own colour (unless ``outline`` is False), and fade the surround. The whole-slide side spectrum is
         dropped — it isn't region-specific and only shrinks the close-up — so a cropped panel
         is a clean, square-pixelled zoom. ``{}`` for the full image (``rg`` None)."""
         if rg is None:
@@ -1105,6 +1266,7 @@ class ExportMixin:
         om = self._region_mask_2d(rg)
         if om is not None:
             kw["outline_mask"] = om
+            kw["show_outline"] = outline
         return kw
 
     def _crop_targets(self, opts):
@@ -1202,16 +1364,19 @@ class ExportMixin:
         return pd.DataFrame(rows) if rows else None
 
     # ----- per-scope handlers ---------------------------------------------- #
-    def _export_ion(self, opts):
+    def _ion_render(self, opts):
         p = self._peak_for_mz(self.active_mz) or {"mz": self.active_mz}
         base = self._panel_kwargs(p, opts)
 
         def render(rg):
-            kw = {**base, **self._crop_kwargs(rg)}
+            kw = {**base, **self._crop_kwargs(rg, opts.get("crop_outline", True))}
             if rg is not None:
                 kw["title"] = f"{rg['name']} · m/z {float(self.active_mz):.4f}"
             return export.render_ion_panel(**kw)
+        return render
 
+    def _export_ion(self, opts):
+        render = self._ion_render(opts)
         targets = self._resolve_crop_targets(opts)
         if targets is None:
             return False
@@ -1223,10 +1388,23 @@ class ExportMixin:
         and optionally cropped to a region. Score images aren't single-ion intensities, so
         the relative-% legend and side spectrum are dropped; colormap, scale bar, theme,
         crop and ROI outline all apply. The component's identity goes in the filename."""
-        c = getattr(self, "_comp", None)
-        if c is None or not getattr(c, "images", None):
+        made = self._component_render(opts)
+        if made is None:
             self.statusBar().showMessage("Run PCA or NMF first (Components tab).")
             return False
+        render, c, idx = made
+        targets = self._resolve_crop_targets(opts)
+        if targets is None:
+            return False
+        return self._save_targets(opts, targets, render,
+                                  f"{c.method.lower()}_component{idx}",
+                                  f"Save {c.method} component image")
+
+    def _component_render(self, opts):
+        """``(render, components, index)`` for the active component, or None before PCA/NMF."""
+        c = getattr(self, "_comp", None)
+        if c is None or not getattr(c, "images", None):
+            return None
         idx = max(0, min(int(getattr(self, "_comp_active", 0)), len(c.images) - 1))
         image = np.asarray(c.images[idx], float)
         ev = (f" · EV {c.explained_variance[idx]:.0%}"
@@ -1237,23 +1415,29 @@ class ExportMixin:
         def render(rg):
             kw = dict(image=image, mz=None, label="", mean_spectrum=None)
             kw.update(dkw)
-            kw.update(self._crop_kwargs(rg))
+            kw.update(self._crop_kwargs(rg, opts.get("crop_outline", True)))
             name = f"{rg['name']} · " if rg is not None else ""
             kw["title"] = f"{name}{c.method} component {idx}{ev}"
             return export.render_ion_panel(**kw)
+        return render, c, idx
 
+    def _export_overlay(self, opts):
+        render = self._overlay_render(opts)
+        if render is None:
+            self.statusBar().showMessage("No visible features to overlay.")
+            return False
+        if opts.get("roi_outline") and not self._overlay_outlines():
+            self.statusBar().showMessage("No visible regions to outline — exporting without one.")
         targets = self._resolve_crop_targets(opts)
         if targets is None:
             return False
-        return self._save_targets(opts, targets, render,
-                                  f"{c.method.lower()}_component{idx}",
-                                  f"Save {c.method} component image")
+        return self._save_targets(opts, targets, render, "overlay", "Save colour overlay")
 
-    def _export_overlay(self, opts):
+    def _overlay_render(self, opts):
+        """``render(rg)`` for the colour overlay, or None when no feature is visible."""
         peaks = self._overlay_peaks() or self._visible_peaks()
         if not peaks:
-            self.statusBar().showMessage("No visible features to overlay.")
-            return False
+            return None
         chans = self._overlay_channels(peaks)
         rgb = self._compose_overlay_rgb(chans, opts)
         channels = []
@@ -1270,8 +1454,6 @@ class ExportMixin:
                                  label=self._clean_label(p["mz"]),
                                  label_override=p.get("label_override")))
         base_outlines = self._overlay_outlines() if opts.get("roi_outline") else []
-        if opts.get("roi_outline") and not base_outlines:
-            self.statusBar().showMessage("No visible regions to outline — exporting without one.")
         dk = self._design_kwargs(opts)
         dk.pop("crop", None)                               # crop is per-target below
 
@@ -1280,17 +1462,13 @@ class ExportMixin:
             crop = None
             if rg is not None:
                 crop = self._region_bbox(rg)
-                om = self._region_mask_2d(rg)
+                om = self._region_mask_2d(rg) if opts.get("crop_outline", True) else None
                 if om is not None:
                     outs.append((om, rg.get("color", "#ffffff")))
             return export.render_overlay_panel(
                 rgb, channels, outlines=(outs or None), crop=crop,
                 show_legend=bool(opts["card"] and opts["colorbar"]), **dk)
-
-        targets = self._resolve_crop_targets(opts)
-        if targets is None:
-            return False
-        return self._save_targets(opts, targets, render, "overlay", "Save colour overlay")
+        return render
 
     def _overlay_channels(self, peaks):
         """[(peak, hexcolor)] — each overlay channel's colour: the feature's explicit colour
@@ -1353,13 +1531,10 @@ class ExportMixin:
             sub = d if rg is None else os.path.join(d, self._safe_name(rg["name"]))
             if rg is not None:
                 os.makedirs(sub, exist_ok=True)
-            crop_kw = self._crop_kwargs(rg)
+            crop_kw = self._crop_kwargs(rg, opts.get("crop_outline", True))
             for p in peaks:
                 mz = p["mz"]
-                kw = {**self._panel_kwargs(p, opts), **crop_kw}
-                if rg is not None:
-                    kw["title"] = f"{rg['name']} · m/z {mz:.4f}  {self._clean_label(mz)}".strip()
-                fig = export.render_ion_panel(**kw)
+                fig = self._gallery_figure(p, rg, crop_kw, opts)
                 # label_override first so a renamed feature / lipid-class composite (whose
                 # representative m/z has no DB hit) names its file by its class, not "feature".
                 label = p.get("label_override") or self._clean_label(mz) or "feature"
@@ -1371,6 +1546,13 @@ class ExportMixin:
         self._export_pending.append(d)
         self.statusBar().showMessage(f"Wrote {n} images to {d}")
         return True
+
+    def _gallery_figure(self, p, rg, crop_kw, opts):
+        mz = p["mz"]
+        kw = {**self._panel_kwargs(p, opts), **crop_kw}
+        if rg is not None:
+            kw["title"] = f"{rg['name']} · m/z {mz:.4f}  {self._clean_label(mz)}".strip()
+        return export.render_ion_panel(**kw)
 
     def _resolve_spec_source(self, ident):
         """``(name, axis, y, color)`` for a spectra-export source id — ``'__mean__'`` (the
@@ -1461,46 +1643,46 @@ class ExportMixin:
         sel = (ax >= mz_range[0]) & (ax <= mz_range[1])
         return (s[0], ax[sel], np.asarray(s[2], float)[sel]) + tuple(s[3:])
 
+    def _spectrum_render(self, opts, spectra):
+        """``render(s)`` for one spectrum's own figure (separate layout), ``render(None)`` for
+        every spectrum overlaid in one figure."""
+        peaks_mz = ([p["mz"] for p in self._visible_peaks()]
+                    if (self.peaks and opts.get("spec_peaks", True)) else None)
+        diff_labels = self._diff_labels(opts)
+        diff_name = f"{diff_labels[0]} − {diff_labels[1]}" if diff_labels else None
+        kw = dict(peaks=peaks_mz, active_mz=(self.active_mz if opts.get("spec_active", False) else None),
+                  theme=opts["theme"], width_in=max(opts["width"], 8.0), dpi=opts["dpi"],
+                  mz_range=self._spec_mz_range(opts), draw_style=opts.get("spec_style", "line"),
+                  # one shared y-scale across every exported spectrum, when asked
+                  ylim=(export.spectra_ylim(spectra) if opts.get("spec_yshare") else None))
+
+        def render(s):
+            if s is None:
+                return export.render_spectrum_figure(spectra, diff_labels=diff_labels, **kw)
+            return export.render_spectrum_figure(
+                [s], title=str(s[0]), diff_labels=(diff_labels if s[0] == diff_name else None), **kw)
+        return render
+
     def _export_spectrum_fig(self, opts):
         spectra = self._gather_spectra(opts)
         if not spectra:
             self.statusBar().showMessage("No spectra selected to export.")
             return False
-        peaks_mz = ([p["mz"] for p in self._visible_peaks()]
-                    if (self.peaks and opts.get("spec_peaks", True)) else None)
-        active_mz = self.active_mz if opts.get("spec_active", False) else None
-        mz_range = self._spec_mz_range(opts)
-        draw_style = opts.get("spec_style", "line")
-        diff_labels = self._diff_labels(opts)
-        diff_name = f"{diff_labels[0]} − {diff_labels[1]}" if diff_labels else None
-        # one shared y-scale across every exported spectrum, when asked (else per-spectrum auto)
-        shared_ylim = export.spectra_ylim(spectra) if opts.get("spec_yshare") else None
+        render = self._spectrum_render(opts, spectra)
         fmt = opts["fmt"]
-        width = max(opts["width"], 8.0)
         if opts.get("spec_layout") == "separate":
             base = self._save_path("Save spectrum figures (one per spectrum)",
                                    f"spectrum.{fmt}", fmt)
             if not base:
                 return False
             for s in spectra:
-                fig = export.render_spectrum_figure([s], peaks=peaks_mz, active_mz=active_mz,
-                                                    theme=opts["theme"], width_in=width,
-                                                    dpi=opts["dpi"], mz_range=mz_range,
-                                                    title=str(s[0]), draw_style=draw_style,
-                                                    ylim=shared_ylim,
-                                                    diff_labels=(diff_labels if s[0] == diff_name
-                                                                 else None))
-                export.save_figure(fig, self._suffix_path(base, s[0]), dpi=opts["dpi"])
+                export.save_figure(render(s), self._suffix_path(base, s[0]), dpi=opts["dpi"])
             self.statusBar().showMessage(f"Wrote {len(spectra)} spectrum figures")
             return True
         path = self._save_path("Save spectrum figure", f"spectrum.{fmt}", fmt)
         if not path:
             return False
-        fig = export.render_spectrum_figure(spectra, peaks=peaks_mz, active_mz=active_mz,
-                                            theme=opts["theme"], width_in=width, dpi=opts["dpi"],
-                                            mz_range=mz_range, draw_style=draw_style,
-                                            ylim=shared_ylim, diff_labels=diff_labels)
-        export.save_figure(fig, path, dpi=opts["dpi"])
+        export.save_figure(render(None), path, dpi=opts["dpi"])
         self.statusBar().showMessage(f"Wrote {path}")
         return True
 
@@ -1576,6 +1758,13 @@ class ExportMixin:
     def _export_segmentation(self, opts):
         if getattr(self, "seg", None) is None:
             return False
+        targets = self._resolve_crop_targets(opts)
+        if targets is None:
+            return False
+        return self._save_targets(opts, targets, self._seg_render(opts), "segmentation",
+                                  "Save segmentation map")
+
+    def _seg_render(self, opts):
         colors, _legend = self._seg_colors_legend()
         # honour the dialog's scale-bar checkbox; the renderer auto-sizes the bar to each
         # (possibly cropped) map, so a region close-up gets a correctly-scaled bar too.
@@ -1587,11 +1776,7 @@ class ExportMixin:
                 self.seg.label_image, colors, legend=_legend, title=title,
                 theme=opts["theme"], width_in=opts["width"], dpi=opts["dpi"], pixel_size_um=px,
                 crop=(self._region_bbox(rg) if rg is not None else None))
-
-        targets = self._resolve_crop_targets(opts)
-        if targets is None:
-            return False
-        return self._save_targets(opts, targets, render, "segmentation", "Save segmentation map")
+        return render
 
     def _seg_colors_legend(self):
         """Map clusters → colours (by named region if any, else by cluster) + a legend."""

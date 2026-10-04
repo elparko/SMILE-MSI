@@ -24,9 +24,45 @@ def home_dir() -> str:
     Defaults to ``~/.smile-msi`` (override with ``$SMILE_MSI_HOME``)."""
     base = os.environ.get("SMILE_MSI_HOME")
     if not base:
-        base = os.path.join(os.path.expanduser("~"), ".smile-msi")
+        base = home_redirect() or default_home_dir()
     os.makedirs(base, exist_ok=True)
     return base
+
+
+def default_home_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".smile-msi")
+
+
+def _redirect_file() -> str:
+    """``<default home>/home`` — one line naming the folder that actually holds the app
+    store (sessions, cubes, prefs). Lets the caches live on a bigger disk without an
+    environment variable; ``$SMILE_MSI_HOME`` still wins when set."""
+    return os.path.join(default_home_dir(), "home")
+
+
+def home_redirect() -> str:
+    """The redirected app folder named by the redirect file, or ``""``."""
+    try:
+        with open(_redirect_file(), encoding="utf-8") as f:
+            path = f.readline().strip()
+    except OSError:
+        return ""
+    return os.path.expanduser(path) if path else ""
+
+
+def set_home_redirect(path) -> None:
+    """Point the app store at ``path`` (``None``/empty clears the redirect). Takes effect
+    on the next :func:`home_dir` call; callers move the existing store themselves."""
+    os.makedirs(default_home_dir(), exist_ok=True)
+    rf = _redirect_file()
+    if not path:
+        try:
+            os.remove(rf)
+        except OSError:
+            pass
+        return
+    with open(rf, "w", encoding="utf-8") as f:
+        f.write(os.path.abspath(os.path.expanduser(str(path))) + "\n")
 
 
 def dataset_key(source: str) -> str:

@@ -466,3 +466,46 @@ def test_table_bar_refresh_count_after_a_blocked_rebuild(app):
     t.blockSignals(False)
     bar.refresh_count()
     assert bar.findChild(QtWidgets.QLabel).text() == "0 of 0 selected"
+
+
+def test_ticking_a_parent_recounts_once_not_once_per_child(app):
+    """A parent with ItemIsAutoTristate emits itemChanged per child. Walking the tree on every
+    one of those made ticking a 3000-ion feature list take 70 s in the Export Studio."""
+    from smile_msi.gui.common import coalesce
+
+    tree = QtWidgets.QTreeWidget()
+    parent = QtWidgets.QTreeWidgetItem(tree)
+    parent.setFlags(parent.flags() | QtCore.Qt.ItemIsUserCheckable
+                    | QtCore.Qt.ItemIsAutoTristate)
+    parent.setCheckState(0, QtCore.Qt.Unchecked)
+    for _ in range(400):
+        child = QtWidgets.QTreeWidgetItem(parent)
+        child.setFlags(child.flags() | QtCore.Qt.ItemIsUserCheckable)
+        child.setCheckState(0, QtCore.Qt.Unchecked)
+
+    signals, walks = [0], [0]
+    tree.itemChanged.connect(lambda *_: signals.__setitem__(0, signals[0] + 1))
+    tree.itemChanged.connect(coalesce(tree, lambda: walks.__setitem__(0, walks[0] + 1)))
+
+    parent.setCheckState(0, QtCore.Qt.Checked)
+    QtWidgets.QApplication.processEvents()
+
+    assert signals[0] > 400                       # Qt really does emit one per child
+    assert walks[0] <= 2                          # …and we recount at most twice
+    assert all(parent.child(i).checkState(0) == QtCore.Qt.Checked
+               for i in range(parent.childCount()))
+
+
+def test_a_lone_tick_updates_the_count_without_an_event_loop(app):
+    """Coalescing must not defer a single change — the label is read straight after a tick."""
+    lw = QtWidgets.QListWidget()
+    for name in ("endo", "peri", "epi"):
+        it = QtWidgets.QListWidgetItem(name)
+        it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+        it.setCheckState(QtCore.Qt.Unchecked)
+        lw.addItem(it)
+    bar = check_list_bar(lw, "region")
+    count = bar.findChild(QtWidgets.QLabel)
+    assert count.text() == "0 of 3 selected"
+    lw.item(0).setCheckState(QtCore.Qt.Checked)
+    assert count.text() == "1 of 3 selected"

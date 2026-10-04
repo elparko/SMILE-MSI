@@ -102,6 +102,11 @@ SCHEMA: tuple[Param, ...] = (
     Param("projection", "Spectrum", "Peak picking", "choice", "mean",
           choices=("mean", "skyline (max)"),
           help="Pick on the mean spectrum or the per-m/z maximum (skyline)."),
+    Param("max_peaks", "Max peaks (0 = no limit)", "Peak picking", "int", 0,
+          lo=0, hi=200000,
+          help="Keep at most this many peaks, most intense first. 0 keeps every peak that "
+               "clears the gates; a cap makes two regions with different numbers of "
+               "detectable ions report the same count."),
     # ---- Pre-processing chain (preprocess.py) ---------------------------
     Param("baseline_method", "Baseline", "Pre-processing", "choice", "none",
           choices=("none", "SNIP", "local minimum", "convex hull", "median"),
@@ -137,6 +142,10 @@ SCHEMA: tuple[Param, ...] = (
     Param("spatial_projection", "Candidates", "Spatial finder", "choice", "mean",
           choices=("mean", "skyline (max)", "both"),
           help="Candidate spectrum for the spatially-aware feature finder."),
+    Param("spatial_max_candidates", "Max candidates (0 = no limit)", "Spatial finder",
+          "int", 2000, lo=0, hi=200000,
+          help="How many detected peaks enter the spatial gates, most intense first. Each "
+               "extra candidate costs one Moran's I evaluation."),
     Param("spatial_min_freq", "Min frequency (%)", "Spatial finder", "float", 1.0,
           lo=0.0, hi=100.0, decimals=1,
           help="Minimum fraction of pixels a feature must occupy to survive."),

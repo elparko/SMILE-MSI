@@ -16,6 +16,7 @@ Arbitrary m/z falls back to a single streaming pass. No network, no database fil
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
 import math
@@ -64,12 +65,24 @@ class SpectrumStore:
     def shared_axis(self):
         return None
 
+    # Memoized (min, max) m/z once known — without a shared axis the bounds cost a full
+    # pass over every spectrum, and they are asked for by every log-axis build, the cube
+    # size estimate, the cube build and the dataset fingerprint.
+    _mz_bounds_cache = None
+
+    def remember_mz_bounds(self, lo, hi):
+        self._mz_bounds_cache = (float(lo), float(hi))
+
     def mz_bounds(self):
-        """(min m/z, max m/z) across the dataset — cheap when a shared axis exists.
+        """(min m/z, max m/z) across the dataset — cheap when a shared axis exists, one
+        serial pass otherwise (memoized; :meth:`MSIDataset.mz_range` computes it with the
+        parallel reader first and hands the result back via :meth:`remember_mz_bounds`).
 
         Non-finite entries (a corrupt / misread spectrum) are dropped so one bad read can't
         poison the bounds — and, downstream, the dataset fingerprint that keys the managed
         session (a garbage range used to mint a duplicate cohort sample on every load)."""
+        if self._mz_bounds_cache is not None:
+            return self._mz_bounds_cache
         ax = self.shared_axis()
         if ax is not None:
             a = np.asarray(ax, dtype=np.float64)
@@ -84,6 +97,7 @@ class SpectrumStore:
             if mz.size:
                 lo = min(lo, float(mz.min()))
                 hi = max(hi, float(mz.max()))
+        self._mz_bounds_cache = (lo, hi)
         return lo, hi
 
 
@@ -195,6 +209,72 @@ def _ram_budget():
     return int(total * 0.5) if total else 4 * (1 << 30)
 
 
+def _cube_build_budget():
+    """RAM the out-of-core cube build may use for its transient sort buffers: an eighth of
+    the dense-cache budget (a sixteenth of physical RAM), floored at 128 MB and capped at
+    4 GB. ``$SMILE_MSI_RAM_BUDGET_GB`` scales it through :func:`_ram_budget`."""
+    return int(min(max(_ram_budget() // 8, 128 << 20), 4 << 30))
+
+
+# Pixels per batch for the processed-mode prime / skyline accumulators: one bincount (or
+# maximum.at) per batch instead of one nbins-long scatter + accumulate per pixel.
+_PRIME_BATCH = 64
+
+# Bin cap the app passes to build_mz_cube. The library default (60,000) widens 15 ppm bins to
+# ~38 ppm over a 200-2000 m/z range; this cap keeps them at 15 ppm (≈153k bins there) so
+# cube-served ion images and ROI spectra honour a 10 ppm window instead of ±19-38 ppm. The
+# extra bins cost 8 bytes each (indptr / column sums), nothing per pixel.
+FULL_CUBE_MAX_BINS = 200_000
+
+
+class _PrimeAccumulator:
+    """:meth:`MSIDataset.prime`'s per-spectrum work, factored so a cube build can fold it into
+    its own read (one pass over the file instead of two). Row ``k`` is pixel ``base + k``;
+    chunk partials merge into the whole-slide accumulator in pixel order."""
+
+    def __init__(self, axis, edges, n, base=0):
+        self.axis = axis
+        self.edges = edges                       # None for a shared axis
+        self.n = int(n)
+        self.base = int(base)
+        self.acc = np.zeros(len(axis), dtype=np.float64)
+        self.tic = np.zeros(self.n)
+        self.rms = np.zeros(self.n)
+        self.med = np.zeros(self.n)
+        self._bi: list = []
+        self._bw: list = []
+
+    def add(self, k, mz, inten):
+        inten = np.asarray(inten, dtype=np.float64)
+        if self.edges is None:
+            self.acc[: len(inten)] += inten
+        else:
+            idx = np.searchsorted(self.edges, mz, side="right") - 1
+            ok = (idx >= 0) & (idx < len(self.axis))
+            self._bi.append(idx[ok])
+            self._bw.append(inten[ok])
+            if len(self._bi) >= _PRIME_BATCH:
+                self.flush()
+        self.tic[k], self.rms[k], self.med[k] = _pixel_stats(inten)
+
+    def flush(self):
+        if self._bi:
+            self.acc += np.bincount(np.concatenate(self._bi), weights=np.concatenate(self._bw),
+                                    minlength=len(self.axis))
+            self._bi, self._bw = [], []
+
+    def merge(self, part):
+        part.flush()
+        self.acc += part.acc
+        sl = slice(part.base, part.base + part.n)
+        self.tic[sl], self.rms[sl], self.med[sl] = part.tic, part.rms, part.med
+
+    def result(self, n_total):
+        self.flush()
+        return ((self.axis, self.acc / max(int(n_total), 1)),
+                {"tic": self.tic, "rms": self.rms, "median": self.med})
+
+
 class ImzMLStore(SpectrumStore):
     """Lazy imzML backend — reads each spectrum from the .ibd on demand.
 
@@ -281,7 +361,8 @@ class ImzMLStore(SpectrumStore):
         # Cache the (immutable) parse result so the next open of this file skips the
         # single-threaded XML parse entirely (see from_cache). Only the full, unsubsampled
         # read is cacheable; previews (stride/max_pixels) parse fresh. Best-effort.
-        if int(stride) == 1 and max_pixels is None and self._portable is not None:
+        self._full_read = int(stride) == 1 and max_pixels is None
+        if self._full_read and self._portable is not None:
             self._save_parse_cache()
 
     def _save_parse_cache(self):
@@ -331,6 +412,9 @@ class ImzMLStore(SpectrumStore):
         # value stays flagged as an estimate on reopen.
         self.pixel_size_y_um = None
         self.pixel_size_source = cached.get("pixel_size_source")
+        if cached.get("mz_bounds") is not None:
+            self._mz_bounds_cache = tuple(float(v) for v in cached["mz_bounds"])
+        self._full_read = True
         self.supports_parallel = True
         self._ibd_path = ibd
         self._portable = PortableSpectrumReader(
@@ -342,6 +426,17 @@ class ImzMLStore(SpectrumStore):
 
     def __len__(self):
         return self._n
+
+    def remember_mz_bounds(self, lo, hi):
+        super().remember_mz_bounds(lo, hi)
+        # Only a full, unsubsampled read has the slide's true bounds; write them into the
+        # parse sidecar so the next open skips the pass entirely. Best-effort.
+        if getattr(self, "_full_read", False):
+            try:
+                from . import session
+                session.amend_parse_cache(self.path, mz_bounds=np.asarray([lo, hi], dtype=np.float64))
+            except Exception:  # noqa: BLE001 — caching must never break a load
+                pass
 
     def get(self, i):
         if self._p is not None:
@@ -473,6 +568,8 @@ class MSIDataset:
         self.pixel_size_source = getattr(store, "pixel_size_source", None)
         self.orientation = 0         # display rotation, 90°-CW steps (0–3); see set_orientation
         self.transforms: list = []   # per-spectrum preprocessing callables (mz,inten)->(mz,inten)
+        self._transform_wants_index: list = []   # per transform: takes the pixel index too
+        self.preprocessing = None    # the config those transforms were built from (GUI/session)
         # caches built on demand
         self._mean = None          # (axis, mean_intensity)
         self._pix = None           # dict(tic=, rms=, median=)
@@ -480,6 +577,10 @@ class MSIDataset:
         self._masked_mean_cache: dict = {}  # exact LRU of masked mean spectra (ROI/region signatures)
         self._feat: _Features | None = None
         self._ion_cache: dict = {}  # LRU of streamed arbitrary-m/z ion vectors
+        self._mz_range = None      # (lo, hi) of the raw store — one pass on processed data
+        # callable(label, seconds, n_spectra): set by the GUI so every bulk read of the
+        # store lands in the perf log with its cost (see _pass)
+        self.on_pass = None
         self._cube = None           # optional (axis, csc pixels×bins, edges) for fast ion images
         self._cube_mean_cache: dict = {}  # LRU of cube-served masked mean spectra (region re-select)
         self._cube_mean_lock = threading.Lock()  # guards _cube_mean_cache (GUI + worker threads hit it)
@@ -491,11 +592,28 @@ class MSIDataset:
         self._ion_embedding: dict = {}  # learned ion embeddings, keyed by caller (ionembed.py)
 
     # ----- preprocessing hook --------------------------------------------- #
+    @contextlib.contextmanager
+    def _pass(self, label: str, n=None):
+        """Time one bulk read over the store and report it through ``on_pass``. Every
+        method that streams spectra runs under one of these, so a slow session shows which
+        pass cost what — including passes that ran on the GUI thread."""
+        import time
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            cb = getattr(self, "on_pass", None)
+            if cb is not None:
+                try:
+                    cb(label, time.perf_counter() - t0, self.n_pixels if n is None else int(n))
+                except Exception:  # noqa: BLE001 — diagnostics never break a pass
+                    pass
+
     def _read(self, i):
         """Read spectrum i and apply the preprocessing pipeline (if any)."""
         mz, inten = self.store.get(int(i))
-        for t in self.transforms:
-            mz, inten = t(mz, inten)
+        for t, wants_i in zip(self.transforms, self._transform_wants_index):
+            mz, inten = t(mz, inten, i) if wants_i else t(mz, inten)
         return mz, inten
 
     # ----- parallel streaming -------------------------------------------- #
@@ -503,6 +621,9 @@ class MSIDataset:
     # / build_mz_cube). Reads are disk- and numpy-bound (both release the GIL), so a
     # thread pool overlaps them across cores. Default: leave headroom for the GUI.
     n_stream_workers: int | None = None
+    # Threads that bin pixel chunks during the out-of-core cube build (see
+    # _build_mz_cube_streaming); default = min(4, cores - 2). Reads are unaffected.
+    n_bin_workers: int | None = None
 
     def _stream_workers(self) -> int:
         if self.n_stream_workers:
@@ -525,11 +646,13 @@ class MSIDataset:
             parallel = (getattr(self.store, "supports_parallel", False)
                         and len(indices) >= 1024)
         transforms = self.transforms if apply_transforms else ()
+        # which transforms want the pixel index (per-region recalibration); see _read
+        wants = self._transform_wants_index if apply_transforms else ()
         if not parallel:
             for i in indices:
                 mz, inten = self.store.get(int(i))
-                for t in transforms:
-                    mz, inten = t(mz, inten)
+                for t, wants_i in zip(transforms, wants):
+                    mz, inten = t(mz, inten, i) if wants_i else t(mz, inten)
                 yield i, mz, inten
             return
 
@@ -554,8 +677,8 @@ class MSIDataset:
                 with rlock:
                     readers.append(r)
             mz, inten = store.read_with(r, int(i))
-            for t in transforms:
-                mz, inten = t(mz, inten)
+            for t, wants_i in zip(transforms, wants):
+                mz, inten = t(mz, inten, i) if wants_i else t(mz, inten)
             return i, mz, inten
 
         it = iter(indices)
@@ -583,10 +706,17 @@ class MSIDataset:
                     except Exception:  # noqa: BLE001
                         pass
 
-    def set_preprocessing(self, transforms):
+    def set_preprocessing(self, transforms, config=None):
         """Set the per-spectrum preprocessing pipeline (list of callables that take
-        and return ``(mz, intensity)``, preserving the m/z axis). Clears caches."""
+        and return ``(mz, intensity)``, preserving the m/z axis). Clears caches.
+        ``config`` is the :func:`preprocess.build_pipeline` dict the callables came from —
+        kept on the dataset so sessions can persist it and cache keys can include it."""
         self.transforms = list(transforms or [])
+        # per-region recalibration needs to know which pixel it is looking at; every other
+        # transform keeps the two-argument form. Resolved once here, not per spectrum.
+        self._transform_wants_index = [bool(getattr(t, "needs_index", False))
+                                       for t in self.transforms]
+        self.preprocessing = dict(config) if (config and self.transforms) else None
         # Cap how much per-pixel normalization may amplify a faint pixel. A low-TIC pixel
         # (tissue edge / incomplete baseline / electronic spike — the ones SCiLS excludes
         # from normalization) would otherwise be divided by a near-zero factor and explode
@@ -654,7 +784,8 @@ class MSIDataset:
         block = None
         bulk = getattr(store, "read_intensity_block", None)
         if bulk is not None:
-            block = bulk()
+            with self._pass("read into RAM (bulk block)"):
+                block = bulk()
         if block is not None and block.shape == (n, k):
             mat = block
             if progress:
@@ -664,14 +795,15 @@ class MSIDataset:
             done = 0
             # snapshot RAW spectra (apply_transforms=False) so a later set_preprocessing stays
             # correct; transforms are re-applied on read just as they are for the lazy store.
-            for i, _mz, inten in self._read_many(range(n), parallel=parallel,
-                                                 apply_transforms=False):
-                row = np.asarray(inten, dtype=np.float32)
-                L = min(row.shape[0], k)
-                mat[i, :L] = row[:L]
-                done += 1
-                if progress and done % 256 == 0:
-                    progress(done, n)
+            with self._pass("read into RAM (per pixel)"):
+                for i, _mz, inten in self._read_many(range(n), parallel=parallel,
+                                                     apply_transforms=False):
+                    row = np.asarray(inten, dtype=np.float32)
+                    L = min(row.shape[0], k)
+                    mat[i, :L] = row[:L]
+                    done += 1
+                    if progress and done % 256 == 0:
+                        progress(done, n)
             if progress:
                 progress(n, n)
         self.store = DenseMemoryStore(self.coordinates, axis, mat, polarity=self.polarity,
@@ -760,7 +892,32 @@ class MSIDataset:
 
     @property
     def mz_range(self):
-        return self.store.mz_bounds()
+        """(min, max) m/z of the raw store, computed once per dataset. Processed-mode data
+        has no shared axis, so the bounds need a pass over every spectrum: it runs through
+        the parallel reader (not the store's serial fallback) and the result is handed back
+        to the store, which persists it beside the file when it can."""
+        cached = getattr(self, "_mz_range", None)
+        if cached is not None:
+            return cached
+        store = self.store
+        if getattr(store, "_mz_bounds_cache", None) is None and store.shared_axis() is None:
+            with self._pass("m/z bounds"):
+                if getattr(store, "supports_parallel", False) and self.n_pixels >= 1024:
+                    lo, hi = np.inf, -np.inf
+                    for _, mz, _ in self._read_many(range(self.n_pixels),
+                                                    apply_transforms=False):
+                        mz = np.asarray(mz, dtype=np.float64)
+                        mz = mz[np.isfinite(mz)]
+                        if mz.size:
+                            lo = min(lo, float(mz.min()))
+                            hi = max(hi, float(mz.max()))
+                    remember = getattr(store, "remember_mz_bounds", None)
+                    if remember is not None:
+                        remember(lo, hi)
+                else:
+                    store.mz_bounds()                  # serial fallback, memoised by the store
+        self._mz_range = tuple(store.mz_bounds())
+        return self._mz_range
 
     def set_orientation(self, k: int):
         """Display rotation in 90°-clockwise steps (0–3). Applied at the single
@@ -889,6 +1046,8 @@ class MSIDataset:
         med = np.zeros(n)
 
         done = 0
+        timer = self._pass("prime (mean spectrum + pixel stats)")
+        timer.__enter__()
         if shared is not None:
             axis = np.asarray(shared, dtype=np.float64)
             acc = np.zeros(len(axis), dtype=np.float64)
@@ -904,19 +1063,42 @@ class MSIDataset:
             axis = self._log_axis(self._bin_ppm)
             edges = _bin_edges(axis)
             acc = np.zeros(len(axis), dtype=np.float64)
+            # Batch the bin scatter: a per-pixel bincount allocates and zero-fills an
+            # nbins-long (up to 200k) array per spectrum, which dominated the pass on a
+            # 4k-peak centroid slide. Bin contributions still accumulate in pixel order.
+            batch_idx: list = []
+            batch_w: list = []
             for i, mz, inten in self._read_many(range(n)):
                 idx = np.searchsorted(edges, mz, side="right") - 1
                 ok = (idx >= 0) & (idx < len(axis))
-                acc += np.bincount(idx[ok], weights=inten[ok], minlength=len(axis))
+                batch_idx.append(idx[ok])
+                batch_w.append(inten[ok])
                 tic[i], rms[i], med[i] = _pixel_stats(inten)
                 done += 1
+                if len(batch_idx) >= _PRIME_BATCH:
+                    acc += np.bincount(np.concatenate(batch_idx),
+                                       weights=np.concatenate(batch_w), minlength=len(axis))
+                    batch_idx, batch_w = [], []
                 if progress and done % 256 == 0:
                     progress(done, n)
+            if batch_idx:
+                acc += np.bincount(np.concatenate(batch_idx),
+                                   weights=np.concatenate(batch_w), minlength=len(axis))
             mean = acc / n
+        timer.__exit__(None, None, None)
         if progress:
             progress(n, n)
         self._mean = (axis, mean)
         self._pix = {"tic": tic, "rms": rms, "median": med}
+
+    def _prime_accumulator(self, n, base=0):
+        """A fresh :class:`_PrimeAccumulator` on this dataset's prime axis (the shared m/z axis,
+        or the ``_bin_ppm`` log axis for processed data)."""
+        shared = self.store.shared_axis()
+        if shared is not None:
+            return _PrimeAccumulator(np.asarray(shared, dtype=np.float64), None, n, base)
+        axis = self._log_axis(self._bin_ppm)
+        return _PrimeAccumulator(axis, _bin_edges(axis), n, base)
 
     def _prime_dense(self, M, progress=None):
         """Vectorized :meth:`prime` for an in-RAM dense matrix: the mean spectrum is one
@@ -982,19 +1164,20 @@ class MSIDataset:
             return hit
         shared = self.store.shared_axis()
         idxs = np.flatnonzero(mask)
-        if shared is not None:
-            axis = np.asarray(shared, dtype=np.float64)
-            acc = np.zeros(len(axis))
-            for i, _, inten in self._read_many(idxs):    # parallel, like prime()/max_spectrum
-                acc[: len(inten)] += inten
-        else:
-            axis = self._log_axis(self._bin_ppm)
-            edges = _bin_edges(axis)
-            acc = np.zeros(len(axis))
-            for i, mz, inten in self._read_many(idxs):
-                bi = np.searchsorted(edges, mz, side="right") - 1
-                ok = (bi >= 0) & (bi < len(axis))
-                acc += np.bincount(bi[ok], weights=inten[ok], minlength=len(axis))
+        with self._pass("ROI mean spectrum (streamed)", n=len(idxs)):
+            if shared is not None:
+                axis = np.asarray(shared, dtype=np.float64)
+                acc = np.zeros(len(axis))
+                for i, _, inten in self._read_many(idxs):    # parallel, like prime()/max_spectrum
+                    acc[: len(inten)] += inten
+            else:
+                axis = self._log_axis(self._bin_ppm)
+                edges = _bin_edges(axis)
+                acc = np.zeros(len(axis))
+                for i, mz, inten in self._read_many(idxs):
+                    bi = np.searchsorted(edges, mz, side="right") - 1
+                    ok = (bi >= 0) & (bi < len(axis))
+                    acc += np.bincount(bi[ok], weights=inten[ok], minlength=len(axis))
         result = (axis, acc / max(len(idxs), 1))
         if len(self._masked_mean_cache) >= 8:      # bounded LRU (masks can be large)
             self._masked_mean_cache.pop(next(iter(self._masked_mean_cache)))
@@ -1093,6 +1276,9 @@ class MSIDataset:
         shared = self.store.shared_axis()
         idxs = np.flatnonzero(np.asarray(mask, dtype=bool)) if mask is not None \
             else range(self.n_pixels)
+        timer = self._pass("skyline (max spectrum)" if mask is None else "ROI skyline (streamed)",
+                           n=len(idxs))
+        timer.__enter__()
         if shared is not None:
             axis = np.asarray(shared, dtype=np.float64)
             acc = np.zeros(len(axis))
@@ -1102,12 +1288,21 @@ class MSIDataset:
             axis = self._log_axis(self._bin_ppm)
             edges = _bin_edges(axis)
             acc = np.zeros(len(axis))
+            # One maximum.at per batch of pixels instead of an nbins-long temporary per
+            # pixel — identical result (max is order-free and acc starts at 0 either way).
+            batch_idx: list = []
+            batch_w: list = []
             for _, mz, inten in self._read_many(idxs):
                 bi = np.searchsorted(edges, mz, side="right") - 1
                 ok = (bi >= 0) & (bi < len(axis))
-                tmp = np.zeros(len(axis))
-                np.maximum.at(tmp, bi[ok], inten[ok])
-                acc = np.maximum(acc, tmp)
+                batch_idx.append(bi[ok])
+                batch_w.append(inten[ok])
+                if len(batch_idx) >= _PRIME_BATCH:
+                    np.maximum.at(acc, np.concatenate(batch_idx), np.concatenate(batch_w))
+                    batch_idx, batch_w = [], []
+            if batch_idx:
+                np.maximum.at(acc, np.concatenate(batch_idx), np.concatenate(batch_w))
+        timer.__exit__(None, None, None)
         result = (axis, acc)
         if mask is None:
             self._max = result
@@ -1179,21 +1374,22 @@ class MSIDataset:
             self._feat = _Features(peaks=peaks, matrix=mat, tol_ppm=tol_ppm, reduce=reduce)
             return mat
         done = 0
-        for i, mz, inten in self._read_many(range(n)):
-            if a0 is not None:
-                a, b = a0, b0
-            else:
-                a = np.searchsorted(mz, lo, side="left")
-                b = np.searchsorted(mz, hi, side="right")
-            if reduce != "max" and dense:
-                csum = np.concatenate(([0.0], np.cumsum(inten)))
-                sums = csum[b] - csum[a]
-                mat[i] = sums / np.maximum(b - a, 1) if reduce == "mean" else sums
-            else:
-                _reduce_windows(inten, a, b, reduce, mat[i])
-            done += 1
-            if progress and done % 256 == 0:
-                progress(done, n)
+        with self._pass(f"extract {p} feature(s)"):
+            for i, mz, inten in self._read_many(range(n)):
+                if a0 is not None:
+                    a, b = a0, b0
+                else:
+                    a = np.searchsorted(mz, lo, side="left")
+                    b = np.searchsorted(mz, hi, side="right")
+                if reduce != "max" and dense:
+                    csum = np.concatenate(([0.0], np.cumsum(inten)))
+                    sums = csum[b] - csum[a]
+                    mat[i] = sums / np.maximum(b - a, 1) if reduce == "mean" else sums
+                else:
+                    _reduce_windows(inten, a, b, reduce, mat[i])
+                done += 1
+                if progress and done % 256 == 0:
+                    progress(done, n)
         if progress:
             progress(n, n)
         self._feat = _Features(peaks=peaks, matrix=mat, tol_ppm=tol_ppm, reduce=reduce)
@@ -1366,7 +1562,8 @@ class MSIDataset:
 
     def build_mz_cube(self, bin_ppm: float = 15.0, max_bins: int = 60000,
                       min_intensity: float = 0.0, progress=None,
-                      out_path=None, fingerprint: str = "", max_ram_bytes=None):
+                      out_path=None, fingerprint: str = "", max_ram_bytes=None,
+                      prime: bool = False):
         """Stream once to build a sparse ``pixels × m/z-bin`` matrix. Afterwards an
         ion image at ANY m/z is a fast column-range slice (no file re-read) — the
         load-bearing path for browsing large files. Bins are ``bin_ppm`` ppm wide,
@@ -1377,8 +1574,14 @@ class MSIDataset:
         :class:`~smile_msi.cubestore.CubeStore` at that path (Phase-2 streaming build):
         the whole cube never sits in RAM, so peak build memory is bounded by
         ``max_ram_bytes`` (default 256 MB) instead of ~4× the cube. ``_cube`` then becomes
-        the lazily-read store. Without ``out_path`` the legacy in-RAM build runs unchanged."""
+        the lazily-read store. Without ``out_path`` the legacy in-RAM build runs unchanged.
+
+        ``prime=True`` folds :meth:`prime` into the same read when its results are not
+        cached yet — the mean spectrum and per-pixel stats come out of this one pass, so a
+        disk-backed slide is read once on open instead of twice."""
         from scipy import sparse
+
+        fuse_prime = bool(prime) and (self._mean is None or self._pix is None)
 
         # widen bins if needed so the cube spans the full m/z range within max_bins
         lo, hi = self.mz_range
@@ -1412,7 +1615,7 @@ class MSIDataset:
                 return self._build_mz_cube_streaming(
                     out_path, axis=axis, edges=edges, nbins=nbins, bi0=bi0, valid0=valid0,
                     min_intensity=min_intensity, bin_ppm=bin_ppm, fingerprint=fingerprint,
-                    max_ram_bytes=max_ram_bytes, progress=progress)
+                    max_ram_bytes=max_ram_bytes, progress=progress, prime=fuse_prime)
         # Assemble the cube in pixel CHUNKS: each chunk becomes a compact float32 CSR block
         # and the blocks are vstacked at the end. This bounds the transient COO memory to
         # one chunk (int32 indices) instead of holding a list of arrays for EVERY pixel and
@@ -1446,7 +1649,12 @@ class MSIDataset:
             parts.append(part.astype(np.float32))             # store compact; sums already done
             buf_r, buf_c, buf_v = [], [], []
 
+        pa = self._prime_accumulator(n) if fuse_prime else None
+        timer = self._pass("cube build (in RAM)" + (" + prime" if pa is not None else ""))
+        timer.__enter__()
         for i, mz, inten in self._read_many(range(n)):
+            if pa is not None:
+                pa.add(i, mz, inten)
             cols, vals = self._bin_pixel(mz, inten, edges, nbins, min_intensity, bi0, valid0)
             if cols.size:
                 buf_r.append(np.full(cols.size, i, dtype=np.int64))
@@ -1462,6 +1670,9 @@ class MSIDataset:
                 in_chunk = 0
         if in_chunk:
             flush(base + in_chunk)
+        timer.__exit__(None, None, None)
+        if pa is not None:
+            self._mean, self._pix = pa.result(n)
         if progress:
             progress(n, n)
         cube = (sparse.vstack(parts, format="csc") if parts
@@ -1477,130 +1688,232 @@ class MSIDataset:
         return self._cube
 
     def _build_mz_cube_streaming(self, out_path, *, axis, edges, nbins, bi0, valid0,
-                                 min_intensity, bin_ppm, fingerprint, max_ram_bytes, progress):
+                                 min_intensity, bin_ppm, fingerprint, max_ram_bytes, progress,
+                                 prime=False):
         """Out-of-core cube build (see :meth:`build_mz_cube`): the cube is written straight to
         a :class:`CubeStore` at ``out_path`` so it never sits in RAM whole.
 
         Two passes, both memory-bounded:
 
-        * **Pass 1** streams every spectrum, bins it (identically to the in-RAM build), and
-          spills the per-pixel ``(row, col, value)`` entries to a temp file in *pixel order*,
-          accumulating a per-column count. Only one spectrum is resident.
-        * **Pass 2** turns that row-ordered spill into canonical CSC one **column band** at a
-          time: select the band's entries, stable-sort by column (rows stay ascending, since
-          they were spilled in pixel order), and stream the sorted ``data``/``indices`` block
-          to the store. Per-column sums (the mean-spectrum numerator) are accumulated in
-          float64 exactly as ``cube.T @ ones`` would. The band count is chosen so each band's
-          transient stays under ``max_ram_bytes``.
+        * **Pass 1** streams the spectra in pixel chunks, bins each chunk into one block CSR
+          (the same construction as the in-RAM build, so within-pixel bin collisions sum
+          identically) and spills its ``(row, col, value)`` entries into a fixed number of
+          **column-range bucket files**, each chunk's slice grouped by bucket. Only one chunk
+          is resident; chunks are bounded by entry count, not pixel count.
+        * **Pass 2** turns each bucket into canonical CSC: a bucket that fits the RAM budget
+          is loaded once and stable-sorted by column (rows stay ascending because chunks
+          were spilled in pixel order and the grouping was stable); an oversize bucket is
+          split into column sub-bands, each selected by one scan of *that bucket only*. The
+          sorted ``data``/``indices`` block streams to the store and the per-column sums (the
+          mean-spectrum numerator) accumulate in float64 exactly as ``cube.T @ ones``.
 
-        The resulting store is byte-identical to building the CSC in RAM and calling
-        :meth:`CubeStore.create`, so ion images / mean & max spectra are unchanged."""
-        import math
+        Spill I/O is a small constant multiple of the entry count regardless of the budget.
+        The previous design re-scanned the whole spill once per column band, which on a
+        600M-entry slide with the old 128 MB default meant ~200 full scans of a 7 GB spill.
+        The result is byte-identical to building the CSC in RAM and calling
+        :meth:`CubeStore.create`."""
         import os
         import tempfile
 
         from scipy import sparse
 
-        from .cubestore import CubeStore
-
         n = self.n_pixels
         dest_dir = os.path.dirname(str(out_path)) or "."
-        spill_dtypes = (("r", np.int32), ("c", np.int32), ("v", np.float32))
-        paths, handles = {}, {}
-        for key, _dt in spill_dtypes:
-            fd, p = tempfile.mkstemp(prefix=f".cube_spill_{key}_", suffix=".bin", dir=dest_dir)
+        budget = int(max_ram_bytes) if max_ram_bytes else _cube_build_budget()
+        entry_dt = np.dtype([("r", "<i4"), ("c", "<i4"), ("v", "<f4")])
+        _PER_ENTRY = 44                           # spill + contiguous copy + argsort + sorted out
+        # Chunks are binned on a small thread pool (COO→CSR, grouping, bincount all release
+        # the GIL) while the consumer keeps draining the reader; commits — the bucket-file
+        # appends and the column counts — happen on the consumer in submission order, so the
+        # spill is byte-identical to a serial build. The transient budget (~96 B per entry:
+        # the int32/int32/float64 buffers, their concatenation, the COO→CSR block and the
+        # grouped copies) is split across the in-flight chunks; a chunk never drops below 64k
+        # entries and never exceeds 16M.
+        import os as _os
+        nbin_workers = (max(1, int(self.n_bin_workers)) if self.n_bin_workers
+                        else max(1, min(4, (_os.cpu_count() or 2) - 2)))
+        chunk_entries = int(min(max(budget // (96 * nbin_workers), 1 << 16), 16 << 20))
+        nbuckets = int(max(1, min(32, nbins)))
+        bucket_edges = np.linspace(0, nbins, nbuckets + 1).astype(np.int64)
+        bucket_paths = []
+        for b in range(nbuckets):
+            fd, p = tempfile.mkstemp(prefix=f".cube_spill_{b:02d}_", suffix=".bin", dir=dest_dir)
             os.close(fd)
-            paths[key] = p
-            handles[key] = open(p, "wb")
+            bucket_paths.append(p)
+        col_counts = np.zeros(nbins, dtype=np.int64)
+        nnz = 0
         writer = None
         try:
-            # --- pass 1: stream, bin, spill (row, col, val) in pixel order; count columns ---
-            col_counts = np.zeros(nbins, dtype=np.int64)
-            nnz = 0
-            for i, mz, inten in self._read_many(range(n)):
-                cols, vals = self._bin_pixel(mz, inten, edges, nbins, min_intensity, bi0, valid0)
-                if cols.size:
-                    # 1-row CSR sums within-pixel bin collisions in float64 then casts to
-                    # float32 — the exact same value the in-RAM block CSR produces for this row.
-                    row = sparse.csr_matrix(
-                        (vals, (np.zeros(cols.size, dtype=np.int32), cols)),
-                        shape=(1, nbins)).astype(np.float32)
-                    c = row.indices.astype(np.int32)
-                    handles["r"].write(np.full(c.size, i, dtype=np.int32).tobytes())
-                    handles["c"].write(c.tobytes())
-                    handles["v"].write(row.data.tobytes())
-                    col_counts[c] += 1
-                    nnz += int(c.size)
-                if progress and (i & 255) == 0:
-                    progress(i, 2 * n)                 # pass 1 is the first half of the bar
-            for h in handles.values():
-                h.flush()
-                h.close()
+            # --- pass 1: stream → block CSR per chunk (pool) → bucketed spill, in pixel order ---
+            from collections import deque
+            from concurrent.futures import ThreadPoolExecutor
+
+            def bin_chunk(buf_mz, buf_in, base, nrows):
+                """Pure: one chunk of raw spectra (pixels base..base+nrows-1, in order) →
+                (per-column counts, nnz, [(bucket, bytes)], prime partial). Binning each
+                spectrum happens here too, so the consumer only hands spectra over."""
+                pa = self._prime_accumulator(nrows, base) if prime else None
+                rows_l, cols_l, vals_l = [], [], []
+                for k in range(nrows):
+                    if pa is not None:
+                        pa.add(k, buf_mz[k], buf_in[k])
+                    cols_i, vals_i = self._bin_pixel(buf_mz[k], buf_in[k], edges, nbins,
+                                                     min_intensity, bi0, valid0)
+                    if cols_i.size:
+                        rows_l.append(np.full(cols_i.size, k, dtype=np.int32))
+                        cols_l.append(cols_i)
+                        vals_l.append(vals_i)
+                if not rows_l:
+                    return None, 0, [], pa
+                r = np.concatenate(rows_l)
+                c = np.concatenate(cols_l)
+                v = np.concatenate(vals_l)                    # float64 → sums collisions exactly
+                part = sparse.csr_matrix((v, (r, c)), shape=(nrows, nbins)).astype(np.float32)
+                if part.nnz == 0:
+                    return None
+                rows = np.repeat(np.arange(nrows, dtype=np.int32) + np.int32(base),
+                                 np.diff(part.indptr))
+                cols = part.indices.astype(np.int32)
+                vals = part.data
+                # group by bucket only (a stable radix pass on uint8 keys); the per-column
+                # sort happens once per bucket in pass 2.
+                bid = (np.searchsorted(bucket_edges, cols, side="right") - 1).astype(np.uint8)
+                order = np.argsort(bid, kind="stable")
+                rows, cols, vals, bid = rows[order], cols[order], vals[order], bid[order]
+                counts = np.bincount(cols, minlength=nbins)
+                bounds = np.searchsorted(bid, np.arange(nbuckets + 1, dtype=np.uint8))
+                blobs = []
+                for b in range(nbuckets):
+                    lo, hi = int(bounds[b]), int(bounds[b + 1])
+                    if hi <= lo:
+                        continue
+                    rec = np.empty(hi - lo, dtype=entry_dt)
+                    rec["r"] = rows[lo:hi]
+                    rec["c"] = cols[lo:hi]
+                    rec["v"] = vals[lo:hi]
+                    blobs.append((b, rec.tobytes()))
+                return counts, int(cols.size), blobs, pa
+
+            prime_all = self._prime_accumulator(n) if prime else None
+
+            def commit(fut):
+                nonlocal nnz
+                counts, k, blobs, pa = fut.result()    # propagates a worker error
+                if pa is not None:
+                    prime_all.merge(pa)
+                if counts is None:
+                    return
+                col_counts[:] += counts
+                nnz += k
+                for b, blob in blobs:
+                    with open(bucket_paths[b], "ab") as fh:
+                        fh.write(blob)
+
+            buf_mz: list = []
+            buf_in: list = []
+            base = 0
+            in_chunk = 0
+            in_entries = 0
+            inflight: deque = deque()
+            pool = ThreadPoolExecutor(max_workers=nbin_workers)
+            pass1 = self._pass("cube build pass 1 (bin + spill)" + (" + prime" if prime else ""))
+            pass1.__enter__()
+            try:
+                for i, mz, inten in self._read_many(range(n)):
+                    buf_mz.append(mz)
+                    buf_in.append(inten)
+                    in_entries += len(mz)
+                    in_chunk += 1
+                    if progress and (i & 255) == 0:
+                        progress(i, 2 * n)             # pass 1 is the first half of the bar
+                    if in_entries >= chunk_entries:
+                        inflight.append(pool.submit(bin_chunk, buf_mz, buf_in, base, in_chunk))
+                        buf_mz, buf_in = [], []
+                        base += in_chunk
+                        in_chunk = 0
+                        in_entries = 0
+                        while len(inflight) > nbin_workers:   # bounded window, in-order commit
+                            commit(inflight.popleft())
+                if in_chunk:
+                    inflight.append(pool.submit(bin_chunk, buf_mz, buf_in, base, in_chunk))
+                while inflight:
+                    commit(inflight.popleft())
+            finally:
+                pool.shutdown(wait=True)
+                pass1.__exit__(None, None, None)
+            if prime_all is not None:
+                self._mean, self._pix = prime_all.result(n)   # stored into the sidecar below
 
             indptr = np.empty(nbins + 1, dtype=np.int64)
             indptr[0] = 0
             np.cumsum(col_counts, out=indptr[1:])
 
-            # --- pass 2: column-band counting-sort -> CSC, streamed to the store ---
-            # Read the spill with explicit chunked file reads (NOT mmap): mmap pages would
-            # count against process RSS once touched and defeat the memory bound, whereas
-            # np.fromfile leaves the spill in the OS page cache and keeps only one scan chunk
-            # resident. Each band holds ~budget/_PER_ENTRY entries at once for the stable sort.
-            budget = int(max_ram_bytes) if max_ram_bytes else (128 << 20)
-            _PER_ENTRY = 44                           # r+c+v spill + selected + argsort + sorted out
-            nbands = max(1, int(math.ceil(nnz * _PER_ENTRY / max(budget, 1)))) if nnz else 1
-            band_edges = np.linspace(0, nbins, nbands + 1).astype(np.int64)
+            # --- pass 2: each bucket → canonical CSC block(s), streamed to the store ---
             colsum = np.zeros(nbins, dtype=np.float64)
             writer = CubeStore.create_streaming(
                 out_path, axis=axis, edges=edges, indptr=indptr, nnz=nnz,
                 fingerprint=fingerprint, n_pixels=n, bin_ppm=bin_ppm,
                 min_intensity=min_intensity)
-            scan = 1 << 22                            # entries per spill-scan chunk (bounded RAM)
-            readers = {k: open(paths[k], "rb") for k, _dt in spill_dtypes}
-            try:
-                for bi in range(nbands):
-                    c0, c1 = int(band_edges[bi]), int(band_edges[bi + 1])
-                    if c1 <= c0:
-                        continue
-                    sel_r, sel_c, sel_v = [], [], []
-                    for rd in readers.values():
-                        rd.seek(0)
-                    remaining = nnz
-                    while remaining > 0:
-                        k = min(scan, remaining)
-                        remaining -= k
-                        cc = np.fromfile(readers["c"], dtype=np.int32, count=k)
-                        rr = np.fromfile(readers["r"], dtype=np.int32, count=k)
-                        vv = np.fromfile(readers["v"], dtype=np.float32, count=k)
-                        m = (cc >= c0) & (cc < c1)
-                        if m.any():
-                            sel_r.append(rr[m])
-                            sel_c.append(cc[m])
-                            sel_v.append(vv[m])
-                    if not sel_c:
-                        continue
-                    C = np.concatenate(sel_c)
-                    order = np.argsort(C, kind="stable")  # rows already ascending → canonical CSC
-                    data_block = np.concatenate(sel_v)[order]
-                    idx_block = np.concatenate(sel_r)[order]
-                    sel_r = sel_c = sel_v = C = order = None
-                    writer.write_block(data_block, idx_block)
-                    # per-column sums for this band, float64-accumulated == (cube.T @ ones)[c0:c1]
-                    local = indptr[c0:c1 + 1] - indptr[c0]
-                    nzc = np.where(np.diff(local) > 0)[0]
-                    if nzc.size:
-                        colsum[c0 + nzc] = np.add.reduceat(data_block.astype(np.float64), local[nzc])
-                    data_block = idx_block = None
-                    if progress:
-                        progress(n + int((bi + 1) / nbands * n), 2 * n)
-            finally:
-                for rd in readers.values():
-                    try:
-                        rd.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+
+            def emit(cols, rows, vals, c0, c1):
+                order = np.argsort(cols, kind="stable")   # rows already ascending → canonical
+                data_block = vals[order]
+                idx_block = rows[order]
+                writer.write_block(data_block, idx_block)
+                # per-column sums for this band, float64-accumulated == (cube.T @ ones)[c0:c1]
+                local = indptr[c0:c1 + 1] - indptr[c0]
+                nzc = np.where(np.diff(local) > 0)[0]
+                if nzc.size:
+                    colsum[c0 + nzc] = np.add.reduceat(data_block.astype(np.float64), local[nzc])
+
+            scan = 1 << 22                            # entries per bucket-scan chunk (bounded RAM)
+            pass2 = self._pass("cube build pass 2 (sort + write)", n=0)
+            pass2.__enter__()
+            for b in range(nbuckets):
+                c0, c1 = int(bucket_edges[b]), int(bucket_edges[b + 1])
+                m = os.path.getsize(bucket_paths[b]) // entry_dt.itemsize
+                if c1 <= c0 or m == 0:
+                    continue
+                nsub = max(1, int(math.ceil(m * _PER_ENTRY / max(budget, 1))))
+                if nsub == 1:
+                    rec = np.fromfile(bucket_paths[b], dtype=entry_dt)
+                    emit(np.ascontiguousarray(rec["c"]), np.ascontiguousarray(rec["r"]),
+                         np.ascontiguousarray(rec["v"]), c0, c1)
+                    rec = None
+                else:
+                    sub_edges = np.linspace(c0, c1, min(nsub, c1 - c0) + 1).astype(np.int64)
+                    with open(bucket_paths[b], "rb") as rd:
+                        for s in range(len(sub_edges) - 1):
+                            s0, s1 = int(sub_edges[s]), int(sub_edges[s + 1])
+                            if s1 <= s0:
+                                continue
+                            rd.seek(0)
+                            sel_r, sel_c, sel_v = [], [], []
+                            remaining = m
+                            while remaining > 0:
+                                k = min(scan, remaining)
+                                remaining -= k
+                                rec = np.fromfile(rd, dtype=entry_dt, count=k)
+                                keep = (rec["c"] >= s0) & (rec["c"] < s1)
+                                if keep.any():
+                                    sel_r.append(rec["r"][keep])
+                                    sel_c.append(rec["c"][keep])
+                                    sel_v.append(rec["v"][keep])
+                            if sel_c:
+                                emit(np.concatenate(sel_c), np.concatenate(sel_r),
+                                     np.concatenate(sel_v), s0, s1)
+                            sel_r = sel_c = sel_v = None
+                if progress:
+                    progress(n + int((b + 1) / nbuckets * n), 2 * n)
+            pass2.__exit__(None, None, None)
             mean = self._mean if getattr(self, "_mean", None) is not None else None
             pix = self._pix if getattr(self, "_pix", None) is not None else None
+            # A rebuild over the store being replaced (preprocessing change, manual rebuild):
+            # release its handle first so the atomic replace works on Windows too.
+            cur = self._cube
+            if isinstance(cur, CubeStore) and cur.path and \
+                    os.path.abspath(cur.path) == os.path.abspath(str(out_path)):
+                self._close_cube()
             store = writer.finalize(colsum, mean=mean, pix=pix)
             writer = None
         except BaseException:
@@ -1608,12 +1921,7 @@ class MSIDataset:
                 writer.abort()
             raise
         finally:
-            for h in handles.values():
-                try:
-                    h.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            for p in paths.values():
+            for p in bucket_paths:
                 try:
                     os.remove(p)
                 except OSError:
@@ -1674,6 +1982,28 @@ class MSIDataset:
             vals = self._cached_stream_ion(mz, tol_ppm, reduce)
         return vals / self.norm_factors(norm)
 
+    def ion_needs_disk_pass(self, mz: float, tol_ppm: float = DEFAULT_TOL_PPM,
+                            reduce: str = "sum") -> bool:
+        """True when :meth:`ion_vector` for this m/z would stream every spectrum off disk:
+        no extracted feature column, no in-RAM matrix, no cube, no cached streamed vector.
+        The GUI checks this before rendering on the event thread while the cube is building."""
+        j = self._feature_index(mz)
+        if j is not None and self._feat.reduce == reduce:
+            return False
+        if self._dense() is not None and self.store.shared_axis() is not None:
+            return False
+        if self._cube is not None or getattr(self.store, "in_memory", False):
+            return False
+        return (round(float(mz), 5), float(tol_ppm), reduce) not in self._ion_cache
+
+    def skyline_needs_disk_pass(self) -> bool:
+        """True when :meth:`max_spectrum` would stream every spectrum off disk (no cached
+        skyline, no in-RAM store, no cube to serve :meth:`cube_max_spectrum` instead)."""
+        if self._max is not None or self._cube is not None:
+            return False
+        return not (getattr(self.store, "in_memory", False)
+                    or getattr(self.store, "matrix", None) is not None)
+
     def _dense_ion(self, mz, tol_ppm, reduce):
         """Arbitrary-m/z ion vector as a vectorized column-range reduction of the in-RAM
         dense matrix — no per-pixel loop, no cube, no disk. Mathematically identical to
@@ -1712,13 +2042,14 @@ class MSIDataset:
         # instead of a serial per-pixel _read — this is the loop that froze the GUI on a
         # no-cube slide and that estimate_fdr's off-peak decoys hammer. Numerically identical
         # (same per-pixel window reduction, results yielded in pixel order).
-        for i, m, inten in self._read_many(range(self.n_pixels)):
-            a = np.searchsorted(m, lo, side="left")
-            b = np.searchsorted(m, hi, side="right")
-            if b > a:
-                seg = inten[a:b]
-                vals[i] = seg.sum() if reduce == "sum" else (
-                    seg.max() if reduce == "max" else seg.mean())
+        with self._pass(f"ion image m/z {mz:.4f} (streamed, no cube)"):
+            for i, m, inten in self._read_many(range(self.n_pixels)):
+                a = np.searchsorted(m, lo, side="left")
+                b = np.searchsorted(m, hi, side="right")
+                if b > a:
+                    seg = inten[a:b]
+                    vals[i] = seg.sum() if reduce == "sum" else (
+                        seg.max() if reduce == "max" else seg.mean())
         return vals
 
     def ion_image(self, mz: float, tol_ppm: float = DEFAULT_TOL_PPM, reduce: str = "sum",
@@ -1794,12 +2125,18 @@ class MSIDataset:
         return val
 
     def pick_peaks(self, snr: float = 3.0, min_rel_intensity: float = 0.0,
-                   max_peaks: int = 500, mask=None, projection: str = "mean",
+                   max_peaks: int = 0, mask=None, projection: str = "mean",
                    prominence: float = 1.0, local_noise: bool = True,
                    centroided: bool | None = None):
         """Detect peaks in the mean (``projection='mean'``) or skyline/maximum
-        (``projection='max'``) spectrum -> list of ``{mz, intensity, rel_intensity,
-        snr}`` sorted by descending intensity.
+        (``projection='max'``) spectrum -> :class:`PeakList` of ``{mz, intensity,
+        rel_intensity, snr}`` sorted by descending intensity.
+
+        ``max_peaks`` keeps only the N most intense; set it to ``0`` for no limit. The
+        result always reports how many peaks were detected before truncation as
+        ``.n_detected``, so a capped list can say so instead of looking like a
+        measurement — two regions that both stop at the cap have not been shown to
+        contain the same number of ions.
 
         Two pipelines, chosen by data type (``centroided`` overrides auto-detection):
 
@@ -1833,7 +2170,7 @@ class MSIDataset:
         axis, spec = (self.max_spectrum(mask=mask) if projection == "max"
                       else self.mean_spectrum(mask=mask))
         if not len(spec) or spec.max() <= 0:
-            return []
+            return PeakList()
         if centroided is None:
             centroided = self.is_centroided()
         if centroided:
@@ -1859,7 +2196,7 @@ class MSIDataset:
             "snr": float(spec[i] / noise[i]) if noise[i] > 0 else float("inf"),
         } for i in idx]
         peaks.sort(key=lambda d: d["intensity"], reverse=True)
-        return peaks[:max_peaks]
+        return PeakList(peaks[:max_peaks] if max_peaks and max_peaks > 0 else peaks, len(peaks))
 
     def _pick_centroids(self, axis, spec, snr, min_rel_intensity, max_peaks):
         """Peak 'picking' for already-centroided data: the recorded points **are** the
@@ -1876,7 +2213,7 @@ class MSIDataset:
         Gibb & Strimmer 2012; reimplemented, no source copied)."""
         nz = np.flatnonzero(spec > 0)
         if nz.size == 0:
-            return []
+            return PeakList()
         base = float(spec[nz].max())
         noise = _mad(spec)                       # robust height floor over the centroids
         thresh = max(snr * noise, min_rel_intensity * base)
@@ -1888,12 +2225,27 @@ class MSIDataset:
             "snr": float(spec[i] / noise) if noise > 0 else float("inf"),
         } for i in keep]
         peaks.sort(key=lambda d: d["intensity"], reverse=True)
-        return peaks[:max_peaks]
+        return PeakList(peaks[:max_peaks] if max_peaks and max_peaks > 0 else peaks, len(peaks))
 
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+class PeakList(list):
+    """A peak list that remembers how many peaks were detected before ``max_peaks``
+    truncation. A plain list would make a capped list indistinguishable from a complete
+    one: two regions that both stop at the cap look like they hold the same number of
+    ions when one may hold far more. Behaves as an ordinary list everywhere else."""
+
+    def __init__(self, items=(), n_detected: int | None = None):
+        super().__init__(items)
+        self.n_detected = len(self) if n_detected is None else int(n_detected)
+
+    @property
+    def truncated(self) -> bool:
+        return self.n_detected > len(self)
+
+
 def _safe_meta(parser, kind: str) -> str:
     try:
         if kind == "polarity":

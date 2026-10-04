@@ -18,7 +18,7 @@ from .. import (spatial, imaging, preprocess, provenance, session, library,
                 prefs, profiles, intake)
 from .. import APP_NAME
 from ..match import Annotator
-from ..msi import MSIDataset
+from ..msi import MSIDataset, FULL_CUBE_MAX_BINS
 import sys
 from . import filedialogs
 from . import common  # common.icon(...) — bare `icon` is shadowed locally in this file
@@ -231,11 +231,16 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         self._build_menu()
         self._install_status_progress()  # progress + cancel live in the status bar now
         self._setup_shortcuts()
+        common.install_copy_shortcut()   # ⌘C over any table copies the whole grid as CSV
         self.statusBar().showMessage("Open an imzML file (File menu), or Load demo, to begin.  "
                                      "(Help → Quick start)")
         # After the window is up: re-apply a remembered lipid DB and, on the very first launch,
         # open the setup wizard. Non-blocking (singleShot) and never during tests.
         QtCore.QTimer.singleShot(0, self._run_startup_setup)
+        # regions sent by the MCP server land in the session's inbox; take them in here
+        self._inbox_timer = QtCore.QTimer(self)
+        self._inbox_timer.timeout.connect(self._take_inbox_regions)
+        self._inbox_timer.start(3000)
 
     def _size_to_screen(self):
         """Open at a sensible fraction of the available screen (never larger than it),
@@ -534,6 +539,9 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         datam.addAction("Import lipid database…", self._import_lipid_db).setIcon(common.icon("import"))
         a_cache = datam.addAction("Build fast ion cache", self.build_ion_cache)
         a_cache.setToolTip("One streaming pass → instant ion images for any m/z (best for large files)")
+        a_caches = datam.addAction("Manage caches…", self._open_cache_dialog)
+        a_caches.setToolTip("See what the sessions/cube store holds, delete orphaned or duplicate "
+                            "caches, or move the store to another disk")
 
         viewm = self.menuBar().addMenu("&View")
         a_panel = viewm.addAction("Show/hide right panel")
@@ -612,6 +620,8 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
              "contrast": float(self.contrast_spin.value()), "snr": float(self.snr_spin.value()),
              "minrel": float(self.minrel_spin.value()),
              "prominence": float(self.prominence_spin.value()),
+             "max_peaks": int(self.maxpeaks_spin.value()),
+             "max_candidates": int(self.spatial_maxcand_spin.value()),
              "orientation": int(getattr(self.ds, "orientation", 0)) if self.ds is not None else 0}
         # stamp the active profile (name+version+hash) and where this sample deviates from
         # it, so the data trail records the method and any per-sample overrides (soft lock).
@@ -646,6 +656,8 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             provenance=getattr(self, "prov", None),
             acquisition_meta=getattr(self, "_acquisition_meta", None),
             calibration_models=getattr(self, "_calibration_models", None),
+            preprocessing=getattr(self.ds, "preprocessing", None),
+            calibration=getattr(self, "_calibration", None),
             analysis_runs=self._analysis_runs_index())
 
     def _analysis_runs_index(self):
@@ -727,7 +739,7 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         # snapshot immutable references and write off the GUI thread — the npz can be tens
         # of MB and the cube never changes once built, so a background write can't race.
         path, cube, mean, pix = self._session_path, ds._cube, ds._mean, ds._pix
-        fp = library.dataset_fingerprint(ds)
+        fp = self._cube_fingerprint(ds)
 
         def write():
             try:
@@ -739,14 +751,26 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         import threading
         threading.Thread(target=write, daemon=True, name="cube-sidecar").start()
 
+    @staticmethod
+    def _cube_fingerprint(ds) -> str:
+        """The key a cube sidecar is saved and matched under: the slide fingerprint plus a
+        hash of the preprocessing it was built with, so a cube built on raw spectra is never
+        served to a recalibrated session (or the reverse)."""
+        fp = library.dataset_fingerprint(ds)
+        cfg = getattr(ds, "preprocessing", None)
+        if cfg:
+            import hashlib
+            import json
+            fp += "|pp:" + hashlib.sha1(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:8]
+        return fp
+
     def _restore_cache_from_sidecar(self, ds, session_path) -> bool:
         """Load the fast cube (+ prime stats) saved beside a session, skipping the rebuild.
         Returns True only when a sidecar exists and matches this slide (fingerprint +
         pixel count); the cube/mean/stats are then assigned onto ``ds`` directly so the
         reopen touches the .ibd only for the shared m/z axis, not a full re-stream."""
         try:
-            got = session.load_cube(session_path, library.dataset_fingerprint(ds),
-                                    ds.n_pixels)
+            got = session.load_cube(session_path, self._cube_fingerprint(ds), ds.n_pixels)
         except Exception:  # noqa: BLE001
             got = None
         if not got:
@@ -770,6 +794,28 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
                 f"'{os.path.basename(ibd)}' must sit in the same folder as the .imzML "
                 "(imzML stores only the metadata; the .ibd holds the spectra).")
         ds = MSIDataset.from_imzml(src, lazy=True, stride=stride)
+        ds.on_pass = self._log_pass
+        if session_path is None and int(stride) == 1:
+            # File ▸ Open imzML used to re-prime and rebuild the cube even when this slide's
+            # managed session and cube sidecar exist. Resolve them by fingerprint here so the
+            # sidecar restore below serves every open path, not only the Samples panel.
+            try:
+                sp = session.resolve_session_path(src, library.dataset_fingerprint(ds),
+                                                  ds.n_pixels)
+                if sp and os.path.exists(sp):
+                    session_path = sp
+            except Exception:  # noqa: BLE001 — the lookup must never block a load
+                pass
+        if session_path:
+            # Re-apply the preprocessing this session was saved with (lock-mass recal, baseline,
+            # …) before any pass, so prime/cube are built — or matched from the sidecar — on
+            # the same spectra the analysis used. Without this a reopened slide silently lost
+            # its recalibration while the panel still showed the reference m/z.
+            try:
+                from .. import headless
+                headless.apply_preprocessing(ds, session.load_session(session_path))
+            except Exception:  # noqa: BLE001 — a bad session must never block the load
+                pass
         if session_path and self._restore_cache_from_sidecar(ds, session_path):
             if stage:
                 stage("Restoring fast cache")
@@ -777,16 +823,19 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             return ds
         if stage:
             stage("Reading spectra into memory")
-        ds.to_ram(progress=progress)               # one disk pass into RAM if it fits the budget
+        if ds.to_ram(progress=progress):           # one disk pass into RAM if it fits the budget
+            if stage:
+                stage("Priming spectra")
+            ds.prime(progress=progress)            # vectorized in RAM; no cube needed (_dense_ion)
+            return ds
+        # Disk-backed (processed mode, or over the RAM budget): the cube is what makes every
+        # later interaction instant, and prime's numbers fall out of the same read — so build
+        # both in ONE pass here instead of priming now and re-reading the slide for the cube
+        # in the background (that was two full reads; on a slow link, minutes each).
         if stage:
-            stage("Priming spectra")
-        ds.prime(progress=progress)                # vectorized when in RAM
-        # Do NOT build the m/z cube on the modal load bar — it's the slowest pass (and the
-        # biggest memory spike). In-RAM stores serve arbitrary-m/z ion images straight from
-        # the dense matrix (ion_vector → _dense_ion), so they need no cube at all; a
-        # disk-backed (over-budget) store gets its cube warmed in the BACKGROUND by
-        # _autobuild_cache once _on_dataset has painted the TIC. First paint then waits only
-        # for parse + to_ram + prime, not the cube.
+            stage("Reading spectra · prime + fast cache")
+        if self._build_cube(ds, progress=progress, prime=True):
+            self._cube_saved = True
         return ds
 
     def closeEvent(self, event):
@@ -834,6 +883,43 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         mapping = prefs.get(self._RELOC_PREF_KEY, {}) or {}
         cand = mapping.get(base, "")
         return cand if cand and os.path.exists(cand) else ""
+
+    def _find_moved_source(self, src: str, session_path: str = "") -> str:
+        """Find a moved imzML without asking: the unique same-named file (with its .ibd) in
+        any folder this machine already reads slides from — the roster's samples, the managed
+        sessions' sources and past manual relocations. On a hit the session JSON and roster
+        entries are repointed so the next open needs no lookup. '' when nothing unique."""
+        import os
+        from .. import cohort as cohort_engine, prefs
+        roots = []
+        for smp in getattr(getattr(self, "cohort", None), "samples", []) or []:
+            if smp.source and os.path.exists(smp.source):
+                roots.append(os.path.dirname(smp.source))
+        for m in session.list_managed():
+            if m.get("source") and os.path.exists(m["source"]):
+                roots.append(os.path.dirname(m["source"]))
+        for cand in (prefs.get(self._RELOC_PREF_KEY, {}) or {}).values():
+            if cand and os.path.exists(cand):
+                roots.append(os.path.dirname(cand))
+        found = cohort_engine.find_moved_source(src, roots)
+        if not found:
+            return ""
+        mapping = dict(prefs.get(self._RELOC_PREF_KEY, {}) or {})
+        mapping[os.path.basename(str(src))] = found
+        prefs.set(self._RELOC_PREF_KEY, mapping)
+        if session_path:
+            cohort_engine._rewrite_session_source(session_path, found)
+        roster = getattr(self, "cohort", None)
+        if roster is not None:
+            hit = False
+            for smp in roster.samples:
+                if smp.source and os.path.abspath(smp.source) == os.path.abspath(src):
+                    smp.source = found
+                    hit = True
+            if hit and hasattr(self, "_save_cohort"):
+                self._save_cohort()
+        self.statusBar().showMessage(f"Found the moved file at {found} — paths updated.")
+        return found
 
     def _prompt_locate_dataset(self, src: str) -> str:
         """Ask the user to point at this machine's copy of a shared analysis's dataset when
@@ -888,7 +974,8 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             # recorded path is absent here. Reuse a remembered relocation, else ask the user to
             # point at their copy. Never silently overlay this analysis onto a different loaded
             # slide — that would write one slide's ROIs into another slide's session file.
-            resolved = self._relocated_source(src) or self._prompt_locate_dataset(src)
+            resolved = (self._relocated_source(src) or self._find_moved_source(src, path)
+                        or self._prompt_locate_dataset(src))
         else:
             resolved = ""
         if not resolved:
@@ -902,7 +989,8 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             return self._prepare_imzml(resolved, progress=progress, session_path=path, stage=stage)
         self._run(load, on_done=self._apply_session, want_progress=True, modal=True,
                   want_stage=True,
-                  stages=["Reading spectra into memory", "Priming spectra"],
+                  stages=["Reading spectra into memory", "Priming spectra",
+                          "Reading spectra · prime + fast cache"],
                   busy=f"Loading {os.path.basename(resolved)} + analysis + fast cache…")
 
     def _apply_session(self, ds):
@@ -936,8 +1024,22 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             self.snr_spin.setValue(float(s.get("snr", 3.0)))
             self.minrel_spin.setValue(float(s.get("minrel", 0.002)))
             self.prominence_spin.setValue(float(s.get("prominence", 1.0)))
+            self.maxpeaks_spin.setValue(int(s.get("max_peaks", 0)))
+            self.spatial_maxcand_spin.setValue(int(s.get("max_candidates", 2000)))
             if self.ds is not None:                       # restore saved rotation before views render
                 self.ds.set_orientation(int(s.get("orientation", 0)))
+            # preprocessing + calibration state: the pipeline itself was applied in the load
+            # worker (_prepare_imzml) so prime/cube already reflect it; here only the panel
+            # widgets and the calibrated-state views catch up. Applying it again would drop
+            # the cube just restored.
+            cfg = data.get("preprocessing") or {}
+            self._set_preprocess_widgets(cfg)
+            if cfg and getattr(ds, "preprocessing", None) != cfg:
+                from .. import headless
+                headless.apply_preprocessing(ds, data)
+            cal = data.get("calibration")
+            self._calibration = dict(cal) if cal else None
+            self._refresh_calibration_views()
 
             # saved feature lists (★) — restore into this sample's in-memory store
             self._feature_lists = {str(n): self._norm_feature_list(feats)
@@ -1313,6 +1415,19 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         # ~94% coverage. The old 0.02 (2%) discarded ~2/3 of real features. Raise toward
         # 0.005 for a tighter list, drop to 0.001 for maximum sensitivity.
         self.minrel_spin.setValue(0.002)
+        # No ceiling by default. A fixed top-N by intensity makes two regions with different
+        # numbers of detectable ions report the same feature count, which reads as agreement
+        # between them when it is only the cap; the S/N and rel-intensity gates above are the
+        # real size controls. Set a number here only to bound a runaway list.
+        self.maxpeaks_spin = NoScrollSpinBox()
+        self.maxpeaks_spin.setRange(0, 200000)
+        self.maxpeaks_spin.setSingleStep(100)
+        self.maxpeaks_spin.setValue(0)
+        self.maxpeaks_spin.setSpecialValueText("no limit")
+        self.maxpeaks_spin.setToolTip(
+            "Keep at most this many peaks, most intense first. 'no limit' (0) keeps every "
+            "peak that clears the S/N, prominence and rel-intensity gates — the honest "
+            "count. A cap silently equalizes feature lists that are not actually equal.")
         self.proj_combo = NoScrollComboBox()
         self.proj_combo.addItems(["mean", "skyline (max)"])
         self.proj_combo.setToolTip("Pick on the mean spectrum, or the skyline (per-m/z maximum) "
@@ -1338,6 +1453,18 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             "low-noise mean-spectrum feature set; 'skyline (max)' surfaces ions bright "
             "in only a few pixels but is noisier; 'both' unions the two and lets the "
             "denoise gate strip the extra skyline noise.")
+        # Candidate pool cap. Each extra candidate costs a Moran's I pass, so unlike the
+        # plain picker this keeps a default ceiling — but it is visible, and the funnel says
+        # when it bound, so a reported candidate count is never mistaken for a measurement.
+        self.spatial_maxcand_spin = NoScrollSpinBox()
+        self.spatial_maxcand_spin.setRange(0, 200000)
+        self.spatial_maxcand_spin.setSingleStep(500)
+        self.spatial_maxcand_spin.setValue(2000)
+        self.spatial_maxcand_spin.setSpecialValueText("no limit")
+        self.spatial_maxcand_spin.setToolTip(
+            "How many detected peaks enter the spatial gates, most intense first. Raise it "
+            "when the funnel reports the cap was hit; each extra candidate costs one "
+            "Moran's I evaluation, so 'no limit' (0) can be slow on dense spectra.")
         self.spatial_freq_spin = NoScrollDoubleSpinBox()
         self.spatial_freq_spin.setRange(0.0, 100.0)
         self.spatial_freq_spin.setSingleStep(0.5)
@@ -1451,6 +1578,7 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         "snr": ("snr_spin", "dspin"),
         "prominence": ("prominence_spin", "dspin"),
         "minrel": ("minrel_spin", "dspin"),
+        "max_peaks": ("maxpeaks_spin", "ispin"),
         "projection": ("proj_combo", "combo"),
         "baseline_method": ("pp_baseline_combo", "combo"),
         "baseline_param": ("pp_baseline_param", "ispin"),
@@ -1461,6 +1589,7 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         "pp_norm_method": ("pp_norm_combo", "combo"),
         "pp_norm_ref": ("pp_norm_ref", "text"),
         "spatial_projection": ("spatial_proj_combo", "combo"),
+        "spatial_max_candidates": ("spatial_maxcand_spin", "ispin"),
         "spatial_min_freq": ("spatial_freq_spin", "dspin"),
         "spatial_min_morans": ("spatial_morans_spin", "dspin"),
         "spatial_fdr": ("spatial_fdr_combo", "combo"),
@@ -1755,10 +1884,27 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
                 "Compares the mean spectrum to known reference lipid ions to find the "
                 "systematic m/z offset that causes mislabels.\nApply lock-mass recalibration "
                 "if the offset is a constant ppm shift (flat slope), then re-pick peaks."))
+            # Scope: samples in different embedding media on one slide drift by different
+            # amounts, and one slide-wide offset fits neither. Measuring every region
+            # separately gives each its own lock mass.
+            self.calib_scope_combo = NoScrollComboBox()
+            self.calib_scope_combo.setToolTip(
+                "Measure the offset over the whole slide, over one region, or over every "
+                "region separately. Use 'Every region' when samples on this slide sit in "
+                "different embedding media — each gets its own lock-mass correction.")
+            srow = QtWidgets.QFormLayout()
+            srow.addRow("Measure over", self.calib_scope_combo)
+            v.addLayout(srow)
+            self.calib_state_label = QtWidgets.QLabel()
+            self.calib_state_label.setWordWrap(True)
+            self.calib_state_label.setTextFormat(QtCore.Qt.RichText)
+            v.addWidget(self.calib_state_label)
             self.calib_table = QtWidgets.QTableWidget(0, 4)
             self.calib_table.setHorizontalHeaderLabels(["Anchor", "ref m/z", "obs m/z", "ppm"])
             self.calib_table.horizontalHeader().setStretchLastSection(True)
             self.calib_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            common.install_table_export(self.calib_table, self, stem="calibration_check",
+                                        title="Export calibration check")
             v.addWidget(self.calib_table)
             self.calib_summary = QtWidgets.QLabel("Load a dataset, then Measure.")
             self.calib_summary.setWordWrap(True)
@@ -1781,19 +1927,61 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             v.addWidget(btns)
             self._calib_dialog = dlg
             self._calib_result = None
+        self._sync_calib_scope_combo()
+        self._refresh_calibration_views()
         self._show_dialog(dlg)
+
+    CALIB_EVERY_REGION = "Every region (separately)"
+
+    def _sync_calib_scope_combo(self):
+        """Repopulate the calibration scope picker from the active slide's regions, keeping
+        the current choice when it still exists."""
+        cb = getattr(self, "calib_scope_combo", None)
+        if cb is None:
+            return
+        names = list(self.region_masks_by_name())
+        want = cb.currentText()
+        cb.blockSignals(True)
+        cb.clear()
+        cb.addItem("Whole slide")
+        if names:
+            cb.addItem(self.CALIB_EVERY_REGION)
+            cb.addItems(names)
+        i = cb.findText(want)
+        cb.setCurrentIndex(i if i >= 0 else 0)
+        cb.blockSignals(False)
 
     def _run_calibration_check(self, *, verify=False):
         if self.ds is None:
             self.statusBar().showMessage("Load a dataset first.")
             return
         mode = self.mode_combo.currentText()
+        cb = getattr(self, "calib_scope_combo", None)
+        scope = cb.currentText() if cb is not None else "Whole slide"
+        masks = self.region_masks_by_name()
+        if scope == self.CALIB_EVERY_REGION and masks:
+            names = list(masks)
+            ds = self.ds
+
+            def measure_each():
+                return {"per_region": [(n, intake.measure_calibration_offset(
+                    ds, mode=mode, mask=masks[n])) for n in names]}
+
+            self._run(measure_each, busy=f"Measuring calibration in {len(names)} regions…",
+                      on_done=lambda r: self._on_calibration_result(r, verify=verify),
+                      label="Calibration check (per region)")
+            return
         self._run(intake.measure_calibration_offset, self.ds, busy="Measuring calibration…",
                   on_done=lambda r: self._on_calibration_result(r, verify=verify),
-                  label="Calibration check", mode=mode)
+                  label="Calibration check", mode=mode, mask=masks.get(scope))
 
     def _on_calibration_result(self, res, *, verify=False):
+        if res and res.get("per_region"):
+            return self._on_calibration_result_regions(res["per_region"], verify=verify)
         self._calib_result = res
+        self._calib_region_results = None
+        self.calib_table.setColumnCount(4)
+        self.calib_table.setHorizontalHeaderLabels(["Anchor", "ref m/z", "obs m/z", "ppm"])
         anchors = res.get("anchors", []) if res else []
         self.calib_table.setRowCount(len(anchors))
         for i, a in enumerate(anchors):
@@ -1822,23 +2010,239 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         if verify:
             msg = ("After recalibration — " + msg + ("  ✓ target reached (<2 ppm)."
                    if abs(med) < 2.0 else "  Re-pick peaks; residual still present."))
+            cal = getattr(self, "_calibration", None)
+            if cal is not None:
+                import time
+                cal["median_after"] = float(med)
+                cal["verified"] = bool(abs(med) < 2.0)
+                cal["verified_at"] = time.strftime("%H:%M")
+                before = cal.get("median_before")
+                was = f" (was {before:+.2f} ppm)" if before is not None else ""
+                self.statusBar().showMessage(
+                    (f"✓ Recalibration applied and verified: residual {med:+.2f} ppm{was}. "
+                     "Re-pick peaks to refresh the feature list.") if cal["verified"] else
+                    (f"Recalibration applied, but the residual is still {med:+.2f} ppm{was} — "
+                     "the offset may be mass-dependent."))
+                self._mark_dirty()
         self.calib_summary.setText(msg)
+        self._refresh_calibration_views()
+
+    def _on_calibration_result_regions(self, pairs, *, verify=False):
+        """Per-region measurement landed. One row per region, plus the **spread** between
+        regions — the number that decides whether a single slide-wide lock mass can work at
+        all. A spread of a few ppm across embedding media means a slide-wide offset is
+        fitting the average of two populations and leaving both mis-assigned."""
+        results = {str(n): r for n, r in pairs}
+        self._calib_region_results = results
+        self._calib_result = None
+        col = "residual ppm" if verify else "median ppm"
+        self.calib_table.setColumnCount(4)
+        self.calib_table.setHorizontalHeaderLabels(["Region", "anchors", col, "slope ppm/Da"])
+        self.calib_table.setRowCount(len(results))
+        meds = {}
+        for i, (name, r) in enumerate(results.items()):
+            n = int(r.get("n", 0))
+            med = float(r.get("median_ppm", float("nan")))
+            if n:
+                meds[name] = med
+            vals = [name, str(n), (f"{med:+.2f}" if n else "—"),
+                    (f"{r.get('slope_ppm_per_da', 0.0):+.3f}" if n else "—")]
+            for j, txt in enumerate(vals):
+                self.calib_table.setItem(i, j, QtWidgets.QTableWidgetItem(txt))
+        if not meds:
+            self.calib_summary.setText(
+                "No reference ions matched in any region — check polarity/mode, or that the "
+                "regions cover tissue.")
+            self.calib_apply_btn.setEnabled(False)
+            self._refresh_calibration_views()
+            return
+        spread = max(meds.values()) - min(meds.values())
+        worst = max(meds, key=lambda k: abs(meds[k]))
+        detail = " · ".join(f"{k} {v:+.2f}" for k, v in meds.items())
+        if verify:
+            cal = getattr(self, "_calibration", None)
+            if cal is not None:
+                import time
+                for rec in cal.get("regions") or []:
+                    m = meds.get(rec.get("name"))
+                    if m is None:
+                        continue
+                    rec["median_after"] = float(m)
+                    rec["verified"] = bool(abs(m) < 2.0)
+                cal["median_after"] = float(meds[worst])   # the worst region, signed
+                cal["verified"] = all(abs(v) < 2.0 for v in meds.values())
+                cal["verified_at"] = time.strftime("%H:%M")
+                self.statusBar().showMessage(
+                    (f"✓ Per-region recalibration verified: every region within 2 ppm "
+                     f"({detail}). Re-pick peaks to refresh the feature lists.")
+                    if cal["verified"] else
+                    (f"Per-region recalibration applied; largest residual {meds[worst]:+.2f} ppm "
+                     f"in {worst} ({detail}). That region's offset may be mass-dependent."))
+                self._mark_dirty()
+            self.calib_summary.setText(
+                f"After recalibration — residual by region: {detail}. Spread {spread:.2f} ppm.")
+            self.calib_apply_btn.setEnabled(False)
+            self._refresh_calibration_views()
+            return
+        needs = [k for k, v in meds.items() if abs(v) >= 2.0]
+        self.calib_apply_btn.setEnabled(bool(needs))
+        if not needs:
+            msg = (f"Every region is within 2 ppm ({detail}); spread {spread:.2f} ppm. "
+                   "No recalibration needed.")
+        else:
+            msg = (f"Offset by region: {detail}. Spread between regions {spread:.2f} ppm — "
+                   f"largest {meds[worst]:+.2f} ppm in {worst}. Apply per-region lock-mass "
+                   f"recalibration to give each region its own correction "
+                   f"({len(needs)} of {len(meds)} need one).")
+            if spread < 2.0:
+                msg += (" The regions agree to within 2 ppm, so one slide-wide lock mass "
+                        "would do nearly as well.")
+        self.calib_summary.setText(msg)
+        self._refresh_calibration_views()
 
     def _apply_calibration_recal(self):
+        per = getattr(self, "_calib_region_results", None)
+        if per:
+            return self._apply_calibration_recal_regions(per)
         res = getattr(self, "_calib_result", None)
         if self.ds is None or not res or not res.get("anchors"):
             return
+        import time
         refs = " ".join(f"{a['ref_mz']:.4f}" for a in res["anchors"])
         self.pp_recal_edit.setText(refs)
         # window must exceed the measured offset so recalibrate locks onto the right apex
         self.pp_recal_tol.setValue(max(float(self.pp_recal_tol.value()),
                                        abs(res["max_abs_ppm"]) * 3.0 + 10.0))
-        self.apply_preprocessing()             # queued: re-primes on the recalibrated axis
+        self._calibration = {
+            "source": "lock-mass", "refs": [float(a["ref_mz"]) for a in res["anchors"]],
+            "tol_ppm": float(self.pp_recal_tol.value()), "n_anchors": len(res["anchors"]),
+            "factor": float(res.get("factor", 1.0)), "median_before": float(res["median_ppm"]),
+            "median_after": None, "verified": False, "applied_at": time.strftime("%Y-%m-%d %H:%M")}
+        self._refresh_calibration_views()
         if self.prov is not None:
             self.prov.step("calibration_recalibrate", n_anchors=len(res["anchors"]),
                            median_ppm=round(res["median_ppm"], 3))
-        # queued after the reprime job → measures on the corrected mean spectrum
-        self._run_calibration_check(verify=True)
+        # re-prime (and rebuild the cube) on the recalibrated axis, THEN measure again on the
+        # corrected mean spectrum — chained on completion, not queued alongside.
+        self.apply_preprocessing(after=lambda: self._run_calibration_check(verify=True))
+
+    def _apply_calibration_recal_regions(self, per):
+        """Give each region its own lock mass. The correction stays axis-preserving, so every
+        pixel keeps the one shared m/z axis and the regions remain comparable bin for bin —
+        only the per-spectrum shift differs. Pixels in no region fall back to the slide-wide
+        reference m/z in the Preprocessing panel, or pass through when that is empty."""
+        if self.ds is None:
+            return
+        import time
+        masks = self.region_masks_by_name()
+        blocks, record = [], []
+        for name, res in per.items():
+            anchors = res.get("anchors") or []
+            m = masks.get(name)
+            if not anchors or m is None:
+                continue
+            blocks.append({
+                "name": name,
+                "refs": [round(float(a["ref_mz"]), 4) for a in anchors],
+                # the window must exceed this region's own offset so recalibrate locks onto
+                # the right apex — a region that drifts further needs a wider window
+                "tol_ppm": round(abs(float(res["max_abs_ppm"])) * 3.0 + 10.0, 2),
+                "mask_sha1": provenance.mask_fingerprint(m)})
+            record.append({"name": name, "n_anchors": len(anchors),
+                           "factor": float(res.get("factor", 1.0)),
+                           "median_before": float(res["median_ppm"]),
+                           "median_after": None, "verified": False})
+        if not blocks:
+            self.statusBar().showMessage("No region had matched anchors to calibrate against.")
+            return
+        self._recal_regions = blocks
+        self._calibration = {
+            "source": "lock-mass", "per_region": True, "regions": record,
+            "refs": [float(x) for b in blocks for x in b["refs"]],
+            "tol_ppm": max(b["tol_ppm"] for b in blocks),
+            "n_anchors": sum(r["n_anchors"] for r in record),
+            "factor": float(np.mean([r["factor"] for r in record])),
+            "median_before": float(np.median([r["median_before"] for r in record])),
+            "median_after": None, "verified": False,
+            "applied_at": time.strftime("%Y-%m-%d %H:%M")}
+        self._refresh_calibration_views()
+        if self.prov is not None:
+            self.prov.step("calibration_recalibrate", per_region=True, n_regions=len(blocks),
+                           region_names=", ".join(b["name"] for b in blocks),
+                           median_ppm=", ".join(f"{r['name']} {r['median_before']:+.2f}"
+                                                for r in record))
+        self.apply_preprocessing(after=lambda: self._run_calibration_check(verify=True))
+
+    def _calibration_unresolved_regions(self) -> list:
+        """Regions this slide's per-region calibration names but no longer has. Names are
+        user-editable, so a rename or delete leaves those pixels uncorrected; the banner and
+        the dialog must say so instead of reporting the slide as calibrated."""
+        cal = getattr(self, "_calibration", None)
+        if not (cal or {}).get("per_region") or self.ds is None:
+            return []
+        have = self.region_masks_by_name()
+        return [r.get("name") for r in (cal.get("regions") or []) if r.get("name") not in have]
+
+    def _refresh_calibration_views(self):
+        """Everything that shows whether the slide is calibrated: the dialog's state line and
+        Apply button, and the dataset banner in the right dock."""
+        cal = getattr(self, "_calibration", None)
+        lab = getattr(self, "calib_state_label", None)
+        if lab is not None:
+            ok, warn = common.PALETTE[2], common.PALETTE[3]
+            if cal is None:
+                lab.setText("<b>Not calibrated.</b> Measure, then apply if the offset is a "
+                            "constant shift.")
+            elif cal.get("per_region"):
+                regs = cal.get("regions") or []
+                measured = [r for r in regs if r.get("median_after") is not None]
+                gone = self._calibration_unresolved_regions()
+                if gone:
+                    lab.setText(f"<b style='color:{warn}'>Per-region calibration incomplete</b> "
+                                f"— no region named "
+                                + ", ".join(f"“{n}”" for n in gone) +
+                                " on this slide, so those pixels are not corrected. Re-measure "
+                                "and apply.")
+                elif not measured:
+                    lab.setText(f"<b>Applying per-region lock-mass recalibration…</b> "
+                                f"{len(regs)} regions, each with its own correction; "
+                                "re-priming and rebuilding the fast cache, then re-measuring.")
+                else:
+                    bits = ", ".join(
+                        f"{r['name']} {r['median_before']:+.2f}→{r['median_after']:+.2f} ppm"
+                        for r in measured)
+                    good = bool(cal.get("verified"))
+                    head = ("✓ Calibrated per region" if good else
+                            "Per-region recalibration applied, residual above 2 ppm")
+                    lab.setText(f"<b style='color:{ok if good else warn}'>{head}</b> — "
+                                f"{bits}. Applied {cal.get('applied_at', '')}.")
+            elif cal.get("median_after") is None and cal.get("source") == "lock-mass":
+                lab.setText(f"<b>Applying lock-mass recalibration…</b> ×{cal.get('factor', 1.0):.7f} "
+                            f"from {cal.get('n_anchors', 0)} anchors; re-priming and rebuilding "
+                            "the fast cache, then re-measuring.")
+            elif cal.get("verified"):
+                lab.setText(f"<b style='color:{ok}'>✓ Calibrated</b> — lock-mass "
+                            f"×{cal.get('factor', 1.0):.7f} from {cal.get('n_anchors', 0)} anchors; "
+                            f"residual median {cal.get('median_after', 0.0):+.2f} ppm "
+                            f"(was {cal.get('median_before', 0.0):+.2f} ppm), verified "
+                            f"{cal.get('verified_at', '')}. Applied {cal.get('applied_at', '')}.")
+            elif cal.get("source") == "manual":
+                lab.setText(f"<b>Lock-mass recalibration applied</b> from the Preprocessing panel "
+                            f"({cal.get('n_anchors', 0)} reference m/z) — not verified here. "
+                            "Click Measure to check the residual.")
+            else:
+                lab.setText(f"<b style='color:{warn}'>Recalibration applied but not within 2 ppm</b> "
+                            f"— residual median {cal.get('median_after', 0.0):+.2f} ppm "
+                            f"(was {cal.get('median_before', 0.0):+.2f} ppm). The offset may be "
+                            "mass-dependent; a single lock mass can't remove that.")
+        btn = getattr(self, "calib_apply_btn", None)
+        if btn is not None and cal is not None and cal.get("source") == "lock-mass":
+            btn.setText("Applied ✓" if cal.get("median_after") is not None else "Applying…")
+            btn.setEnabled(False)
+        elif btn is not None:
+            btn.setText("Apply lock-mass recalibration")
+        if self.ds is not None and getattr(self, "info", None) is not None:
+            self.info.setText(self._dataset_banner_html(self.ds, getattr(self, "_intake_report", None)))
 
     def _open_pick_dialog(self, focus_spatial=False):
         """Combined feature-detection dialog. Two finders share one set of controls
@@ -1867,6 +2271,7 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             pf = QtWidgets.QFormLayout()
             pf.addRow("Spectrum", self.proj_combo)
             pf.addRow("Min rel. intensity", self.minrel_spin)
+            pf.addRow("Max peaks", self.maxpeaks_spin)
             pp_v.addLayout(pf)
             b_pick = QtWidgets.QPushButton("Find peaks")
             b_pick.setObjectName("primaryAction")         # the tab's single run action
@@ -1885,6 +2290,7 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
                                 "culling real diffuse ions."))
             sf = QtWidgets.QFormLayout()
             sf.addRow("Candidates", self.spatial_proj_combo)
+            sf.addRow("Max candidates", self.spatial_maxcand_spin)
             sf.addRow("Min frequency", self.spatial_freq_spin)
             sf.addRow("Min Moran's I", self.spatial_morans_spin)
             sf.addRow("FDR threshold", self.spatial_fdr_combo)
@@ -2338,6 +2744,14 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
                              operations=read_perf_log())
         dlg.exec()
 
+    def _log_pass(self, label, seconds, n):
+        """Perf-log one whole-slide read reported by the dataset layer (``MSIDataset.on_pass``),
+        flagging the ones that ran on the GUI thread — those are the freezes."""
+        app = QtWidgets.QApplication.instance()
+        gui = app is not None and QtCore.QThread.currentThread() is app.thread()
+        where = "  · GUI THREAD" if gui else ""
+        self._perf(f"PASS   {label} · {int(n):,} spectra{where}  ({seconds:.2f}s)")
+
     def _perf(self, msg):
         """Append a timestamped perf line to stderr + ~/smile_msi_perf.log (overridable via
         $SMILE_MSI_HOME). Best-effort timing so slow operations can be diagnosed from a real
@@ -2647,8 +3061,8 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             return
         if getattr(getattr(ds, "store", None), "in_memory", False):
             return
-        _, spec = ds.mean_spectrum()
-        ds.build_mz_cube(min_intensity=float(spec.max()) * 0.001, progress=progress)
+        ds.build_mz_cube(min_intensity=0.0, max_bins=FULL_CUBE_MAX_BINS, progress=progress,
+                         prime=True)
 
     def _load_path(self, path):
         stride = int(self.subsample_spin.value())
@@ -2657,7 +3071,8 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             # read into RAM (if it fits), prime, and build the fast cube once, during load
             return self._prepare_imzml(path, progress=progress, stride=stride, stage=stage)
         self._run(load, on_done=self._on_dataset_opened, want_progress=True,
-                  want_stage=True, stages=["Reading spectra into memory", "Priming spectra"],
+                  want_stage=True, stages=["Reading spectra into memory", "Priming spectra",
+                          "Reading spectra · prime + fast cache"],
                   modal=True, busy=f"Loading {path} + building fast cache…")
 
     def _load_table_path(self, path):
@@ -2814,7 +3229,10 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
                   modal=True, busy="Synthesizing demo dataset…")
 
     def _on_dataset(self, ds):
+        same_dataset = getattr(self, "ds", None) is ds      # wipe-and-restart / re-apply path
         self.ds = ds
+        if getattr(ds, "on_pass", None) is None:
+            ds.on_pass = self._log_pass
         self.peaks = []
         self.seg = None
         self.regions = []
@@ -2840,6 +3258,17 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
                                          # analysis; gates the auto-save's blank-ROI guard so an
                                          # un-restored empty region set can't overwrite the file
         self._cube_saved = False         # cube sidecar is written once per dataset
+        self._pending_ion_refresh = False        # renders parked until the fast cache lands
+        self._pending_spectrum_refresh = False
+        # lock-mass recalibration state (see _apply_calibration_recal): a fresh slide starts
+        # blank; the same dataset re-entering (wipe & restart) keeps it while its pipeline is
+        # still applied, so the banner never says "not calibrated" over recalibrated spectra.
+        prev = getattr(self, "_calibration", None)
+        keep_cal = bool(same_dataset and prev and getattr(ds, "preprocessing", None))
+        self._calibration = prev if keep_cal else None
+        # per-region lock-mass blocks index THIS slide's pixels, so they never carry across
+        self._recal_regions = getattr(self, "_recal_regions", None) if keep_cal else None
+        self._calib_region_results = None
         self._dirty = False
         self._undo_stack = []            # drop snapshots that point at the old dataset
         self._clear_optical()            # the optical backdrop is per-sample (session re-applies it)
@@ -2876,6 +3305,10 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         self._show_intake_suggestion(report)
         if ds.polarity in ("positive", "negative"):
             self.mode_combo.setCurrentText(ds.polarity)
+        # Start the fast-cube build BEFORE the first spectrum/ion paint: while it is in
+        # flight the spectrum view shows the primed mean instead of streaming a skyline, and
+        # ion-image clicks are parked instead of streaming the slide on the GUI thread.
+        self._autobuild_cache()
         self._plot_mean_spectrum()
         # show the TIC image right away so the tissue is visible before peaks are picked
         self.iv.setImage(imaging.quantile_clip(ds.tic_image(), high=99), autoLevels=True)
@@ -2885,7 +3318,6 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         self._refresh_report_list()              # clear the report list for the new sample
         self.statusBar().showMessage("Loaded — showing TIC. Click 'Find peaks', then click a peak "
                                      "(table or spectrum) to view its ion image.")
-        self._autobuild_cache()                  # warm the fast cube so ROI/region views never stream
         self._refresh_action_states()
         self.datasetChanged.emit()
 
@@ -2918,6 +3350,40 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         self._mark_dirty()                         # the restart differs from the saved session
         self.statusBar().showMessage("Analysis wiped — back to the freshly-loaded dataset.")
 
+    def _set_preprocess_widgets(self, cfg: dict) -> None:
+        """Push a saved :func:`preprocess.build_pipeline` config back into the Preprocessing
+        panel (the inverse of :meth:`_preprocess_config`). An empty config resets it."""
+        cfg = cfg or {}
+        bl = cfg.get("baseline")
+        if isinstance(bl, int):
+            self.pp_baseline_combo.setCurrentText("SNIP"); self.pp_baseline_param.setValue(int(bl))
+        elif isinstance(bl, dict):
+            method = {"locmin": "local minimum", "hull": "convex hull", "median": "median"}.get(bl.get("method"), "none")
+            self.pp_baseline_combo.setCurrentText(method)
+            if bl.get("window"):
+                self.pp_baseline_param.setValue(int(bl["window"]))
+        else:
+            self.pp_baseline_combo.setCurrentText("none")
+        sm = cfg.get("smooth") or {}
+        if "savgol" in sm:
+            self.pp_smooth_combo.setCurrentText("Savitzky-Golay"); self.pp_smooth_param.setValue(float(sm["savgol"]))
+        elif "gaussian" in sm:
+            self.pp_smooth_combo.setCurrentText("Gaussian"); self.pp_smooth_param.setValue(float(sm["gaussian"]))
+        else:
+            self.pp_smooth_combo.setCurrentText("none")
+        rc = cfg.get("recalibrate") or {}
+        self.pp_recal_edit.setText(" ".join(f"{float(x):.4f}" for x in rc.get("refs", [])))
+        if rc.get("tol_ppm"):
+            self.pp_recal_tol.setValue(float(rc["tol_ppm"]))
+        self._recal_regions = list(rc.get("regions") or []) or None
+        nm = cfg.get("normalize")
+        if nm == "vector":
+            self.pp_norm_combo.setCurrentText("vector (L2)")
+        elif isinstance(nm, dict) and "reference" in nm:
+            self.pp_norm_combo.setCurrentText("reference m/z"); self.pp_norm_ref.setText(str(nm["reference"]))
+        else:
+            self.pp_norm_combo.setCurrentText("none")
+
     def _preprocess_config(self) -> dict:
         """Build a preprocess.build_pipeline config from the Preprocessing dialog widgets."""
         import re as _re
@@ -2938,8 +3404,25 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         elif sm == "Gaussian":
             cfg["smooth"] = {"gaussian": float(self.pp_smooth_param.value())}
         refs = [float(x) for x in _re.split(r"[,\s]+", self.pp_recal_edit.text().strip()) if x]
-        if refs:
+        per_region = list(getattr(self, "_recal_regions", None) or [])
+        if refs or per_region:
             cfg["recalibrate"] = {"refs": refs, "tol_ppm": float(self.pp_recal_tol.value())}
+            if per_region:
+                # Stamp each block with a fingerprint of the region's CURRENT pixels, not the
+                # ones it had when calibration was applied. Redrawing or re-segmenting a
+                # region then changes the preprocessing hash, so the fast cube built under the
+                # old pixel assignment is not served back (see _cube_fingerprint).
+                live = self.region_masks_by_name()
+                blocks = []
+                for r in per_region:
+                    b = dict(r)
+                    m = live.get(b.get("name"))
+                    if m is not None:
+                        b["mask_sha1"] = provenance.mask_fingerprint(m)
+                    blocks.append(b)
+                cfg["recalibrate"]["regions"] = blocks
+                if self.ds is not None:
+                    cfg["recalibrate"]["n_pixels"] = int(self.ds.n_pixels)
         nm = self.pp_norm_combo.currentText()
         if nm.startswith("vector"):
             cfg["normalize"] = "vector"
@@ -2950,11 +3433,58 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
                 pass
         return cfg
 
-    def apply_preprocessing(self):
+    def apply_preprocessing(self, after=None):
+        """Apply the Preprocessing panel to the dataset (full re-read: re-prime, and for a
+        disk-backed slide the cube rebuild in the same pass). ``after`` runs on completion."""
         if self.ds is None:
             return
+        import time
         cfg = self._preprocess_config()
-        self.ds.set_preprocessing(preprocess.build_pipeline(cfg))
+        masks = self.region_masks_by_name()
+        # A per-region block is keyed by region name, and names are editable. If one no longer
+        # resolves — renamed, deleted, or tagged to another slide — that region's pixels go
+        # uncorrected, so drop the block rather than carry a correction that cannot be rebuilt.
+        lost = [b.get("name") for b in ((cfg.get("recalibrate") or {}).get("regions") or [])
+                if b.get("name") not in masks]
+        if lost:
+            self._recal_regions = [b for b in (self._recal_regions or [])
+                                   if b.get("name") in masks] or None
+            cfg = self._preprocess_config()
+        self.ds.set_preprocessing(preprocess.build_pipeline(cfg, masks=masks), config=cfg)
+        rc = cfg.get("recalibrate")
+        cal = getattr(self, "_calibration", None)
+        if lost:
+            # never keep claiming the slide is calibrated over spectra that are not corrected.
+            # The message is held for _after_preprocess — showing it here would be wiped by
+            # the re-prime's own busy message a moment later.
+            self._calibration = cal = None
+            self._preprocess_note = (
+                "Per-region calibration dropped for "
+                + ", ".join(f"“{n}”" for n in lost)
+                + " — no region by that name on this slide. Re-measure from Data ▸ "
+                  "Calibration check.")
+        if not rc:
+            self._calibration = None                 # recal removed → no longer calibrated
+            self._recal_regions = None
+        elif rc.get("regions"):
+            # _apply_calibration_recal owns the per-region record; only synthesize one when a
+            # session was reopened straight into an applied per-region calibration.
+            if cal is None:
+                self._calibration = {
+                    "source": "lock-mass", "per_region": True,
+                    "regions": [{"name": r.get("name"), "n_anchors": len(r.get("refs") or [])}
+                                for r in rc["regions"]],
+                    "refs": list(rc.get("refs") or []),
+                    "tol_ppm": float(rc.get("tol_ppm", 200.0)),
+                    "n_anchors": sum(len(r.get("refs") or []) for r in rc["regions"]),
+                    "median_after": None,
+                    "verified": False, "applied_at": time.strftime("%Y-%m-%d %H:%M")}
+        elif cal is None or [round(x, 4) for x in cal.get("refs", [])] != [round(x, 4) for x in rc["refs"]]:
+            self._calibration = {"source": "manual", "refs": list(rc["refs"]),
+                                 "tol_ppm": float(rc["tol_ppm"]), "n_anchors": len(rc["refs"]),
+                                 "median_after": None, "verified": False,
+                                 "applied_at": time.strftime("%Y-%m-%d %H:%M")}
+        self._refresh_calibration_views()
         if self.prov is not None and cfg:                              # record for the methods report
             self.prov.step("preprocess", **{k: (v if not isinstance(v, dict) else
                                                  {kk: vv for kk, vv in v.items()})
@@ -2965,15 +3495,24 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
         self.seg = None
 
         def reprime(progress=None, stage=None):
-            # set_preprocessing() cleared the prime cache and, with transforms now active,
-            # _dense() returns None — so this prime takes the slow per-pixel streaming path.
-            # It's the most expensive pass, so it MUST report a moving bar + stage, not hang
-            # silently. prime() emits progress(done, n) every 256 pixels on that path.
+            # set_preprocessing() cleared the prime cache AND the cube, and with transforms
+            # active every read re-applies them — so this is a full pass whatever we do. Fold
+            # the cube rebuild into it for disk-backed slides (one read, not prime now + cube
+            # later); in-RAM stores just re-prime (their ion images need no cube).
+            ds = self.ds
             if stage:
                 stage("Re-priming spectra")
-            self.ds.prime(progress=progress)
+            if getattr(ds.store, "in_memory", False) or getattr(ds.store, "matrix", None) is not None:
+                ds.prime(progress=progress)
+            elif self._build_cube(ds, progress=progress, prime=True):
+                self._cube_saved = True
             return True
-        self._run(reprime, on_done=lambda _: self._after_preprocess(),
+
+        def done(_):
+            self._after_preprocess()
+            if callable(after):                  # a QPushButton.clicked hookup passes `checked`
+                after()
+        self._run(reprime, on_done=done,
                   want_progress=True, want_stage=True, modal=True,
                   stages=["Re-priming spectra"],
                   busy="Applying preprocessing & re-priming…")
@@ -2981,14 +3520,21 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
     def _after_preprocess(self):
         self._exp_mean_spec = None        # mean spectrum changed after re-priming
         self._plot_mean_spectrum()
-        self.statusBar().showMessage("Preprocessing applied. Find peaks again to refresh analyses.")
+        self._autobuild_cache()           # no-op when reprime already rebuilt the cube
+        self._refresh_calibration_views()
+        self._mark_dirty()                # the applied pipeline is session state now
+        note = getattr(self, "_preprocess_note", "")
+        self._preprocess_note = ""
+        self.statusBar().showMessage(
+            (note + " " if note else "")
+            + "Preprocessing applied. Find peaks again to refresh analyses.")
 
     # A cube this big (in-RAM CSC bytes) is built out-of-core straight to its on-disk sidecar
     # (bounded RAM) instead of materialising the whole CSC; smaller cubes keep the fast in-RAM
     # build, whose resident matrix serves ion images a touch faster than the lazy store.
     _STREAM_CUBE_BYTES = 1_500_000_000
 
-    def _cube_stream_target(self, ds, min_intensity):
+    def _cube_stream_target(self, ds):
         """``(out_path, fingerprint)`` to build a large slide's cube out-of-core straight to
         its session sidecar (the Phase-2 bounded-memory path), or ``(None, None)`` to use the
         in-RAM build. Only disk-backed real slides with a big estimated cube qualify; any
@@ -2997,25 +3543,30 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             src = getattr(ds, "source", None)
             if not src or src == "synthetic":
                 return None, None
-            if ds.estimate_cube_bytes(min_intensity=min_intensity) < self._STREAM_CUBE_BYTES:
+            if ds.estimate_cube_bytes(min_intensity=0.0,
+                                      max_bins=FULL_CUBE_MAX_BINS) < self._STREAM_CUBE_BYTES:
                 return None, None
-            fp = library.dataset_fingerprint(ds)
+            fp = self._cube_fingerprint(ds)
             if self._session_path is None:
-                self._session_path = session.resolve_session_path(src, fp, ds.n_pixels)
+                self._session_path = session.resolve_session_path(
+                    src, library.dataset_fingerprint(ds), ds.n_pixels)
             return session.cube_zarr_path(self._session_path), fp
         except Exception:  # noqa: BLE001 — never let the estimate block a build
             return None, None
 
-    def _build_cube(self, ds, spec, progress=None):
+    def _build_cube(self, ds, progress=None, prime=False):
         """Build the fast cube, choosing the bounded-memory streaming path for large slides.
-        Returns True when the cube was streamed straight to its sidecar (already persisted)."""
-        min_intensity = float(spec.max()) * 0.001
-        out_path, fp = self._cube_stream_target(ds, min_intensity)
+        Every peak is kept (no intensity floor) and bins stay at 15 ppm across the whole
+        range (``FULL_CUBE_MAX_BINS``). ``prime=True`` folds the prime pass into the same
+        read. Returns True when the cube was streamed straight to its sidecar (already
+        persisted)."""
+        out_path, fp = self._cube_stream_target(ds)
         if out_path:
-            ds.build_mz_cube(min_intensity=min_intensity, progress=progress,
-                             out_path=out_path, fingerprint=fp)
+            ds.build_mz_cube(min_intensity=0.0, max_bins=FULL_CUBE_MAX_BINS, progress=progress,
+                             out_path=out_path, fingerprint=fp, prime=prime)
             return True                       # on disk at its sidecar → no separate save needed
-        ds.build_mz_cube(min_intensity=min_intensity, progress=progress)
+        ds.build_mz_cube(min_intensity=0.0, max_bins=FULL_CUBE_MAX_BINS, progress=progress,
+                         prime=prime)
         return False
 
     def build_ion_cache(self):
@@ -3024,8 +3575,7 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             return
 
         def build(progress=None):
-            _, spec = self.ds.mean_spectrum()
-            if self._build_cube(self.ds, spec, progress=progress):
+            if self._build_cube(self.ds, progress=progress):
                 self._cube_saved = True       # streamed cube is already at its sidecar
             return True
         self._run(build, want_progress=True,
@@ -3053,17 +3603,33 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
 
         def build(progress=None):
             try:
-                _, spec = ds.mean_spectrum()
-                if self._build_cube(ds, spec, progress=progress):
+                if self._build_cube(ds, progress=progress, prime=True):
                     self._cube_saved = True       # streamed cube is already at its sidecar
                 return True
             finally:
                 self._cube_building = False       # clear on success OR error (so retry can run)
 
-        self._run(build, want_progress=True,
-                  on_done=lambda _: self.statusBar().showMessage(
-                      "Fast cache ready — ROI, region & ion-image views are now instant."),
+        self._run(build, want_progress=True, on_done=lambda _: self._on_fast_cache_ready(),
                   busy="Building fast cache (ROI / ion images)…")
+
+    def _open_cache_dialog(self):
+        from .cachedialog import CacheDialog
+        dlg = CacheDialog(self, build_in_flight=lambda: bool(getattr(self, "_cube_building", False)),
+                          dataset_loaded=lambda: self.ds is not None)
+        dlg.exec()
+
+    def _on_fast_cache_ready(self):
+        """Redraw whatever was parked while the cube was building: the spectrum view that
+        showed the mean in place of a skyline, and an ion image whose m/z had no extracted
+        column (see ``_park_ion_until_cache``)."""
+        self.statusBar().showMessage(
+            "Fast cache ready — ROI, region & ion-image views are now instant.")
+        if getattr(self, "_pending_spectrum_refresh", False):
+            self._pending_spectrum_refresh = False
+            common.guarded(self._plot_mean_spectrum)
+        if getattr(self, "_pending_ion_refresh", False):
+            self._pending_ion_refresh = False
+            common.guarded(self.refresh_ion_image)
 
     # ----- image export (photo tools) ------------------------------------- #
     def _export_view(self, widget, default):

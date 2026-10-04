@@ -22,7 +22,8 @@ from PySide6 import QtCore, QtWidgets
 
 from .. import profiles
 from . import filedialogs
-from .common import (CheckList, note, section_title, NoScrollComboBox, NoScrollSpinBox)
+from .common import (CheckList, install_table_export, note, section_title,
+                     NoScrollComboBox, NoScrollSpinBox)
 
 _FILE_FILTER = (
     "Modality grids (*.csv *.tsv *.txt *.h5ad);;"
@@ -101,6 +102,8 @@ class CoMapDialog(QtWidgets.QDialog):
         self.table.setHorizontalHeaderLabels(["MSI m/z", "Modality feature", "Correlation"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        install_table_export(self.table, self, stem="comap_pairs",
+                             title="Export metabolite ↔ feature pairs")
         root.addWidget(self.table, 1)
 
         self.status = QtWidgets.QLabel("")

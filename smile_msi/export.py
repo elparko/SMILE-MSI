@@ -747,7 +747,7 @@ def render_ion_panel(image=None, *, rgb=None, mz=None, label="", title=None, sub
                      show_colorbar=True, show_scalebar=True, show_title=True,
                      width_in=7.0, dpi=200, legend=None, crop=None, outline_mask=None,
                      dim_outside=False, outline_color="#ffffff", outline_width=None,
-                     label_mode=annot.LABEL_MZ_PPM, ppm=None, subject_mask=None,
+                     show_outline=True, label_mode=annot.LABEL_MZ_PPM, ppm=None, subject_mask=None,
                      auto_corner=True, label_override=None, anchor=None):
     """Render an ion image with a small labelled intensity scale and (when supplied) a
     side-margin spectrum/legend — kept off the data so the image reads cleanly.
@@ -760,7 +760,8 @@ def render_ion_panel(image=None, *, rgb=None, mz=None, label="", title=None, sub
     computed on the **full** image first, so a cropped close-up keeps the very same contrast
     as the full view (a faithful zoom, not a re-stretch). ``outline_mask`` (a full-resolution
     boolean) is traced over the image in ``outline_color`` — the white ROI border seen in
-    publications — and ``dim_outside`` fades everything outside it.
+    publications — and ``dim_outside`` fades everything outside it. ``show_outline=False``
+    keeps the fade but draws no border.
     """
     style = make_style(theme, accent)
     acc = style.accent or accent_for_cmap(cmap)
@@ -832,7 +833,7 @@ def render_ion_panel(image=None, *, rgb=None, mz=None, label="", title=None, sub
     ax = fig.add_axes([0, foot, img_frac, 1.0 - foot])
     ax.imshow(disp, interpolation="nearest", aspect="auto")
     ax.set_axis_off()
-    if om is not None and om.any():                 # the ROI boundary, traced over the data
+    if show_outline and om is not None and om.any():   # the ROI boundary, traced over the data
         ax.contour(om.astype(float), levels=[0.5], colors=[outline_color],
                    linewidths=outline_width, antialiased=True)
     if foot > 0:

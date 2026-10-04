@@ -12,7 +12,7 @@ import pytest
 pytest.importorskip("PySide6")
 pytest.importorskip("pyqtgraph")
 
-from PySide6 import QtWidgets  # noqa: E402
+from PySide6 import QtCore, QtWidgets  # noqa: E402
 
 from smile_msi import annotate, spatial, isotopes, pipeline  # noqa: E402
 from smile_msi.gui import main as M  # noqa: E402
@@ -407,6 +407,12 @@ def test_gui_import_lipid_db_merge_and_replace(win, monkeypatch, tmp_path):
     import pandas as pd
     from smile_msi.lipiddb import build_database
     n_builtin = len(build_database())
+    # Start from the built-in DB whatever this machine remembers: MainWindow() kicks off
+    # _apply_remembered_lipid_db on a real worker, and if the user's saved DB lands before
+    # this test runs, the first _import_lipid_db call below would *toggle it off* instead of
+    # merging (order/timing dependent — seen as a flake in full-suite runs).
+    QtWidgets.QApplication.instance().processEvents()
+    win._set_lipid_db(None)
     # a genuinely new class (cardiolipin, P2 — not in the in-silico enumeration)
     ext = tmp_path / "ext.csv"
     pd.DataFrame([{"ABBREVIATION": "CL 72:8", "FORMULA": "C81H156O17P2", "CATEGORY": "GP"}]).to_csv(ext, index=False)
@@ -482,6 +488,27 @@ def test_gui_setup_wizard_applies_and_persists(win, monkeypatch, tmp_path):
         win.mode_combo.setCurrentText(orig_mode)
         win.id_ppm_spin.setValue(orig_tol)
     assert win._lipid_db is None
+
+
+def test_gui_new_lipid_list_from_identified_features(win):
+    """Features ⋯ → 'New lipid list from identified features…' groups the visible features'
+    identified ions by class; hidden features stay out."""
+    saved_hidden = [p.get("hidden") for p in win.peaks]
+    ided = [p for p in win.peaks if win.ann.class_of(p["mz"])]
+    assert len(ided) >= 2
+    ided[0]["hidden"] = True
+    try:
+        name = win._new_lipid_list_from_features()
+        assert name in win._lipid_lists
+        saved = {m for e in win._lipid_lists[name] for m in e["mzs"]}
+        assert float(ided[0]["mz"]) not in saved
+        assert float(ided[1]["mz"]) in saved
+        for e in win._lipid_lists[name]:
+            assert all(win.ann.class_of(m) == e["class"] for m in e["mzs"])
+    finally:
+        for p, h in zip(win.peaks, saved_hidden):
+            p["hidden"] = h
+        win._lipid_lists.pop(name, None)
 
 
 def test_gui_lipid_list_save_load_persist(win):
@@ -723,6 +750,11 @@ def test_gui_crop_studio_and_export(win, tmp_path):
     # a region with a saved crop exports straight through (no Studio prompt) and writes a file
     opts = dlg.options(); opts["crop_region"] = rg["name"]
     assert win._resolve_crop_targets(opts) == [rg]         # has a crop → no dialog
+    assert win._crop_kwargs(rg)["show_outline"] is True
+    assert win._crop_kwargs(rg, outline=False)["show_outline"] is False   # 'Outline region' unticked
+    dlg.chk_crop_outline.setChecked(False)
+    assert dlg.options()["crop_outline"] is False
+    dlg.chk_crop_outline.setChecked(True)
     p = win._peak_for_mz(win.active_mz) or {"mz": win.active_mz}
     fig = export.render_ion_panel(**{**win._panel_kwargs(p, opts), **win._crop_kwargs(rg)})
     out = tmp_path / "roi_closeup.png"
@@ -757,6 +789,28 @@ def test_gui_export_intensity_window_override(win):
     dlg.chk_window.setChecked(True)
     assert dlg.options()["window_override"] == (5.0, 60.0)
     assert win._export_feature_window(p, dlg.options()) == (5.0, 60.0)
+    dlg.deleteLater()
+
+
+def test_gui_export_live_preview(win):
+    """The Export dialog previews the image it will save, redraws after an option change, and
+    hides the preview for table exports."""
+    from smile_msi.gui.exportdialog import ExportDialog
+
+    win.set_active_mz(win.peaks[0]["mz"])
+    dlg = ExportDialog(win, scope="ion")
+    assert not dlg.preview_pane.isHidden()
+    dlg._render_preview()
+    first = dlg._preview_pixmap
+    assert first is not None and not first.isNull()
+
+    dlg.cmap_combo.setCurrentIndex((dlg.cmap_combo.currentIndex() + 1) % dlg.cmap_combo.count())
+    assert dlg._preview_timer.isActive()
+    dlg._render_preview()
+    assert dlg._preview_pixmap.toImage() != first.toImage()
+
+    dlg.scope_combo.setCurrentIndex(dlg.scope_combo.findData("features"))
+    assert dlg.preview_pane.isHidden()
     dlg.deleteLater()
 
 
@@ -3538,3 +3592,344 @@ def test_feature_panel_value_widgets_are_wheel_safe(win):
                  "class_combo", "ratio_a", "ratio_b"):
         w = getattr(win, attr)
         assert isinstance(w, _NoWheelMixin), f"{attr} is a raw {type(w).__name__}"
+
+
+def test_gui_cache_dialog_lists_store_and_selects_removable(app, tmp_path, monkeypatch):
+    """Data ▸ Manage caches… lists the store with sizes and can select the removable rows."""
+    import json
+    from smile_msi import session
+    from smile_msi.gui.cachedialog import CacheDialog
+    monkeypatch.setenv("SMILE_MSI_HOME", str(tmp_path))
+    d = session.sessions_dir()
+    src = tmp_path / "s.imzML"; src.write_bytes(b"x")
+    with open(os.path.join(d, "s__aaaaaaaa.json"), "w") as f:
+        json.dump({"source": str(src), "n_pixels": 4, "named_regions": []}, f)
+    (tmp_path / "sessions" / "s__aaaaaaaa.cube.zarr").write_bytes(b"z" * 8)
+    (tmp_path / "sessions" / "lost__bbbbbbbb.cube.zarr").write_bytes(b"z" * 16)
+    dlg = CacheDialog(None, build_in_flight=lambda: False, dataset_loaded=lambda: False)
+    assert dlg.table.rowCount() == 3
+    assert "sessions" in dlg.where.text()
+    dlg._select_removable()
+    sel = dlg._selected_paths()
+    assert sel == [os.path.join(d, "lost__bbbbbbbb.cube.zarr")]
+    dlg.close()
+
+
+def _fake_calibration(median):
+    anchors = [{"label": lab, "ref_mz": mz, "obs_mz": mz * (1 + median * 1e-6),
+                "intensity": 1.0, "ppm": median}
+               for lab, mz in (("PI 38:4", 885.5499), ("PE 38:4", 766.5392), ("FA 18:0", 283.2643))]
+    return {"anchors": anchors, "n": 3, "median_ppm": median, "iqr_ppm": 0.1,
+            "max_abs_ppm": abs(median) + 0.2, "slope_ppm_per_da": 0.01,
+            "factor": 1.0 / (1.0 + median * 1e-6)}
+
+
+def test_gui_calibration_apply_confirms_and_persists_state(win, monkeypatch):
+    """Apply lock-mass recalibration must leave an explicit calibrated state: the dialog's
+    state line, a disabled 'Applied ✓' button, the dataset banner, a status-bar confirmation,
+    and the session carries both the pipeline and the calibration record. Clearing the
+    reference m/z drops the state again."""
+    win._open_calibration_dialog()
+    win._on_calibration_result(_fake_calibration(-3.3))
+    assert win.calib_apply_btn.isEnabled()
+    assert "Not calibrated" in win.calib_state_label.text()
+    assert "not calibrated" in win.info.text()
+    # the verify pass re-measures on the corrected spectrum: stub it with a tight residual
+    monkeypatch.setattr(win, "_run_calibration_check",
+                        lambda verify=False: win._on_calibration_result(_fake_calibration(0.3), verify=verify))
+    win._apply_calibration_recal()            # _run is synchronous under test → completes here
+    cal = win._calibration
+    assert cal["source"] == "lock-mass" and cal["verified"] and cal["n_anchors"] == 3
+    assert cal["median_before"] == -3.3 and cal["median_after"] == 0.3
+    assert "✓ Calibrated" in win.calib_state_label.text()
+    assert win.calib_apply_btn.text() == "Applied ✓" and not win.calib_apply_btn.isEnabled()
+    assert "✓ calibrated" in win.info.text()
+    assert "verified" in win.statusBar().currentMessage()
+    assert win.ds.preprocessing["recalibrate"]["refs"] == [885.5499, 766.5392, 283.2643]
+    st = win._session_state()
+    assert st["calibration"]["verified"] and st["preprocessing"]["recalibrate"]["refs"][0] == 885.5499
+    # the cube key now includes the pipeline, so a raw-spectra cube can't be served to it
+    assert "|pp:" in win._cube_fingerprint(win.ds)
+    # remove the reference m/z → no longer calibrated, pipeline gone, banner reverts
+    win.pp_recal_edit.setText("")
+    win.apply_preprocessing()
+    assert win._calibration is None and win.ds.preprocessing is None and not win.ds.transforms
+    assert "not calibrated" in win.info.text()
+    assert "|pp:" not in win._cube_fingerprint(win.ds)
+
+
+def test_gui_preprocess_widgets_round_trip(win):
+    """_set_preprocess_widgets is the inverse of _preprocess_config for every option."""
+    cfg = {"baseline": {"method": "median", "window": 55}, "smooth": {"gaussian": 2.5},
+           "recalibrate": {"refs": [885.5499, 283.2643], "tol_ppm": 60.0},
+           "normalize": {"reference": 255.233}}
+    win._set_preprocess_widgets(cfg)
+    assert win._preprocess_config() == cfg
+    win._set_preprocess_widgets({"baseline": 30, "smooth": {"savgol": 11}, "normalize": "vector"})
+    assert win._preprocess_config() == {"baseline": 30, "smooth": {"savgol": 11}, "normalize": "vector"}
+    win._set_preprocess_widgets({})
+    assert win._preprocess_config() == {}
+
+
+# --------------------------------------------------------------------------- #
+# regions by construction (plan 25): Draw-ROI bar sources + refine + save
+# --------------------------------------------------------------------------- #
+def test_gui_threshold_source_builds_and_saves_a_region(win):
+    """Source = Threshold (signal): the ROI mask is the active feature thresholded at a
+    percentile of its signal pixels (holes filled); tightening the cut shrinks it; 'Save as
+    region' stores it under a name pre-filled from the build."""
+    win.regions = []
+    win._clear_roi()
+    win.roi_shape.setCurrentText("Rectangle")
+    win._pending_pick_region = None
+    win._on_peaks(M.pick_and_build(win.ds, 3.0, 0.01, win.ppm, win.reduce))
+    win.set_active_mz(float(win.peaks[0]["mz"]))
+    win.roi_shape.setCurrentText("Threshold (signal)")
+    win.roi_chk.setChecked(True)
+    assert not win.thr_btn.isHidden() and win.src_region.isHidden()
+    assert not win.refine_tools.isHidden() and not win.roi_actions.isHidden()
+    assert win.border_mode.currentText() == "Filled"
+    win.thr_cut.setValue(60)
+    m60 = win._roi_mask()
+    assert m60 is not None and 0 < int(m60.sum()) < win.ds.n_pixels
+    assert win._band_overlay.isVisible()                    # the footprint is painted
+    vec, label = win._threshold_signal_vector()
+    expect = spatial.threshold_mask(win.ds, vec, 60)
+    assert np.array_equal(m60, expect)
+    win.thr_cut.setValue(90)
+    m90 = win._roi_mask()
+    assert 0 < int(m90.sum()) < int(m60.sum())
+    assert win.thr_slider.value() == 90                     # spin ⇄ slider stay in step
+    assert win._roi_source_label() == f"{label} ≥ p90"
+    ri = win._save_roi_as_region()                          # getText is patched → default name
+    QtWidgets.QApplication.processEvents()                  # closes the undo action
+    assert ri == 0 and len(win.regions) == 1
+    assert win.regions[0]["name"] == f"{label} ≥ p90"
+    assert np.array_equal(win.regions[0]["mask"], m90)
+    assert win.regions[0]["parent"] is None
+    assert not win.roi_chk.isChecked()                      # the build was consumed
+    # absolute cut: the spin turns into an intensity and the mask follows it
+    win.roi_chk.setChecked(True)
+    win.thr_absolute.setChecked(True)
+    assert win.thr_cut.suffix() == "" and not win.thr_slider.isEnabled()
+    cut = float(win.thr_cut.value())
+    assert np.array_equal(win._roi_mask(), spatial.threshold_mask(win.ds, vec, cut, percentile=False))
+    win.thr_absolute.setChecked(False)
+    win._clear_roi()
+    win.roi_shape.setCurrentText("Rectangle")
+    win.regions = []
+
+
+def test_gui_threshold_sum_of_features_and_class(win, monkeypatch):
+    """The Threshold signal can be a lipid class composite or a hand-picked sum of features."""
+    win.regions = []
+    win._clear_roi()
+    if not win.peaks:
+        win._pending_pick_region = None
+        win._on_peaks(M.pick_and_build(win.ds, 3.0, 0.01, win.ppm, win.reduce))
+    win.roi_shape.setCurrentText("Threshold (signal)")
+    win.roi_chk.setChecked(True)
+    win._refresh_threshold_signals()
+    kinds = [win.thr_signal.itemData(i)[0] for i in range(win.thr_signal.count())]
+    assert kinds[0] == "active" and kinds[-1] == "sum"
+
+    def fake_exec(dlg):
+        lst = dlg.findChild(QtWidgets.QListWidget)
+        for i in range(2):
+            lst.item(i).setCheckState(QtCore.Qt.Checked)
+        return QtWidgets.QDialog.Accepted
+    monkeypatch.setattr(QtWidgets.QDialog, "exec", fake_exec)
+    win.thr_signal.setCurrentIndex(win.thr_signal.count() - 1)      # 'Sum of features…' → picker
+    assert len(win._thr_sum_mzs) == 2
+    vec, label = win._threshold_signal_vector()
+    mzs = [win._apex_mz(m) for m in win._thr_sum_mzs]
+    assert label == "sum of 2 features"
+    assert np.allclose(vec, win.ds.composite_vector(mzs, tol_ppm=win.ppm, reduce=win.reduce,
+                                                    norm=win.norm, weight=win.composite_weight))
+    assert win._roi_mask() is not None
+    if win._class_map:                                              # a class composite, when identified
+        cls = next(iter(win._class_map))
+        i = next(i for i in range(win.thr_signal.count()) if win.thr_signal.itemData(i) == ("class", cls))
+        win.thr_signal.setCurrentIndex(i)
+        vec, label = win._threshold_signal_vector()
+        assert label == f"class {cls}" and vec.shape == (win.ds.n_pixels,)
+    win.thr_signal.setCurrentIndex(0)
+    win._thr_sum_mzs = []
+    win._clear_roi()
+    win.roi_shape.setCurrentText("Rectangle")
+
+
+def test_gui_existing_region_source_collar_and_everything_else(win):
+    """Source = Existing region: start from a saved region and Refine it — an outer collar
+    nests under its source ('endo · outer collar 2 px'), 'Everything else' is the complement
+    ('not endo', top level). Filled = the region's own pixels."""
+    win.regions = []
+    win._clear_roi()
+    rows, cols = win.ds._pixel_rows_cols()
+    endo = (rows >= 8) & (rows < 20) & (cols >= 10) & (cols < 26)
+    win._new_region("endo", mask=endo)
+    QtWidgets.QApplication.processEvents()                          # settle any open undo action
+    win.roi_shape.setCurrentText("Existing region")
+    win.roi_chk.setChecked(True)
+    assert win.thr_btn.isHidden() and not win.src_region.isHidden()
+    assert [win.src_region.itemText(i) for i in range(win.src_region.count())] == ["endo"]
+    assert np.array_equal(win._roi_mask(), endo)                    # Filled
+
+    win.border_mode.setCurrentText("Outer collar")
+    win.border_spin.setValue(2)
+    assert win.border_spin.isEnabled()
+    collar = win._roi_mask()
+    assert np.array_equal(collar, spatial.ring_mask(win.ds, endo, 2, mode="outer"))
+    assert not (collar & endo).any()
+    assert win._roi_source_label() == "endo · outer collar 2 px"
+    ri = win._save_roi_as_region()
+    QtWidgets.QApplication.processEvents()                          # closes the undo action
+    assert win.regions[ri]["name"] == "endo · outer collar 2 px"
+    assert win.regions[ri]["parent"] == "endo"                      # nests under its source
+    assert np.array_equal(win.regions[ri]["mask"], collar)
+
+    win.roi_chk.setChecked(True)
+    win.src_region.setCurrentText("endo")
+    win.border_mode.setCurrentText("Everything else")
+    assert not win.border_spin.isEnabled()
+    rest = win._roi_mask()
+    assert np.array_equal(rest, ~endo)
+    assert win._roi_source_label() == "not endo"
+    ri = win._save_roi_as_region()
+    QtWidgets.QApplication.processEvents()
+    assert win.regions[ri]["name"] == "not endo" and win.regions[ri]["parent"] is None
+    assert int(win.regions[ri]["mask"].sum()) == win.ds.n_pixels - int(endo.sum())
+
+    # the µm readout follows the slide's pixel size
+    win.roi_chk.setChecked(True)
+    win.border_mode.setCurrentText("Inner rim")
+    win.border_spin.setValue(6)
+    old = win.ds.pixel_size_um
+    try:
+        win.ds.pixel_size_um = 5.0
+        win._sync_refine_tools()
+        assert win.border_um.text() == "= 30 µm"
+        win.ds.pixel_size_um = None
+        win._sync_refine_tools()
+        assert win.border_um.text() == "(no pixel size)"
+    finally:
+        win.ds.pixel_size_um = old
+    win._undo(); win._undo()                                        # both saves roll back
+    assert [rg["name"] for rg in win.regions] == ["endo"]
+    win.border_mode.setCurrentText("Filled")
+    win._clear_roi()
+    win.roi_shape.setCurrentText("Rectangle")
+    win.regions = []
+
+
+def test_gui_refine_pill_applies_to_drawn_shapes_too(win):
+    """The old hidden Border popup became the visible Refine pill: a drawn rectangle still
+    reduces to an inner rim / outer collar / band, and 'Everything else' inverts it."""
+    win.regions = []
+    win._clear_roi()
+    win.roi_shape.setCurrentText("Rectangle")
+    win.border_mode.setCurrentText("Filled")
+    win.roi_chk.setChecked(True)
+    win.roi.setPos([10, 8]); win.roi.setSize([16, 12])
+    filled = win._roi_mask()
+    assert int(filled.sum()) == 16 * 12
+    win.border_mode.setCurrentText("Inner rim")
+    win.border_spin.setValue(1)
+    rim = win._roi_mask()
+    assert np.array_equal(rim, spatial.ring_mask(win.ds, filled, 1, mode="inner"))
+    assert win._band_overlay.isVisible()
+    win.border_mode.setCurrentText("Everything else")
+    assert np.array_equal(win._roi_mask(), ~filled)
+    win.border_mode.setCurrentText("Filled")
+    assert np.array_equal(win._roi_mask(), filled)
+    assert not win._band_overlay.isVisible()                        # outline suffices when filled
+    win._clear_roi()
+
+
+def test_gui_regions_panel_derive_menu(win, monkeypatch):
+    """Regions panel ▸ Derive: outer collar / inner rim / band nest under their source with
+    the width in the name; Everything else is the complement at top level; Fill holes closes
+    an enclosed core (and refuses when there is nothing to fill). All undoable."""
+    win.regions = []
+    QtWidgets.QApplication.processEvents()
+    rows, cols = win.ds._pixel_rows_cols()
+    box = (rows >= 8) & (rows < 20) & (cols >= 10) & (cols < 26)
+    hole = (rows >= 12) & (rows < 16) & (cols >= 15) & (cols < 21)
+    win._new_region("endo", mask=box & ~hole)
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getInt",
+                        staticmethod(lambda *a, **k: (2, True)))
+    i = win._derive_region_prompt(0, "outer")
+    QtWidgets.QApplication.processEvents()
+    rg = win.regions[i]
+    assert rg["name"] == "endo · outer collar 2 px" and rg["parent"] == "endo"
+    assert np.array_equal(rg["mask"], spatial.ring_mask(win.ds, box & ~hole, 2, mode="outer"))
+    i = win._derive_region_prompt(0, "invert")
+    QtWidgets.QApplication.processEvents()
+    assert win.regions[i]["name"] == "not endo" and win.regions[i]["parent"] is None
+    assert np.array_equal(win.regions[i]["mask"], ~(box & ~hole))
+    i = win._derive_region_prompt(0, "fill")
+    QtWidgets.QApplication.processEvents()
+    assert win.regions[i]["name"] == "endo · filled" and win.regions[i]["parent"] == "endo"
+    assert np.array_equal(win.regions[i]["mask"], box)
+    assert win._derive_region_prompt(i, "fill") == -1                # nothing left to fill
+    assert len(win.regions) == 4
+    # the list shows the derived rings directly under their source
+    order = [rg["name"] for rg in win._nested_order(win.regions)]
+    assert order.index("endo · outer collar 2 px") == order.index("endo") + 1
+    # a cancelled width prompt derives nothing
+    monkeypatch.setattr(QtWidgets.QInputDialog, "getInt",
+                        staticmethod(lambda *a, **k: (0, False)))
+    assert win._derive_region_prompt(0, "band") == -1 and len(win.regions) == 4
+    win._undo(); win._undo(); win._undo()
+    assert [rg["name"] for rg in win.regions] == ["endo"]
+    win.regions = []
+
+
+def test_gui_compartments_dialog_creates_three_grouped_regions(win):
+    """Compartments…: threshold → outer collar → everything else, previewed and created as
+    three regions tagged as their own groups — which the Multi-group analysis dialog then
+    resolves as its groups (names endo / peri / epi)."""
+    from smile_msi import registry
+    from smile_msi.gui.analysisdialog import AnalysisDialog
+    win.regions = []
+    QtWidgets.QApplication.processEvents()
+    win._pending_pick_region = None
+    win._on_peaks(M.pick_and_build(win.ds, 3.0, 0.01, win.ppm, win.reduce))
+    win.set_active_mz(float(win.peaks[0]["mz"]))
+    dlg = win._open_compartments_dialog()
+    assert dlg is win._open_compartments_dialog()                   # built once, re-shown
+    dlg.cut.setValue(60)
+    dlg.collar.setValue(2)
+    trio = dlg.masks()
+    assert trio is not None
+    endo, peri, epi = trio
+    vec, _ = dlg._signal_vector()
+    assert np.array_equal(endo, spatial.threshold_mask(win.ds, vec, 60))
+    assert np.array_equal(peri, spatial.ring_mask(win.ds, endo, 2, mode="outer"))
+    assert not (endo & peri).any() and not (epi & (endo | peri)).any()
+    assert int(endo.sum() + peri.sum() + epi.sum()) == win.ds.n_pixels
+    assert dlg.b_create.isEnabled() and dlg.preview.pixmap() is not None
+    dlg.names[2].setText("endo")                                    # duplicate names block Create
+    assert not dlg.b_create.isEnabled()
+    dlg.names[2].setText("epi")
+    made = dlg._create()
+    QtWidgets.QApplication.processEvents()
+    assert made == ["endo", "peri", "epi"]
+    assert [rg["name"] for rg in win.regions] == made
+    assert [rg["group"] for rg in win.regions] == made
+    assert len({rg["color"] for rg in win.regions}) == 3
+    assert dlg.isHidden()
+    # the Multi-group dialog lists exactly these as its groups
+    sd = registry.REGISTRY["multigroup_features"]
+    ad = win.open_analysis(AnalysisDialog(win, sd))
+    try:
+        inputs = registry.resolve_inputs(ad._state(), sd)
+        assert list(inputs["names"]) == ["endo", "peri", "epi"]
+        labels = np.asarray(inputs["labels"])
+        assert int((labels == 0).sum()) == int(endo.sum())
+        assert int((labels == 1).sum()) == int(peri.sum())
+        assert int((labels == 2).sum()) == int(epi.sum())
+    finally:
+        win._close_analysis(ad)
+    win._undo()
+    assert win.regions == []

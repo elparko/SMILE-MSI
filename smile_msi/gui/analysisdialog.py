@@ -215,11 +215,37 @@ class AnalysisDialog(QtWidgets.QWidget):
     # ------------------------------------------------------------------ #
     # readiness
     # ------------------------------------------------------------------ #
+    def _state(self):
+        """The window's gallery state with THIS dialog's scope-bar picks applied: the chosen
+        feature set, the chosen groups (over the Setup tags and the segmentation fallback)
+        and the A/B pair. The run, the readiness check and the staleness probe all read
+        this, so what the bar says is what the analysis gets."""
+        state = self.win._gallery_state()
+        bar = self.scope
+        if bar.feat_readout is not None:                       # bar has a feature picker
+            state["mzs"] = [float(m) for m in bar.feature_mzs()]
+        chosen = bar.group_regions()
+        if chosen:
+            regions = state.get("regions") or {}
+            groups = {}
+            for name in chosen:
+                mk = regions.get(name)
+                if mk is not None and mk.any():
+                    groups[name] = [mk]
+            if len(groups) >= 2:
+                state["groups"] = groups
+                state["seg_labels"] = None                     # chosen groups, never the fallback
+                state["seg_names"] = None
+        a, b = bar.ab_regions()
+        if a and b:
+            state["scope_a"], state["scope_b"] = [a], [b]
+        return state
+
     def _refresh_run_enabled(self, *_):
         if self.sd is None:
             return
         try:
-            reasons = registry.unmet_needs(self.win._gallery_state(), self.sd)
+            reasons = registry.unmet_needs(self._state(), self.sd)
         except Exception:                                   # noqa: BLE001 — never let a bad state disable forever
             traceback.print_exc()
             reasons = []
@@ -231,7 +257,7 @@ class AnalysisDialog(QtWidgets.QWidget):
     # ------------------------------------------------------------------ #
     def _run(self):
         win, sd = self.win, self.sd
-        state = win._gallery_state()
+        state = self._state()
         try:
             inputs = registry.resolve_inputs(state, sd)
         except ValueError as exc:
@@ -356,6 +382,8 @@ class AnalysisDialog(QtWidgets.QWidget):
         if (needs & {"groups", "region", "ab"}) or sd.id == "region_membership":
             d["groups"] = sorted((state.get("groups") or {}).keys())
             d["regions"] = sorted((state.get("regions") or {}).keys())
+            if state.get("scope_a") or state.get("scope_b"):    # the chosen A/B pair
+                d["ab"] = [list(state.get("scope_a") or []), list(state.get("scope_b") or [])]
         if "target_mz" in needs:
             t = state.get("target_mz")
             d["target_mz"] = (round(float(t), 4) if t is not None else None)
@@ -718,7 +746,7 @@ class AnalysisDialog(QtWidgets.QWidget):
         except Exception:                                   # noqa: BLE001
             fp = ""
         try:
-            cur_inputs = self._scope_descriptor(self.win._gallery_state())
+            cur_inputs = self._scope_descriptor(self._state())
         except Exception:                                   # noqa: BLE001 — unmet inputs still count as drift
             cur_inputs = {}
         if run.is_stale(fp, cur_inputs):

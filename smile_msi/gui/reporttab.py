@@ -24,7 +24,8 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import export
-from .common import (ControlBar, confirm, fig_to_pixmap, glossary_button, icon, note,
+from .common import (ControlBar, confirm, fig_to_pixmap, glossary_button, icon,
+                     install_table_export, note,
                      tab_page, button, MUTED_QSS, MUTED_FG, NoScrollComboBox)
 from . import filedialogs
 
@@ -164,6 +165,8 @@ class ReportTabMixin:
         self.report_table_preview.horizontalHeader().setStretchLastSection(True)
         self.report_table_preview.setMaximumHeight(260)
         self.report_table_preview.hide()
+        install_table_export(self.report_table_preview, self,
+                             stem="report_table", title="Export table")
         pvl.addWidget(self.report_table_preview)
         self.report_source = QtWidgets.QLabel("")
         self.report_source.setWordWrap(True)

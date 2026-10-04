@@ -126,6 +126,7 @@ class CubeStore:
     def __init__(self, store, group, *, axis, edges, indptr, colsum, n_pixels, nbins):
         self._store = store          # zarr ZipStore — kept open for lazy chunk reads
         self._g = group
+        self.path = str(getattr(store, "path", "") or "")    # on-disk location (ZipStore)
         self.axis = np.asarray(axis, dtype=np.float64)       # float64[nbins]   (RAM)
         self.edges = np.asarray(edges, dtype=np.float64)     # float64[nbins+1] (RAM)
         self.indptr = np.asarray(indptr, dtype=np.int64)     # int64[nbins+1]   (RAM)

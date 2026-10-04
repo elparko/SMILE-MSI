@@ -247,7 +247,9 @@ class ScriptConsoleDialog(QtWidgets.QDialog):
         self._apply_btn = menu_button("Apply to app", [
             ("Set as working features", self._apply_features),
             ("Set as segmentation", self._apply_segmentation),
-        ], tooltip="Push the script's features / segmentation into the app's views.", name="menu")
+            ("Add regions to the slide", self._apply_regions),
+        ], tooltip="Push the script's features / segmentation / add_region() regions into the app.",
+            name="menu")
         self._apply_btn.setEnabled(False)
         foot.addWidget(self._apply_btn)
         self._status = note("")
@@ -318,7 +320,8 @@ class ScriptConsoleDialog(QtWidgets.QDialog):
         self._set_running(False)
         self._last_result = result
         self._render(result)
-        self._apply_btn.setEnabled(bool(result.peaks) or result.segmentation is not None)
+        self._apply_btn.setEnabled(bool(result.peaks) or result.segmentation is not None
+                                   or bool(result.regions))
         self.win.statusBar().showMessage(
             ("Workflow failed — see the Log tab." if not result.ok
              else f"Workflow ran — {result.summary()}."))
@@ -411,9 +414,9 @@ class ScriptConsoleDialog(QtWidgets.QDialog):
         rows = []
         for _, r in shown.iterrows():
             rows.append([(f"{v:.4g}" if isinstance(v, float) else str(v)) for v in r.tolist()])
-        fill_table(t, headers, rows)
         from .common import install_table_export
         install_table_export(t, self, stem="workflow_table", title="Export table")
+        fill_table(t, headers, rows)
         return t
 
     def _image_widget(self, arr):
@@ -455,6 +458,27 @@ class ScriptConsoleDialog(QtWidgets.QDialog):
         self.win.reveal_view("Segmentation")
         self.win.statusBar().showMessage(
             f"Applied segmentation ({int(r.segmentation.n_clusters)} clusters) to the app.")
+
+    def _apply_regions(self):
+        r = self._last_result
+        if r is None or not r.regions:
+            self.win.statusBar().showMessage(
+                "No regions from the last run — stage them with add_region(name, mask).")
+            return
+        win = self.win
+        win.record_undo("script regions", domains=("regions",))
+        names = []
+        for rg in r.regions:
+            i = win._new_region(rg["name"], color=rg.get("color"), mask=rg["mask"], refresh=False)
+            names.append(win.regions[i]["name"])
+        win._refresh_regions_all(names[-1])
+        if win.prov is not None:
+            win.prov.step("region_derive", source="script", op="add_region", names=list(names))
+        win._mark_dirty()
+        self.refresh_context()
+        win.statusBar().showMessage(
+            f"Added {len(names)} region{'s' if len(names) != 1 else ''} from the script: "
+            f"{', '.join(names)}.")
 
     # ------------------------------------------------------------------ #
     # AI guide

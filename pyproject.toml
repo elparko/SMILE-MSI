@@ -83,6 +83,12 @@ spatialomics = ["anndata>=0.10"]
 # Learned ion-image embeddings (ionembed.py): self-supervised contrastive encoder. Heavy;
 # lazy-imported and REQUIRED for colocalize(method="learned") — no silent fallback to Pearson.
 ion-embed = ["torch>=2.2"]
+# Model Context Protocol server (mcpserver.py): lets an AI assistant drive the engine. Kept
+# out of core — and out of smile_msi.spec — because the SDK pulls ~28 packages (pydantic,
+# starlette, uvicorn, cryptography) that the desktop app never uses and the frozen Windows
+# bundle should not carry. Pinned to the 2.x line: 2.0 renamed the server class FastMCP →
+# MCPServer and moved mcp.server.fastmcp.* to mcp.server.mcpserver.*, so v1 code will not run.
+mcp = ["mcp>=2.2,<3"]
 build = ["pyinstaller>=6.0"]
 dev = ["pytest>=7", "pytest-timeout>=2.1", "shap>=0.44"]
 

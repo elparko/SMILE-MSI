@@ -312,7 +312,7 @@ def _apex_centroid(axis, spec, k, half: int = 2) -> float:
 
 
 def measure_calibration_offset(ds, references=None, *, mode: str = "negative",
-                               tol_ppm: float = 30.0) -> dict:
+                               tol_ppm: float = 30.0, mask=None) -> dict:
     """Measure the dataset's **absolute** m/z calibration offset against known reference ions.
 
     Unlike :func:`mass_drift` (per-pixel *spread* vs. an auto-picked peak) and
@@ -326,6 +326,11 @@ def measure_calibration_offset(ds, references=None, *, mode: str = "negative",
     For each anchor the nearest mean-spectrum apex within ``tol_ppm`` gives the observed m/z
     and a signed ppm error (sub-bin refined). ``tol_ppm`` must exceed the expected offset
     (default 30 ppm — wide enough to catch a ~−12 ppm drift without grabbing a neighbour).
+
+    ``mask`` (boolean per-pixel array) measures one region instead of the whole slide. Two
+    samples in different embedding media on one slide drift by different amounts, and a
+    slide-wide measurement averages them into an offset that fits neither; measure each
+    region, then correct each with :func:`preprocess.recalibrate_regions`.
 
     Returns ``{anchors: [{label, ref_mz, obs_mz, intensity, ppm}], n, median_ppm, iqr_ppm,
     max_abs_ppm, slope_ppm_per_da, factor}`` where ``factor = 1/(1 + median_ppm·1e-6)`` is
@@ -344,7 +349,7 @@ def measure_calibration_offset(ds, references=None, *, mode: str = "negative",
     if not norm_refs:
         return empty
 
-    axis, spec = ds.mean_spectrum()
+    axis, spec = ds.mean_spectrum(mask=mask)
     axis = np.asarray(axis, float)
     spec = np.asarray(spec, float)
     if axis.size == 0:

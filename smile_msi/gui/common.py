@@ -120,12 +120,19 @@ def load_imzml(path, stride=1, progress=None):
     return ds
 
 def pick_and_build(ds, snr, min_rel, tol_ppm, reduce, projection="mean", mask=None,
-                   progress=None, prominence=1.0):
+                   progress=None, prominence=1.0, max_peaks=0):
     # mask restricts peak DETECTION to a region's pixels (a per-sample feature list);
     # features are still integrated over every pixel so the ion images span the slide.
+    # max_peaks=0 means no cap: a fixed top-N would make two regions with different
+    # numbers of detectable ions report the same count.
     peaks = ds.pick_peaks(snr=snr, min_rel_intensity=min_rel, projection=projection,
-                          mask=mask, prominence=prominence)
+                          mask=mask, prominence=prominence, max_peaks=max_peaks)
     mzs = [p["mz"] for p in peaks]
+    # Extraction caches one float32 per pixel per feature, and every feature_matrix consumer
+    # (segmentation, PCA/NMF, co-localization) then takes a float64 copy — 3x this figure. A
+    # noisy slide picked with no cap can ask for more than the machine has, so report the
+    # size rather than discover it as a MemoryError three steps later.
+    peaks.cache_gb = ds.n_pixels * len(mzs) * 4 / 1e9
     if mzs:
         ds.ensure_features(mzs, tol_ppm=tol_ppm, reduce=reduce, progress=progress)
     return peaks
@@ -133,7 +140,7 @@ def pick_and_build(ds, snr, min_rel, tol_ppm, reduce, projection="mean", mask=No
 def find_spatial(ds, snr, min_rel, tol_ppm, reduce, min_frequency, min_morans,
                  norm="tic", mask=None, progress=None, prominence=1.0,
                  projection="mean", rescue_frequency=None, collapse_isotopes=False,
-                 fdr_max=None, mode="negative", fdr_ppm=5.0):
+                 fdr_max=None, mode="negative", fdr_ppm=5.0, max_candidates=2000):
     """Worker for the spatially-aware feature finder: mean candidates →
     frequency gate → spatial-denoise gate → auto-width → (opt) isotope collapse →
     (opt) FDR threshold. Returns the engine's
@@ -147,7 +154,7 @@ def find_spatial(ds, snr, min_rel, tol_ppm, reduce, min_frequency, min_morans,
     res = spatial.find_spatial_features(
         ds, snr=snr, min_rel_intensity=min_rel, tol_ppm=tol_ppm, reduce=reduce,
         min_frequency=min_frequency, min_morans=min_morans, norm=norm, mask=mask,
-        prominence=prominence, projection=projection,
+        max_candidates=max_candidates, prominence=prominence, projection=projection,
         rescue_frequency=rescue_frequency, collapse_isotopes=collapse_isotopes,
         progress=progress)
     if fdr_max is not None and res.peaks:
@@ -1596,6 +1603,28 @@ def check_table_bar(table, col=0, noun="row", *, on_change=None):
         on_change=on_change)
 
 
+def coalesce(owner, fn):
+    """Wrap ``fn`` so a burst of signals costs two runs, not one per signal.
+
+    A lone call runs ``fn`` straight away (so a single tick updates the label synchronously);
+    further calls before the event loop next idles are dropped, and one deferred run at the
+    end covers them. Ticking a parent row carrying ``ItemIsAutoTristate`` emits ``itemChanged``
+    for every child, so a handler that walks the whole tree is O(N²) — measured at 7.8 s for a
+    1000-ion feature list and 70 s for 3000."""
+    timer = QtCore.QTimer(owner)
+    timer.setSingleShot(True)
+    timer.setInterval(0)
+    timer.timeout.connect(fn)
+
+    def run(*_):
+        if timer.isActive():                        # mid-cascade — the pending run covers it
+            return
+        fn()
+        timer.start()
+
+    return run
+
+
 def _bulk_bar(widget, noun, rows_visible, rows_all, get_state, set_state, on_change):
     """The **All / None / Invert + live count** row, over whatever rows the caller enumerates.
 
@@ -1612,9 +1641,12 @@ def _bulk_bar(widget, noun, rows_visible, rows_all, get_state, set_state, on_cha
     count.setStyleSheet(MUTED_QSS)
 
     def refresh_count():
-        every = rows_all()
-        n = sum(1 for it in every if get_state(it))
-        count.setText(f"{n} of {len(every)} selected")
+        try:
+            every = rows_all()
+            n = sum(1 for it in every if get_state(it))
+            count.setText(f"{n} of {len(every)} selected")
+        except RuntimeError:                        # the bar went away before a deferred run
+            return
 
     def apply(fn):
         widget.blockSignals(True)                   # one repaint, not one per row
@@ -1635,7 +1667,7 @@ def _bulk_bar(widget, noun, rows_visible, rows_all, get_state, set_state, on_cha
     lay.addStretch(1)
     lay.addWidget(count)
     row.refresh_count = refresh_count
-    widget.itemChanged.connect(lambda *_: refresh_count())
+    widget.itemChanged.connect(coalesce(row, refresh_count))
     refresh_count()
     return row
 
@@ -2613,11 +2645,33 @@ def fill_table(table: QtWidgets.QTableWidget, headers, rows):
         table.blockSignals(blocked)                   # restore prior blocking state
     table.resizeColumnsToContents()
     table.setSortingEnabled(was_sorting)              # restore (numeric-aware) sorting
+    # Right-click Copy / Export on every filled table; a view with its own menu is skipped.
+    install_table_export(table)
 
 
 # --------------------------------------------------------------------------- #
-# Generic table export — give any QTableWidget a Copy / CSV-Excel affordance
+# Generic table copy/export — one Copy (CSV) / Export affordance for every view
 # --------------------------------------------------------------------------- #
+def _item_text(item, col=None):
+    """The text one cell copies as. ``col`` is the column for a tree item, None for a
+    table/list item.
+
+    Falls back to the tick state for checkbox-only cells (the segmentation ``✓`` column,
+    the standards ``Use`` column, the lipid tree's eye) — those carry their whole meaning
+    in the checkbox, so copying them as an empty string loses a column."""
+    if item is None:
+        return ""
+    txt = item.text() if col is None else item.text(col)
+    if txt:
+        return txt
+    chk = (item.data(QtCore.Qt.CheckStateRole) if col is None
+           else item.data(col, QtCore.Qt.CheckStateRole))
+    if chk is None:
+        return ""
+    state = QtCore.Qt.CheckState(chk)
+    return {QtCore.Qt.Checked: "yes", QtCore.Qt.PartiallyChecked: "partial"}.get(state, "no")
+
+
 def table_grid(table: QtWidgets.QTableWidget, *, selected_only=False):
     """Read a QTableWidget into ``(headers, rows)`` of plain strings.
 
@@ -2638,9 +2692,145 @@ def table_grid(table: QtWidgets.QTableWidget, *, selected_only=False):
             continue
         if sel_rows is not None and r not in sel_rows:
             continue
-        rows.append([(table.item(r, c).text() if table.item(r, c) is not None else "")
-                     for c in cols])
+        rows.append([_item_text(table.item(r, c)) for c in cols])
     return headers, rows
+
+
+def tree_grid(tree: QtWidgets.QTreeWidget, *, selected_only=False):
+    """Read a QTreeWidget into ``(headers, rows)`` — every item is one row, in the order
+    it is drawn, so a grouped roster copies the way it reads on screen."""
+    cols = [c for c in range(tree.columnCount()) if not tree.isColumnHidden(c)]
+    head = tree.headerItem()
+    headers = [(head.text(c) if head is not None else f"col{c}") for c in cols]
+    rows = []
+    it = QtWidgets.QTreeWidgetItemIterator(
+        tree, QtWidgets.QTreeWidgetItemIterator.NotHidden)
+    while it.value() is not None:
+        item = it.value()
+        it += 1
+        if selected_only and not item.isSelected():
+            continue
+        rows.append([_item_text(item, c) for c in cols])
+    return headers, rows
+
+
+def list_grid(lw: QtWidgets.QListWidget, *, selected_only=False):
+    """Read a QListWidget into ``(headers, rows)`` — one column of visible rows."""
+    rows = []
+    for i in range(lw.count()):
+        item = lw.item(i)
+        if item is None or item.isHidden():
+            continue
+        if selected_only and not item.isSelected():
+            continue
+        rows.append([_item_text(item)])
+    return ["item"], rows
+
+
+def _model_grid(view, *, selected_only=False):
+    """Last-resort reader for a model-backed view (QTableView / QTreeView)."""
+    model = view.model()
+    if model is None:
+        return [], []
+    cols = list(range(model.columnCount()))
+    headers = [str(model.headerData(c, QtCore.Qt.Horizontal) or f"col{c}") for c in cols]
+    sm = view.selectionModel()
+    rows = []
+    for r in range(model.rowCount()):
+        if selected_only and (sm is None or not sm.isRowSelected(r, QtCore.QModelIndex())):
+            continue
+        rows.append([str(model.data(model.index(r, c)) or "") for c in cols])
+    return headers, rows
+
+
+def view_grid(view, *, selected_only=False):
+    """``(headers, rows)`` for any item view — table, tree or list — so copy and export
+    read the same grid whichever widget a screen happened to use."""
+    if isinstance(view, QtWidgets.QTableWidget):
+        return table_grid(view, selected_only=selected_only)
+    if isinstance(view, QtWidgets.QTreeWidget):
+        return tree_grid(view, selected_only=selected_only)
+    if isinstance(view, QtWidgets.QListWidget):
+        return list_grid(view, selected_only=selected_only)
+    return _model_grid(view, selected_only=selected_only)
+
+
+def grid_csv(headers, rows, *, sep=","):
+    """``(headers, rows)`` → CSV text, quoted by the csv module (so a lipid name with a
+    comma survives the round trip)."""
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=sep, lineterminator="\n")
+    if headers:
+        w.writerow(headers)
+    w.writerows(rows)
+    return buf.getvalue()
+
+
+def copy_grid(headers, rows, *, sep=","):
+    """Put a grid on the clipboard as delimited text. Returns the text.
+
+    Deliberately ``setText`` and not ``setMimeData``: a QMimeData built in Python is kept by
+    the clipboard and destroyed by Qt's static teardown *after* the interpreter is gone, and
+    PySide segfaults unwinding it — so any process that copied a table crashed on quit.
+    Extra clipboard flavours (an HTML table for Excel) are not worth that; ``sep="\t"`` is
+    the spreadsheet-friendly form instead."""
+    text = grid_csv(headers, rows, sep=sep)
+    QtGui.QGuiApplication.clipboard().setText(text)
+    return text
+
+
+def _selected_row_count(view):
+    if isinstance(view, (QtWidgets.QTreeWidget, QtWidgets.QListWidget)):
+        return len(view.selectedItems())
+    return len({ix.row() for ix in view.selectedIndexes()})
+
+
+def copy_table(view, *, selected_only=None, sep=","):
+    """Copy a whole table view to the clipboard as CSV, headers included.
+
+    ``selected_only=None`` (the default) reads the intent from the selection: two or more
+    selected rows copy just those rows, anything less copies the whole visible grid.
+    Clicking one row and pressing ⌘C is how you ask for *the table*, not for that one cell.
+
+    Returns ``(n_rows, n_columns)``, or None when there was nothing to copy."""
+    if selected_only is None:
+        selected_only = _selected_row_count(view) > 1
+    headers, rows = view_grid(view, selected_only=selected_only)
+    if not rows and selected_only:                # a selection that yielded nothing
+        headers, rows = view_grid(view, selected_only=False)
+    if not rows:
+        return None
+    copy_grid(headers, rows, sep=sep)
+    return len(rows), len(headers)
+
+
+def _status_window(widget):
+    """The nearest ancestor window that owns a status bar. Dialogs are parented to the main
+    window, so a copy or export launched from one still reports where the user is looking —
+    and the provenance header is found on the same object."""
+    w = widget
+    while w is not None:
+        if hasattr(w, "statusBar"):
+            return w
+        w = w.parent()
+    return None
+
+
+def _say(widget, message):
+    win = _status_window(widget)
+    if win is not None:
+        win.statusBar().showMessage(message)
+
+
+def copy_view(view, *, selected_only=None, sep=","):
+    """:func:`copy_table` plus a status-bar report of what landed on the clipboard."""
+    got = copy_table(view, selected_only=selected_only, sep=sep)
+    kind = "tab-separated" if sep == "\t" else "CSV"
+    _say(view, f"Copied {got[0]} rows × {got[1]} columns to the clipboard ({kind})."
+               if got else "Nothing to copy — the table is empty.")
+    return got
 
 
 def export_rows(parent, headers, rows, *, stem="table", title="Export table", empty_msg=None,
@@ -2656,9 +2846,9 @@ def export_rows(parent, headers, rows, *, stem="table", title="Export table", em
     analysis); pass ``header_lines`` to override, else it's pulled from the parent window's
     provenance. CSV/TSV get the comment block; XLSX gets a separate ``Provenance`` sheet."""
     from . import filedialogs
+    win = _status_window(parent)
     if not rows:
-        if parent is not None:
-            parent.statusBar().showMessage(empty_msg or "Nothing to export.")
+        _say(parent, empty_msg or "Nothing to export.")
         return None
     path, flt = filedialogs.get_save_file_name(
         parent, title, f"{stem}.csv",
@@ -2669,9 +2859,9 @@ def export_rows(parent, headers, rows, *, stem="table", title="Export table", em
     if not ext:                                       # no suffix typed → honour the chosen filter
         ext = ".tsv" if "tsv" in flt.lower() else ".xlsx" if "xlsx" in flt.lower() else ".csv"
         path += ext
-    if header_lines is None and parent is not None and hasattr(parent, "audit_csv_header"):
+    if header_lines is None and win is not None and hasattr(win, "audit_csv_header"):
         try:                                          # dataset + software + this analysis name
-            header_lines = parent.audit_csv_header(analysis=str(stem).replace("_", " "))
+            header_lines = win.audit_csv_header(analysis=str(stem).replace("_", " "))
         except Exception:  # noqa: BLE001 — a header is never worth failing an export over
             header_lines = None
     if ext == ".xlsx":
@@ -2688,8 +2878,7 @@ def export_rows(parent, headers, rows, *, stem="table", title="Export table", em
             w = csv.writer(f, delimiter=sep)
             w.writerow(headers)
             w.writerows(rows)
-    if parent is not None:
-        parent.statusBar().showMessage(f"Wrote {path} ({len(rows)} rows)")
+    _say(parent, f"Wrote {path} ({len(rows)} rows)")
     return path
 
 
@@ -2699,48 +2888,98 @@ def export_table(parent, table, *, stem="table", title="Export table", selected_
     The single primitive behind 'export everywhere': any table view offers an export with
     one call, in the same formats (and the same UTF-8-sig CSV, so Excel reads unicode lipid
     names) as the rest of the app — without each view re-implementing a DataFrame + dialog."""
-    headers, rows = table_grid(table, selected_only=selected_only)
+    headers, rows = view_grid(table, selected_only=selected_only)
     empty = "No rows selected." if selected_only else "Nothing to export — the table is empty."
     return export_rows(parent, headers, rows, stem=stem, title=title, empty_msg=empty)
 
 
-def copy_table(table):
-    """Copy the selected cells (or the whole visible table when nothing is selected) to the
-    clipboard as TSV — paste straight into Excel / Sheets."""
-    sel = table.selectedIndexes()
-    if sel:
-        rows = sorted({ix.row() for ix in sel})
-        cols = sorted({ix.column() for ix in sel})
-    else:
-        rows = [r for r in range(table.rowCount()) if not table.isRowHidden(r)]
-        cols = [c for c in range(table.columnCount()) if not table.isColumnHidden(c)]
-    lines = []
-    for r in rows:
-        lines.append("\t".join((table.item(r, c).text() if table.item(r, c) is not None else "")
-                               for c in cols))
-    QtGui.QGuiApplication.clipboard().setText("\n".join(lines))
+def add_copy_actions(menu, view):
+    """Add **Copy table (CSV)** / **Copy selected rows** to a menu a view already builds
+    itself. Views without their own menu take :func:`install_table_export` instead."""
+    menu.addAction("Copy table (CSV)", lambda: copy_view(view, selected_only=False))
+    act = menu.addAction("Copy selected rows", lambda: copy_view(view, selected_only=True))
+    act.setEnabled(_selected_row_count(view) > 0)
+    # Excel pastes comma-separated text into a single column; tabs land it in real cells.
+    menu.addAction("Copy for Excel (tab-separated)",
+                   lambda: copy_view(view, selected_only=False, sep="\t"))
+    return menu
 
 
-def install_table_export(table, parent, *, stem="table", title="Export table"):
-    """Give any QTableWidget a right-click **Copy / Export…** menu — the one call that puts an
-    export affordance on a table view. Use for tables that don't already have a custom context
-    menu (it sets one); tables with their own menu should add an item calling
-    :func:`export_table` instead."""
-    table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+def install_table_export(view, parent=None, *, stem="table", title="Export table"):
+    """Give any item view a right-click **Copy / Export…** menu — the one call that puts an
+    export affordance on a table view.
+
+    Idempotent, and it leaves a view that already has its own custom menu alone (those call
+    :func:`add_copy_actions` from their own handler). ``parent`` is the window an export
+    dialog and its status message belong to; omit it and the view's own window is used."""
+    if view.property("_smile_table_menu"):
+        return None
+    if view.contextMenuPolicy() == QtCore.Qt.CustomContextMenu:
+        return None
+    view.setProperty("_smile_table_menu", True)
+    view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
 
     def _menu(pos):
-        menu = QtWidgets.QMenu(table)
-        menu.addAction("Copy", lambda: copy_table(table))
+        menu = QtWidgets.QMenu(view)
+        add_copy_actions(menu, view)
         menu.addSeparator()
-        menu.addAction("Export table…", lambda: export_table(parent, table, stem=stem, title=title))
+        owner = parent if parent is not None else view.window()
+        menu.addAction("Export table…",
+                       lambda: export_table(owner, view, stem=stem, title=title))
         act = menu.addAction("Export selected rows…",
-                             lambda: export_table(parent, table, stem=stem, title=title,
+                             lambda: export_table(owner, view, stem=stem, title=title,
                                                   selected_only=True))
-        act.setEnabled(bool(table.selectedIndexes()))
-        menu.exec(table.viewport().mapToGlobal(pos))
+        act.setEnabled(bool(view.selectedIndexes()))
+        menu.exec(view.viewport().mapToGlobal(pos))
 
-    table.customContextMenuRequested.connect(_menu)
+    view.customContextMenuRequested.connect(_menu)
     return _menu
+
+
+class _CopyKeyFilter(QtCore.QObject):
+    """Application-wide ⌘C / Ctrl+C over any table, tree or list.
+
+    Qt gives item views no copy of their own, so ⌘C over a grid of results used to leave the
+    clipboard holding whatever was there before. This copies the whole visible table as CSV.
+    It filters the *application* rather than each window because the Cohort screen and every
+    dialog are separate top-level windows; text editors and cell editors keep their own copy."""
+
+    def eventFilter(self, obj, ev):               # noqa: N802 (Qt API)
+        if ev.type() != QtCore.QEvent.KeyPress:
+            return False
+        if not ev.matches(QtGui.QKeySequence.StandardKey.Copy):
+            return False
+        view = _view_for_copy(obj)
+        if view is None:
+            return False
+        copy_view(view)
+        return True                               # handled — don't let it bubble and copy twice
+
+
+def _view_for_copy(obj):
+    """The item view a key press belongs to, or None when something else should keep it."""
+    if not isinstance(obj, QtWidgets.QWidget):
+        return None
+    if isinstance(obj, (QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox,
+                        QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit)):
+        return None                               # incl. a cell editor open inside a table
+    w = obj
+    while w is not None:
+        if isinstance(w, QtWidgets.QAbstractItemView):
+            return w
+        w = w.parentWidget()
+    return None
+
+
+def install_copy_shortcut(app=None):
+    """Wire ⌘C / Ctrl+C to 'copy this table as CSV' for the whole application. Idempotent."""
+    app = app or QtWidgets.QApplication.instance()
+    if app is None or app.property("_smile_copy_filter"):
+        return None
+    filt = _CopyKeyFilter(app)                    # parented to the app → outlives this call
+    app.installEventFilter(filt)
+    app.setProperty("_smile_copy_filter", True)
+    return filt
 
 
 # --------------------------------------------------------------------------- #

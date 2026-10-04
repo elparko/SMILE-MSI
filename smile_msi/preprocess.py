@@ -175,6 +175,48 @@ def recalibrate(reference_mzs, tol_ppm: float = 200.0):
     return f
 
 
+def recalibrate_regions(specs, default_refs=None, default_tol_ppm: float = 200.0,
+                        n_pixels: int | None = None):
+    """Lock-mass recalibration with a **different reference set per region** — for a slide
+    carrying several samples in different embedding media, where each medium drifts by its
+    own constant ppm offset and one slide-wide lock mass splits the difference.
+
+    ``specs`` is ``[(mask, reference_mzs, tol_ppm), ...]`` with ``mask`` a boolean per-pixel
+    array. Pixels outside every mask fall back to ``default_refs`` (pass through unchanged
+    when that is empty). Earlier specs win where masks overlap.
+
+    The returned transform takes the pixel index as a third argument and carries
+    ``needs_index = True``; :meth:`MSIDataset._read` passes the index only to transforms that
+    ask for it, so every other transform keeps the two-argument form. Each region still gets
+    the axis-preserving correction of :func:`recalibrate`, so all pixels stay on one shared
+    m/z axis and remain directly comparable bin for bin.
+    """
+    fns, masks = [], []
+    for mask, refs, tol in specs:
+        m = np.asarray(mask, dtype=bool)
+        if refs is None or len(refs) == 0 or not m.any():
+            continue
+        fns.append(recalibrate(refs, float(tol)))
+        masks.append(m)
+    fallback = recalibrate(default_refs, float(default_tol_ppm)) if default_refs else None
+    if not fns:
+        return fallback if fallback is not None else (lambda mz, inten: (mz, inten))
+
+    n = int(n_pixels or max(m.size for m in masks))
+    assign = np.full(n, -1, dtype=np.int32)
+    for k in range(len(masks) - 1, -1, -1):       # reverse fill → the earlier spec wins
+        m = masks[k][:n]
+        assign[:m.size][m] = k
+
+    def f(mz, inten, i):
+        k = int(assign[i]) if 0 <= i < n else -1
+        if k < 0:
+            return fallback(mz, inten) if fallback is not None else (mz, inten)
+        return fns[k](mz, inten)
+    f.needs_index = True
+    return f
+
+
 def auto_recalibrate(ds, n_refs: int = 3, min_rel_intensity: float = 0.05,
                      tol_ppm: float = 100.0):
     """Lock-mass recalibration with **auto-selected internal references** — the
@@ -220,11 +262,17 @@ def normalize_reference(ref_mz: float, tol_ppm: float = 100.0):
 # --------------------------------------------------------------------------- #
 # Config -> pipeline (for CLI / GUI)
 # --------------------------------------------------------------------------- #
-def build_pipeline(config: dict):
+def build_pipeline(config: dict, masks: dict | None = None):
     """Map a config dict to a transform list. Recognized keys:
     ``baseline`` (int iters), ``smooth`` ({'savgol': window} or {'gaussian': sigma}),
     ``recalibrate`` ({'refs': [...], 'tol_ppm': ...}), ``normalize`` ('vector' or
-    {'reference': mz})."""
+    {'reference': mz}).
+
+    ``recalibrate`` may also carry ``regions``: ``[{'name', 'refs', 'tol_ppm'}, ...]`` for a
+    per-region lock mass (:func:`recalibrate_regions`). Region names are resolved against
+    ``masks`` (``{name: bool[n_pixels]}``) — a caller reopening a session should pass the
+    session's region masks (:func:`headless.build_preprocessing` does this), since a region
+    that does not resolve falls back to the slide-wide ``refs``."""
     steps = []
     bl = config.get("baseline")
     if isinstance(bl, dict):                  # Cardinal-style {'method': 'locmin'|'snip'|...}
@@ -240,8 +288,16 @@ def build_pipeline(config: dict):
             w = sm.get("savgol", 9) if isinstance(sm, dict) else int(sm)
             steps.append(smooth_savgol(int(w)))
     rc = config.get("recalibrate")
-    if rc and rc.get("refs"):                 # need reference masses; skip (don't crash) without them
-        steps.append(recalibrate(rc["refs"], rc.get("tol_ppm", 200.0)))
+    if rc:                                    # need reference masses; skip (don't crash) without them
+        tol = rc.get("tol_ppm", 200.0)
+        specs = [((masks or {}).get(r.get("name")), r.get("refs"), r.get("tol_ppm", tol))
+                 for r in (rc.get("regions") or [])]
+        specs = [s for s in specs if s[0] is not None and s[1]]
+        if specs:
+            steps.append(recalibrate_regions(specs, rc.get("refs"), tol,
+                                             n_pixels=rc.get("n_pixels")))
+        elif rc.get("refs"):
+            steps.append(recalibrate(rc["refs"], tol))
     nm = config.get("normalize")
     if nm == "vector":
         steps.append(normalize_vector())

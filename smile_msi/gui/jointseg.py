@@ -23,7 +23,8 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import spatial, session, profiles
-from .common import (PALETTE, MUTED_QSS, CheckList, ControlBar, dark_image_view, fill_table,
+from .common import (PALETTE, MUTED_QSS, CheckList, ControlBar, add_copy_actions,
+                     dark_image_view, fill_table,
                      icon, tab_page, tool_button, NoScrollComboBox, NoScrollDoubleSpinBox,
                      NoScrollSlider)
 
@@ -513,6 +514,8 @@ class CohortSegMixin:
             act.setToolTip("The active sample must be one of the jointly-segmented whole "
                            "slides with a matching pixel grid.")
         act.triggered.connect(lambda: self._jseg_cluster_to_region(cl))
+        menu.addSeparator()
+        add_copy_actions(menu, self.jseg_table)
         menu.exec(self.jseg_table.viewport().mapToGlobal(pos))
 
     def _jseg_active_alignable(self):

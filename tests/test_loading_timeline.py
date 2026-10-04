@@ -154,3 +154,18 @@ def test_timeline_dialog_renders_startup_and_operations(app):
 
 def test_timeline_dialog_empty_state_is_safe(app):
     TimelineDialog(None)                      # no clock, no ops → must not raise
+
+
+def test_parse_perf_log_pass_lines_become_rows():
+    text = ("[12:00:00] START  Loading x…\n"
+            "[12:00:09] PASS   m/z bounds · 142,796 spectra  (162.30s)\n"
+            "[12:03:00] PASS   ion image m/z 760.5850 (streamed, no cube) · 142,796 spectra  · GUI THREAD  (201.10s)\n"
+            "[12:06:00] DONE   Loading x…  (370.00s)\n")
+    events = parse_perf_log(text)
+    assert [e["kind"] for e in events] == ["START", "PASS", "PASS", "DONE"]
+    assert events[1]["seconds"] == 162.3 and events[1]["label"].startswith("m/z bounds")
+    ops = summarize_operations(events)
+    labels = [o["label"] for o in ops]
+    assert any("GUI THREAD" in lab for lab in labels)
+    assert ops[-1]["label"] == "Loading x…" and ops[-1]["status"] == "done"
+    assert all(o["status"] == "done" for o in ops)

@@ -248,6 +248,7 @@ def _run_find_spatial(ds, inp, p):
     return spatial.find_spatial_features(
         ds, snr=p["snr"], min_rel_intensity=p.get("min_rel_intensity", 0.0),
         min_frequency=p["min_frequency"], min_morans=p["min_morans"],
+        max_candidates=int(p.get("max_candidates", 2000)),
         tol_ppm=p["tol_ppm"], norm=p["norm"], mask=inp.get("mask"),
         progress=inp.get("progress"))
 
@@ -258,13 +259,14 @@ def _run_find_coherent(ds, inp, p):
         ds, snr=p["snr"], min_rel_intensity=p.get("min_rel_intensity", 0.0),
         min_frequency=p["min_frequency"], min_morans=p.get("min_morans", 0.0),
         min_quality=p["min_quality"], max_hotspot=p["max_hotspot"],
+        max_candidates=int(p.get("max_candidates", 2000)),
         tol_ppm=p["tol_ppm"], norm=p["norm"], mask=inp.get("mask"),
         progress=inp.get("progress"))
 
 
 def _run_find_peaks(ds, inp, p):
     return ds.pick_peaks(snr=p["snr"], min_rel_intensity=p.get("min_rel_intensity", 0.0),
-                         max_peaks=int(p.get("max_peaks", 500)),
+                         max_peaks=int(p.get("max_peaks", 0)),   # 0 = no cap
                          prominence=p.get("prominence", 1.0), mask=inp.get("mask"))
 
 
@@ -779,6 +781,7 @@ _register(StepDef(
             ParamSpec("min_rel_intensity", "Min rel. intensity", "float", 0.002, lo=0, hi=0.1, step=0.001),
             ParamSpec("min_frequency", "Min pixel frequency", "float", 0.01, lo=0, hi=1, step=0.01),
             ParamSpec("min_morans", "Min Moran's I", "float", 0.05, lo=0, hi=1, step=0.01),
+            ParamSpec("max_candidates", "Max candidates (0 = no limit)", "int", 2000, lo=0, hi=200000, step=500),
             _p_tol(10.0), _p_norm()],
     run=_run_find_spatial,
     peaks=lambda r: list(r.peaks),
@@ -786,7 +789,8 @@ _register(StepDef(
     to_table=lambda r: _df(r.peaks),
     rep_ions=lambda r, n, ds=None: [(float(p["mz"]), str(p.get("label", "")),
                                      float(p.get("morans_i", 0.0) or 0.0)) for p in r.peaks[:int(n)]],
-    summary=lambda r: f"{len(r.peaks)} spatial features (of {r.n_candidates} candidates)"))
+    summary=lambda r: (f"{len(r.peaks)} spatial features (of {r.n_candidates} candidates"
+                       + (f", capped from {r.n_detected} detected" if r.candidates_capped else "") + ")")))
 
 _register(StepDef(
     id="find_coherent_features", name="Coherent feature extraction", category="Peaks",
@@ -799,6 +803,7 @@ _register(StepDef(
             ParamSpec("min_morans", "Min Moran's I", "float", 0.0, lo=0, hi=1, step=0.01),
             ParamSpec("min_quality", "Min quality", "float", 0.15, lo=0, hi=1, step=0.01),
             ParamSpec("max_hotspot", "Max hotspot fraction", "float", 0.80, lo=0, hi=1, step=0.05),
+            ParamSpec("max_candidates", "Max candidates (0 = no limit)", "int", 2000, lo=0, hi=200000, step=500),
             _p_tol(10.0), _p_norm()],
     run=_run_find_coherent,
     peaks=lambda r: list(r.peaks),
@@ -806,7 +811,9 @@ _register(StepDef(
     to_table=lambda r: _df(r.peaks),
     rep_ions=lambda r, n, ds=None: [(float(p["mz"]), str(p.get("label", "")),
                                      float(p.get("quality", 0.0) or 0.0)) for p in r.peaks[:int(n)]],
-    summary=lambda r: f"{len(r.peaks)} coherent features (of {r.n_candidates} candidates; {r.n_after_spatial} spatial)"))
+    summary=lambda r: (f"{len(r.peaks)} coherent features (of {r.n_candidates} candidates"
+                       + (f", capped from {r.n_detected} detected" if r.candidates_capped else "")
+                       + f"; {r.n_after_spatial} spatial)")))
 
 _register(StepDef(
     id="find_peaks", name="Find peaks", category="Peaks",
@@ -816,14 +823,16 @@ _register(StepDef(
     params=[ParamSpec("snr", "Signal-to-noise", "float", 3.0, lo=0, hi=50, step=0.5),
             ParamSpec("min_rel_intensity", "Min rel. intensity", "float", 0.002, lo=0, hi=0.1, step=0.001),
             ParamSpec("prominence", "Prominence", "float", 1.0, lo=0, hi=10, step=0.5),
-            ParamSpec("max_peaks", "Max peaks", "int", 500, lo=10, hi=5000, step=10)],
+            ParamSpec("max_peaks", "Max peaks (0 = no limit)", "int", 0, lo=0, hi=200000, step=100)],
     run=_run_find_peaks,
     peaks=lambda r: list(r),
     produce=lambda r: {"peaks": _mz_list(r)},
     to_table=lambda r: _df(r),
     rep_ions=lambda r, n, ds=None: [(float(p["mz"]), "", float(p.get("intensity", 0.0) or 0.0))
                                     for p in sorted(r, key=lambda q: -(q.get("intensity", 0.0) or 0.0))[:int(n)]],
-    summary=lambda r: f"{len(r)} peaks"))
+    summary=lambda r: (f"{len(r)} peaks"
+                       + (f" (capped from {r.n_detected} detected)"
+                          if getattr(r, "n_detected", len(r)) > len(r) else ""))))
 
 _register(StepDef(
     id="auto_segment", name="Segmentation", category="Segmentation",

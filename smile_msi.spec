@@ -99,7 +99,11 @@ except Exception:  # noqa: BLE001 — [shap] extra not present in this build
     pass
 
 # Trim weight: never used, and each drags in large or platform-specific deps.
-excludes = ["PyQt5", "PyQt6", "PySide2", "tkinter", "IPython", "notebook",
+# "mcp" is the AI-assistant server (smile_msi/mcpserver.py, the [mcp] extra). The desktop app
+# never runs it, and the SDK drags in pydantic, starlette, uvicorn and a compiled cryptography
+# wheel — so it is excluded rather than bundled whenever a dev machine happens to have it
+# installed. mcpserver.py imports it inside build_server(), so nothing else in the app breaks.
+excludes = ["PyQt5", "PyQt6", "PySide2", "tkinter", "IPython", "notebook", "mcp",
             "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore"]
 
 ICON = None

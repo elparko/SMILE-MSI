@@ -559,6 +559,24 @@ def _index_imzml_by_basename(roots) -> dict:
     return index
 
 
+def find_moved_source(src: str, roots) -> str | None:
+    """This machine's copy of a missing imzML ``src``: the *unique* file with the same
+    basename under any of ``roots`` (searched recursively) that has its ``.ibd`` beside it.
+    ``None`` when nothing or more than one thing matches — guessing could open the wrong
+    slide. Used before asking the user to locate a file by hand."""
+    bn = _path_basename(src).lower()
+    if not bn:
+        return None
+    seen = []
+    for root in dict.fromkeys(r for r in roots if r):
+        if not os.path.isdir(root):
+            continue
+        for hit in _index_imzml_by_basename([root]).get(bn, []):
+            if os.path.exists(os.path.splitext(hit)[0] + ".ibd") and hit not in seen:
+                seen.append(hit)
+    return seen[0] if len(seen) == 1 else None
+
+
 def _rewrite_session_source(session_path: str, new_source: str) -> bool:
     """Point a managed session JSON's own ``source`` at ``new_source`` so reopening that
     sample on its own reloads from the right place too. Best-effort; never raises."""

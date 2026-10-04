@@ -81,7 +81,10 @@ ion's image.
 > Per-ion (DGMM)* under **Advanced**; *Montage*, *Feature lists* and *Quality (QC)* under **More**.
 
 - **Ion image** — the active m/z mapped across the tissue. Turn on **Draw ROI** and outline an area
-  (rectangle, circle, polygon, or freehand brush), then click **→ Feature list** right on the toolbar
+  (rectangle, circle, polygon, or freehand brush) — or start the mask from a **Threshold (signal)**
+  or an **Existing region** (see *Regions by construction* below) — refine it with the **Refine**
+  pill (inner rim / outer collar / band of N px, shown in µm too, or *Everything else*), then
+  **Save as region** or click **→ Feature list** right on the toolbar
   to turn that ROI into an annotated feature list in one step (it's saved as a region and its peaks are
   picked + identified; switch sets via *Features ▸ Feature set*). With the ROI tool off, click any
   pixel to overlay its spectrum; the ROI's mean spectrum overlays automatically. Manage which
@@ -116,8 +119,42 @@ ion's image.
 - **Co-localization** — rank all ions by spatial similarity to the active m/z, and **Detect modules**
   to cluster ions into co-localized groups (reordered correlation heatmap + module table).
 
+### Regions by construction (threshold → collar → everything else)
+
+Compartments that follow the tissue's own signal instead of a hand-drawn outline. On the
+Draw-ROI bar the shape picker doubles as a **Source** list:
+
+- **Threshold (signal)** — the mask is every pixel where a signal reaches a cut. Open
+  **Threshold ▾** to pick the signal (the active feature, a lipid class composite, or *Sum of
+  features…* such as the two sulfatide species) and the cut (a percentile of the signal pixels,
+  default 60; tick *absolute intensity* to cut on raw intensity). *Fill holes* makes a fascicle
+  interior solid; *drop islands* removes specks. The footprint paints live on the image with a
+  pixel count.
+- **Existing region** — the mask starts from a saved region, so a cluster-built or drawn
+  endoneurium can grow a collar.
+- **Refine** — *Filled* keeps the mask; *Inner rim* / *Outer collar* / *Band* keep a ring of N px
+  around its boundary (the µm readout uses the slide's pixel size); *Everything else* inverts it
+  to every other acquired pixel.
+- **Save as region** — names it from the build (*ST 42:2;O3 ≥ p60*, *endo · outer collar 6 px*,
+  *not endo*); a refined existing region nests under its source.
+- **Compartments…** — the whole nerve recipe in one dialog: signal + cut → **endoneurium**,
+  collar width → **perineurium**, everything else → **epineurium**, previewed as one overlay.
+  *Create regions* adds the three (names editable) tagged as their own groups, so Multi-group
+  features, Discriminating features and Region comparison list them straight away.
+
+The same operations sit on the Regions panel: right-click a region ▸ **Derive** ▸ *Inner rim… /
+Outer collar… / Band… / Everything else / Fill holes*. Every step is undoable (⌘Z) and recorded
+in the provenance as a `region_derive` step. From a script (section 11) the same masks come from
+`threshold_mask`, `ring`, `invert` and `composite`, and `add_region` pushes them back into the app.
+
 ## 6. Export & reproducibility
 
+- **Copy a table (⌘C / Ctrl+C)** — click any table, tree or list in the app and press ⌘C: the
+  **whole visible grid** lands on the clipboard as CSV, header row included, in the order and with
+  the sort and filters you are looking at. Select two or more rows first and only those rows are
+  copied. Right-click any table for the same **Copy table (CSV)** and **Copy selected rows**,
+  plus **Copy for Excel (tab-separated)** — Excel pastes comma-separated text into a single
+  column, tabs land it in real cells — and **Export table…** for a file.
 - **File → Export… (⌘E)** — the **Export hub**: one dialog for every artifact, with format and
   design optionality.
   - *What to export:* the active **ion image**, a **colour overlay**, an **ion-image gallery**
@@ -268,9 +305,12 @@ run it on the loaded slide, then save it as a reusable workflow preset.
   output with `log(...)`, `table(df, "title")`, `image(mz, "title")` and `record(name, value)`.
 - **Run it** — ⌘/Ctrl+Return (or the **▶ Run** button). Tables and ion images appear as tabs; the
   **Log** tab shows prints, recorded values and any error (with your line numbers).
-- **Apply to app** — push the script's features or segmentation back into the app's views.
+- **Apply to app** — push the script's features or segmentation back into the app's views, or
+  add the regions it staged with `add_region(name, mask)` to the slide (masks built with
+  `threshold_mask(composite([...]), 60)`, `ring(mask, width_px=6, mode="outer")`, `invert(mask)`
+  — see the *Compartments by construction* example).
 - **AI guide** — the **AI guide** button shows (and copies) a self-describing reference of every
-  function plus this slide's context. Hand it to an AI assistant and ask it to write
+  function plus this slide's context. Hand it to an AI assistant (e.g. a chat assistant) and ask it to write
   a workflow for you; paste the result back in. The same text lives in
   [`SCRIPTING.md`](SCRIPTING.md).
 - **Save as workflow** — store a script under `~/.smile-msi/workflows/` (*Workflows → Save as…*) and

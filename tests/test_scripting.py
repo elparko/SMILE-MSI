@@ -286,3 +286,62 @@ def test_run_analysis_single_piece_falls_back_to_pixel():
     api.set_features(feats)
     df = api.run_analysis("roi_comparison", method="mwu", tol_ppm=10.0, norm="tic", mask=one)
     assert df.attrs["unit"] == "pixel"
+
+
+# --------------------------------------------------------------------------- #
+# regions by construction (plan 25)
+# --------------------------------------------------------------------------- #
+def test_composite_is_the_sum_of_ion_vectors(api):
+    mzs = [888.6236, 885.5499]
+    expect = api.ion_vector(mzs[0]) + api.ion_vector(mzs[1])
+    assert np.allclose(api.composite(mzs), expect)
+    with pytest.raises(scripting.ScriptError):
+        api.composite([])
+
+
+def test_threshold_ring_invert_partition_the_slide(api):
+    ds = api.ds
+    endo = api.threshold_mask(api.composite([888.6236]), 60)
+    assert endo.dtype == bool and endo.shape == (ds.n_pixels,) and endo.any()
+    peri = api.ring(endo, width_px=2, mode="outer")
+    assert peri.any() and not (peri & endo).any()
+    epi = api.invert(endo | peri)
+    assert int(endo.sum() + peri.sum() + epi.sum()) == ds.n_pixels
+    assert np.array_equal(api.threshold_mask(888.6236, 60), endo)      # an m/z is accepted too
+    with pytest.raises(scripting.ScriptError):
+        api.ring(endo)                                                  # no width at all
+    with pytest.raises(scripting.ScriptError):
+        api.ring(endo, width_um=30)                                     # synthetic: no pixel size
+    ds.pixel_size_um = 5.0
+    try:
+        assert np.array_equal(api.ring(endo, width_um=10), api.ring(endo, width_px=2))
+    finally:
+        ds.pixel_size_um = None
+
+
+def test_add_region_stages_and_is_usable_by_name(api):
+    api.find_peaks(snr=5)
+    endo = api.threshold_mask(888.6236, 60)
+    peri = api.ring(endo, width_px=2, mode="outer")
+    epi = api.invert(endo | peri)
+    api.add_region("endo", endo)
+    api.add_region("peri", peri, color="#ff8800")
+    api.add_region("epi", epi)
+    assert [r["name"] for r in api.new_regions] == ["endo", "peri", "epi"]
+    assert api.new_regions[1]["color"] == "#ff8800"
+    assert "endo" in api.region_names()
+    df = api.multigroup(groups=["endo", "peri", "epi"])                 # by name
+    assert len(df) == len(api.features)
+    api.add_region("endo", peri)                                        # re-staging replaces
+    assert [r["name"] for r in api.new_regions] == ["peri", "epi", "endo"]
+    with pytest.raises(scripting.ScriptError):
+        api.add_region("empty", np.zeros(api.ds.n_pixels, bool))
+
+
+def test_run_script_returns_staged_regions(api):
+    r = scripting.run_script(
+        "m = threshold_mask(888.6236, 60)\nadd_region('core', m)\n", api)
+    assert r.ok, r.error
+    assert [rg["name"] for rg in r.regions] == ["core"]
+    assert "1 region(s)" in r.summary()
+    assert any("add_region" in line for line in r.logs)

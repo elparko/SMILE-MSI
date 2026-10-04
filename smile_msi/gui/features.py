@@ -11,7 +11,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from .. import (spatial, imaging, isotopes, session, msms, library, studio)
 from ..msi import _mad
-from .common import (colormap, confirm, copy_table, fill_table, set_header_tooltips)
+from .common import (add_copy_actions, colormap, confirm, fill_table, set_header_tooltips)
 from . import filedialogs
 
 
@@ -37,7 +37,7 @@ class FeaturesTabMixin:
         menu.addAction("Clear all features", self._clear_features)
         menu.addAction("Import targets…", self._import_targets)
         menu.addSeparator()
-        menu.addAction("Copy", lambda: copy_table(self.feat_table))
+        add_copy_actions(menu, self.feat_table)
         menu.addAction("Export feature list (CSV, with analyses)…", self.export_features)
         menu.addAction("Export…  (images · spectra · book)", lambda: self.open_export_hub("features"))
         menu.exec(self.feat_table.viewport().mapToGlobal(pos))
@@ -265,12 +265,16 @@ class FeaturesTabMixin:
         df = self.feat_df
         # the confidence column shows the 0–100 score as a sortable "%"; the folded
         # label + the reasons ride along as a tooltip + cell colour (_decorate_confidence)
-        cols = ["mz", "lipid", "class", "adduct", "ppm", "confidence_score", "msi_level",
+        # S/N sits next to m/z: it is a property of the detected peak, not of the annotation,
+        # so the lipid/class/adduct/ppm/confidence block stays contiguous.
+        cols = ["mz", "snr", "lipid", "class", "adduct", "ppm", "confidence_score", "msi_level",
                 "isotopologue", "spatial_morans_i", "isotope_ok", "isotope_spectral",
                 "isotope_spatial", "n_adducts", "alternatives"]
-        heads = ["m/z", "lipid", "class", "adduct", "ppm", "confidence", "MSI", "isotopologue?",
-                 "spatial (Moran I)", "isotope?", "iso fit", "iso co-loc",
+        heads = ["m/z", "S/N", "lipid", "class", "adduct", "ppm", "confidence", "MSI",
+                 "isotopologue?", "spatial (Moran I)", "isotope?", "iso fit", "iso co-loc",
                  "#adducts", "alternatives"]
+        if "snr" not in df.columns:                       # lists saved before S/N was shown
+            heads.pop(cols.index("snr")); cols.remove("snr")
         # only show the new isotope-evidence columns when present (older lists may lack them)
         if "isotope_spectral" not in df.columns:
             for c in ("isotope_spectral", "isotope_spatial"):
@@ -285,11 +289,14 @@ class FeaturesTabMixin:
             at = cols.index("confidence_score") + 1
             cols.insert(at, "fdr_q")
             heads.insert(at, "FDR q")
+        # MS/MS is identification evidence, so it sits just before the confidence it feeds.
+        # Anchored by name: a fixed index moved whenever an optional column above it appeared.
         if "msms" in df.columns:
-            cols.insert(6, "msms")
-            heads.insert(6, "MS/MS")
+            at = cols.index("confidence_score")
+            cols.insert(at, "msms")
+            heads.insert(at, "MS/MS")
         if "msms_lib" in df.columns:                      # spectral-library match (plan 04)
-            at = (cols.index("msms") + 1) if "msms" in cols else 6
+            at = (cols.index("msms") + 1) if "msms" in cols else cols.index("confidence_score")
             cols.insert(at, "msms_lib")
             heads.insert(at, "MS/MS (library)")
         # region-scoped lists carry a confinement score: how much higher each ion is

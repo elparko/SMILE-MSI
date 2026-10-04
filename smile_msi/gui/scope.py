@@ -237,6 +237,8 @@ class ScopeBar(QtWidgets.QFrame):
             self.combo_b.setMinimumWidth(150)
             self.combo_b.setToolTip("Region B")
             row.addWidget(self.combo_b)
+            for c in (self.combo_a, self.combo_b):
+                c.currentIndexChanged.connect(lambda *_: self.changed.emit())
             row.addStretch(1)
             outer.addLayout(row)
 
@@ -466,6 +468,8 @@ class ScopeBar(QtWidgets.QFrame):
         if self.feat_combo is not None:
             self._rebuild_feat_combo()
             self._update_feature_readout()
+        if self.combo_a is not None:
+            self._rebuild_ab_combos()
         if self.region_readout is not None:
             self.region_readout.setText(self._region_text())
         if self.group_readout is not None:
@@ -487,6 +491,35 @@ class ScopeBar(QtWidgets.QFrame):
         n = len(self.feature_mzs())
         label = f"★ {name}" if kind == "list" else name
         return f"{n} features · {label}"
+
+    # ----- A vs B ---------------------------------------------------------- #
+    _AB_DEFAULT = "Setup groups (first two)"
+
+    def _rebuild_ab_combos(self):
+        """Fill the A/B pickers with every region that has pixels, keeping the current
+        choice by name. The first entry defers to the Setup group tags (the historical
+        default), so an untouched bar behaves exactly as before."""
+        win = self.win
+        names = [rg["name"] for rg in (win.regions or [])
+                 if win._region_pixel_mask(rg) is not None]
+        for combo in (self.combo_a, self.combo_b):
+            cur = combo.currentData() if combo.count() else None
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(self._AB_DEFAULT, None)
+            for n in names:
+                combo.addItem(n, n)
+            idx = combo.findData(cur) if cur else 0
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+
+    def ab_regions(self):
+        """``(a_name, b_name)`` chosen in the A/B pickers, ``(None, None)`` when either is
+        left on the Setup default (or the bar has no A/B row)."""
+        if self.combo_a is None or self.combo_b is None:
+            return None, None
+        a, b = self.combo_a.currentData(), self.combo_b.currentData()
+        return (a, b) if (a and b) else (None, None)
 
     def _group_text(self):
         win = self.win

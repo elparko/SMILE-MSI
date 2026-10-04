@@ -692,6 +692,26 @@ def test_render_ion_panel_crop_and_outline(ion, tmp_path):
         assert _nonempty(out)
 
 
+def test_render_ion_panel_outline_can_be_hidden(ion):
+    img, _axis, _spec = ion
+    mask = np.zeros(img.shape, bool)
+    mask[8:30, 14:46] = True
+
+    def pixels(**kw):
+        fig = export.render_ion_panel(img, mz=700.0, crop=(5, 33, 11, 49), outline_mask=mask,
+                                      outline_color="#ff00ff", dpi=60, overlay=False, **kw)
+        fig.canvas.draw()
+        return np.asarray(fig.canvas.buffer_rgba())
+
+    def magenta(a):
+        return int(((a[..., 0] > 200) & (a[..., 1] < 60) & (a[..., 2] > 200)).sum())
+
+    assert magenta(pixels()) > 0
+    hidden = pixels(show_outline=False, dim_outside=True)
+    assert magenta(hidden) == 0
+    assert not np.array_equal(hidden, pixels(show_outline=False))   # the fade still applies
+
+
 def test_crop_bounds_clamp_and_reject():
     assert export._crop_bounds((5, 30, 10, 40), 50, 60) == (5, 30, 10, 40)
     assert export._crop_bounds((-5, 999, -2, 999), 40, 56) == (0, 40, 0, 56)   # clamped

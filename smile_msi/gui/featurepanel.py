@@ -34,6 +34,17 @@ from .common import (PALETTE, MUTED_FG, MUTED_QSS, ControlBar, FlowLayout, Range
                      eye_icon, set_header_tooltips, icon)
 
 
+class FeatureTable(QtWidgets.QTableWidget):
+    """Clicking a row must not scroll sideways. Qt scrolls to the clicked cell, so a click
+    on the stretched lipid column, wider than the panel, jumped the view right."""
+
+    def scrollTo(self, index, hint=QtWidgets.QAbstractItemView.EnsureVisible):
+        bar = self.horizontalScrollBar()
+        x = bar.value()
+        super().scrollTo(index, hint)
+        bar.setValue(x)
+
+
 class RegionList(QtWidgets.QListWidget):
     """Region list whose left-most eye glyph toggles visibility on click.
 
@@ -357,8 +368,26 @@ class RightPanelMixin:
             nl = self._NORM_LABEL.get(report.normalization, "")
             if nl:
                 bits.append(nl)
+        cal = getattr(self, "_calibration", None)
+        # a per-region calibration rolls up to its WORST region: saying "calibrated" off the
+        # best one would hide the region the mislabels are still coming from
+        where = f" per region ({len(cal.get('regions') or [])})" if (cal or {}).get("per_region") else ""
+        gone = self._calibration_unresolved_regions()
+        if gone:
+            cal_html = (f"<span style='color:{common.PALETTE[3]}'>calibration incomplete — "
+                        f"{len(gone)} region(s) missing</span>")
+        elif cal and cal.get("verified"):
+            cal_html = (f"<span style='color:{common.PALETTE[2]}'><b>✓ calibrated{where}</b></span> "
+                        f"(lock-mass, residual {cal.get('median_after', 0.0):+.2f} ppm)")
+        elif cal and cal.get("median_after") is not None:
+            cal_html = (f"<span style='color:{common.PALETTE[3]}'>lock-mass applied{where}, "
+                        f"residual {cal['median_after']:+.2f} ppm</span>")
+        elif cal:
+            cal_html = "lock-mass recalibration applied (not verified)"
+        else:
+            cal_html = "<span style='color:#888'>not calibrated</span>"
         return (f"<b>{ds.n_pixels:,}</b> pixels · {ds.width}×{ds.height}<br>"
-                f"m/z {mzlo:.1f}–{mzhi:.1f}<br>{' · '.join(bits)}<br>"
+                f"m/z {mzlo:.1f}–{mzhi:.1f}<br>{' · '.join(bits)}<br>{cal_html}<br>"
                 f"<i>{os.path.basename(ds.source)}</i>")
 
     def _show_intake_suggestion(self, report):
@@ -473,7 +502,7 @@ class RightPanelMixin:
     # ----- Features section (leads with the data) -------------------------- #
     def _populate_features_section(self, v):
         # --- the feature table is the star: build + place it first ----------
-        self.feat_table = QtWidgets.QTableWidget()
+        self.feat_table = FeatureTable()
         self.feat_table.setObjectName("featTable")
         self.feat_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.feat_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
@@ -740,6 +769,8 @@ class RightPanelMixin:
         menu.addAction("Set current list as default", self._set_default_feature_set).setIcon(icon("save"))
         menu.addAction("Manage feature lists…", self._open_feature_lists_manager).setIcon(icon("open"))
         menu.addSeparator()
+        menu.addAction("New lipid list from identified features…",
+                       self._new_lipid_list_from_features).setIcon(icon("add"))
         menu.addAction("Lipid lists…  (◆ class overlays)", self._manage_lipid_lists).setIcon(icon("settings"))
         menu.addSeparator()
         menu.addAction("Confirm with MS/MS…", self.do_msms_confirm).setIcon(icon("run"))

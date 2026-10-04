@@ -191,3 +191,26 @@ def test_zero_output_workflow_status(win):
     con._run()
     assert con._last_result.ok
     assert "no output" in con._status.text().lower()
+
+
+def test_apply_regions_adds_named_regions_and_undoes(win):
+    con = _console(win)
+    con.editor.setPlainText(
+        "endo = threshold_mask(888.6236, 60)\n"
+        "peri = ring(endo, width_px=2, mode='outer')\n"
+        "add_region('endo', endo); add_region('peri', peri, color='#ff8800')\n"
+        "add_region('epi', invert(endo | peri))\n"
+    )
+    con._run()
+    assert con._last_result.ok and con._apply_btn.isEnabled()
+    before = [rg["name"] for rg in win.regions]
+    con._apply_regions()
+    names = [rg["name"] for rg in win.regions]
+    assert names == before + ["endo", "peri", "epi"]
+    by = {rg["name"]: rg for rg in win.regions}
+    assert by["peri"]["color"] == "#ff8800"
+    assert int(by["endo"]["mask"].sum()) + int(by["peri"]["mask"].sum()) \
+        + int(by["epi"]["mask"].sum()) == win.ds.n_pixels
+    assert "regions: L, R, endo, peri, epi" in con._ctx_note.text()
+    win._undo()
+    assert [rg["name"] for rg in win.regions] == before

@@ -22,7 +22,8 @@ from PySide6 import QtCore, QtWidgets
 from .. import export, studio, imaging, palettes, stylelib
 from .. import annotations as annot
 from .common import (note, section_title, MUTED_QSS, RangeSliderField, icon, button,
-                     check_tree_bar, NoScrollComboBox, NoScrollDoubleSpinBox, NoScrollSpinBox)
+                     check_tree_bar, coalesce, NoScrollComboBox, NoScrollDoubleSpinBox,
+                     NoScrollSpinBox)
 from . import filedialogs
 
 # the same label-content choices the Export hub offers (shared, single source)
@@ -51,6 +52,9 @@ class StudioDialog(QtWidgets.QDialog):
     def __init__(self, win):
         super().__init__(win)
         self.win = win
+        # Ticking a feature list cascades itemChanged over every ion in it; recount once at
+        # the end of the cascade, not once per ion (O(N) instead of O(N²)).
+        self._recount = coalesce(self, self._update_count)
         self.setWindowTitle("Export Studio")
         self.setMinimumSize(1000, 520)
         root = QtWidgets.QVBoxLayout(self)
@@ -109,7 +113,7 @@ class StudioDialog(QtWidgets.QDialog):
         hdr.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         hdr.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         self.sec_tree.setMinimumWidth(230)   # keep room for the name column beside the crop button
-        self.sec_tree.itemChanged.connect(lambda *_: self._update_count())
+        self.sec_tree.itemChanged.connect(self._recount)
         self._sec_bar = check_tree_bar(self.sec_tree, "section", on_change=self._update_count)
         v.addWidget(self._sec_bar)
         v.addWidget(self.sec_tree, 1)
@@ -505,7 +509,7 @@ class StudioDialog(QtWidgets.QDialog):
 
     # --------------------------------------------------------------- handlers
     def _tree_item_changed(self, *_):
-        self._update_count()
+        self._recount()
 
     def _update_count(self):
         if not hasattr(self, "count_lbl"):

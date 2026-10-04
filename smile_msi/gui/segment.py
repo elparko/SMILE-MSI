@@ -6,8 +6,9 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .. import prefs, spatial, profiles
+from .. import prefs, regioninbox, spatial, profiles
 from .common import (PALETTE, REGION_PALETTE, HILITE, MUTED_QSS, GUIDE_LINE, ControlBar,
+                     add_copy_actions,
                      _SortItem, dark_image_view, eye_icon, tab_page, confirm, glossary_button,
                      set_header_tooltips, icon, button, primary_button, check_table_bar,
                      NoScrollComboBox, NoScrollSlider, NoScrollSpinBox)
@@ -36,6 +37,11 @@ SEGMENT_DETAIL_HARD_MAX = 200      # the tree itself supports up to ~n_micro; sp
 # ≈ 4) after merging, high enough to separate a whole complex section (brain ≈ 10).
 DEFAULT_SEGMENT_COUNT = 8
 SEGMENT_COUNT_KEY = "segment_default_count"
+
+# Regions panel ▸ Derive: (menu label, op). Ring ops take a width and nest under the source.
+DERIVE_OPS = (("Inner rim…", "inner"), ("Outer collar…", "outer"), ("Band…", "band"),
+              ("Everything else", "invert"), ("Fill holes", "fill"))
+DERIVE_OPS_BY_OP = tuple((op, label.rstrip("…")) for label, op in DERIVE_OPS)
 
 
 def segment_detail_max() -> int:
@@ -1045,6 +1051,8 @@ class SegmentTabMixin:
                     lambda _=False, segs=list(segs): self._hide_segments(segs, False))
         else:
             menu.addAction("Tick or select segment(s) first").setEnabled(False)
+        menu.addSeparator()
+        add_copy_actions(menu, self.seg_table)
         menu.exec(self.seg_table.viewport().mapToGlobal(pos))
 
     def _regions_from_all_segments(self):
@@ -1963,6 +1971,20 @@ class SegmentTabMixin:
             return mask
         return None
 
+    def region_masks_by_name(self) -> dict:
+        """``{region name: bool[n_pixels]}`` for every region that resolves to pixels **on
+        the active slide**. Filtered by :meth:`_region_on_active_slide`, not the panel's
+        display scope: a mask is an index into this dataset's pixels, so a region belonging
+        to another slide must never reach a per-region calibration or extraction."""
+        out = {}
+        for rg in (getattr(self, "regions", None) or []):
+            if not self._region_on_active_slide(rg):
+                continue
+            m = self._region_pixel_mask(rg)
+            if m is not None and m.any():
+                out[str(rg.get("name"))] = m
+        return out
+
     def _aggregate_child_mask(self, rg, _seen=None):
         """Union of the pixel masks of every region nested directly under ``rg`` (recursing
         into nested parents). ``None`` when it has no children that resolve to pixels. The
@@ -2090,6 +2112,35 @@ class SegmentTabMixin:
         if select_name is not None:
             self._select_region_by_name(select_name)
         self.regionsChanged.emit()
+
+    def _take_inbox_regions(self):
+        """Add regions another program (the MCP server) queued for this slide — see
+        :mod:`smile_msi.regioninbox`. Polled; one undo step per delivery."""
+        if self.ds is None or getattr(self, "_restoring", False) or not self._session_path:
+            return
+        if not regioninbox.pending(self._session_path):
+            return
+        regions, problems = regioninbox.take_regions(self._session_path, self.ds.n_pixels)
+        if problems:
+            self.statusBar().showMessage("Could not add sent regions — " + "; ".join(problems))
+        if not regions:
+            return
+        self.record_undo("regions from assistant", domains=("regions",))
+        names = []
+        for rg in regions:
+            existing = {r["name"] for r in self.regions}
+            parent = rg.get("parent") if rg.get("parent") in existing else None
+            i = self._new_region(rg["name"], color=rg.get("color"), mask=rg["mask"],
+                                 parent=parent, refresh=False)
+            self.regions[i]["group"] = rg.get("group", "")
+            names.append(self.regions[i]["name"])
+        self._refresh_regions_all(names[-1])
+        if self.prov is not None:
+            self.prov.step("region_derive", source="mcp", op="send_regions", names=list(names))
+        self._mark_dirty()
+        self.statusBar().showMessage(
+            f"Added {len(names)} region{'s' if len(names) != 1 else ''} sent by the assistant: "
+            f"{', '.join(names)}.")
 
     @staticmethod
     def _effective_parent(rg, by_name):
@@ -2318,6 +2369,63 @@ class SegmentTabMixin:
         self.reveal_view("Ion image")          # grouped-tab safe (raw index is brittle post-IA)
         if getattr(self, "roi_chk", None) is not None and not self.roi_chk.isChecked():
             self.roi_chk.setChecked(True)
+
+    # ----- regions by construction (Derive ▸) ------------------------------- #
+    def _derive_region_prompt(self, ri, op):
+        """Ask for the width (rings only; px, with the µm equivalent in the prompt) and derive."""
+        if not (0 <= ri < len(self.regions)):
+            return -1
+        width = None
+        if op in ("inner", "outer", "band"):
+            px = getattr(self.ds, "pixel_size_um", None) if self.ds is not None else None
+            unit = f"  (1 px = {float(px):g} µm)" if px else ""
+            width, ok = QtWidgets.QInputDialog.getInt(
+                self, dict(DERIVE_OPS_BY_OP)[op], f"Width in pixels{unit}:", 6, 1, 500)
+            if not ok:
+                return -1
+        return self._derive_region(ri, op, width)
+
+    def _derive_region(self, ri, op, width_px=None):
+        """Derive a new region from region ``ri``: an inner rim / outer collar / band of
+        ``width_px`` (nested under the source), everything else (its complement, top level),
+        or the source with its holes filled (nested). Returns the new index, or -1."""
+        if self.ds is None or not (0 <= ri < len(self.regions)):
+            return -1
+        rg = self.regions[ri]
+        src = self._region_pixel_mask(rg)
+        if src is None or not src.any():
+            self.statusBar().showMessage(f"Region '{rg['name']}' has no pixels to derive from.")
+            return -1
+        if op in ("inner", "outer", "band"):
+            w = float(width_px or 0)
+            if w <= 0:
+                return -1
+            out = spatial.ring_mask(self.ds, src, w, mode=op)
+            name = f"{rg['name']} · {dict(DERIVE_OPS_BY_OP)[op].lower()} {w:g} px"
+            parent = rg["name"]
+        elif op == "invert":
+            out = spatial.invert_mask(self.ds, src)
+            name, parent = f"not {rg['name']}", None
+        elif op == "fill":
+            out = spatial.fill_holes(self.ds, src)
+            name, parent = f"{rg['name']} · filled", rg["name"]
+        else:
+            return -1
+        if not out.any():
+            self.statusBar().showMessage(f"'{name}' would be empty — nothing derived.")
+            return -1
+        if op == "fill" and np.array_equal(out, src):
+            self.statusBar().showMessage(f"Region '{rg['name']}' has no holes to fill.")
+            return -1
+        self.record_undo("derive region", domains=("regions",))
+        i = self._new_region(name, mask=out, parent=parent)
+        if self.prov is not None:
+            self.prov.step("region_derive", source=rg["name"], op=op, width_px=width_px,
+                           region=self.regions[i]["name"])
+        self._mark_dirty()
+        self.statusBar().showMessage(
+            f"Derived '{self.regions[i]['name']}' from '{rg['name']}': {int(out.sum()):,} px.")
+        return i
 
     def _region_from_roi(self):
         """Save the drawn ROI (rectangle or polygon) as a named region. The active feature
@@ -2577,10 +2685,18 @@ class SegmentTabMixin:
                 icon("add"),
                 "Group into parent region…" if len(ris) > 1 else "Wrap in parent region…",
                 lambda r=list(ris): self._region_group_into_parent(r))
+            # Derive ▸ — a new region built from this one by construction (distance-transform
+            # rims / collars / bands, the complement, hole filling); rings nest under it.
+            der = menu.addMenu("Derive")
+            for label, op in DERIVE_OPS:
+                der.addAction(icon("add"), label,
+                              lambda _=False, o=op: self._derive_region_prompt(ri, o))
             menu.addSeparator()
             menu.addAction(icon("delete"), "Delete" if len(ris) <= 1 else f"Delete {len(ris)} regions",
                            self._region_delete)
         else:
             menu.addAction("Select a region first").setEnabled(False)
+        menu.addSeparator()
+        add_copy_actions(menu, self.region_list)
         menu.exec(self.region_list.viewport().mapToGlobal(pos))
 

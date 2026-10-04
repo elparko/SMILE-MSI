@@ -694,6 +694,75 @@ def ring_mask(ds, mask, width_px: float, mode: str = "inner"):
     return out
 
 
+def _grid_of(ds, mask):
+    """Scatter a per-pixel bool mask onto the (height, width) tissue grid; returns the grid
+    plus the (rows, cols) placement so callers can gather the result back per pixel."""
+    rows, cols = ds._pixel_rows_cols()
+    grid = np.zeros((ds.height, ds.width), dtype=bool)
+    grid[rows, cols] = mask
+    return grid, rows, cols
+
+
+def fill_holes(ds, mask):
+    """Fill enclosed holes in a per-pixel mask on the tissue grid (a fascicle interior
+    whose core fell under the threshold becomes solid)."""
+    from scipy import ndimage
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return mask
+    grid, rows, cols = _grid_of(ds, mask)
+    return ndimage.binary_fill_holes(grid)[rows, cols]
+
+
+def drop_small(ds, mask, min_pixels: int):
+    """Drop 4-connected islands of fewer than ``min_pixels`` pixels from a mask."""
+    from scipy import ndimage
+    mask = np.asarray(mask, dtype=bool)
+    if int(min_pixels) <= 1 or not mask.any():
+        return mask
+    grid, rows, cols = _grid_of(ds, mask)
+    labeled, n = ndimage.label(grid)
+    if n == 0:
+        return mask
+    keep = np.bincount(labeled.ravel()) >= int(min_pixels)
+    keep[0] = False
+    return keep[labeled][rows, cols]
+
+
+def invert_mask(ds, mask):
+    """Every acquired pixel that is NOT in ``mask`` (the 'everything else' region)."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape[0] != ds.n_pixels:
+        raise ValueError(f"mask has {mask.shape[0]} entries; the slide has {ds.n_pixels} pixels")
+    return ~mask
+
+
+def threshold_mask(ds, values, cut, *, percentile: bool = True, fill_holes: bool = True,
+                   min_pixels: int = 0):
+    """Pixels whose ``values`` (a per-pixel signal: one ion, a class composite, a sum of
+    features) exceed ``cut``. With ``percentile=True`` the cut is a percentile of the
+    *signal* pixels (values > 0) and the mask keeps signal pixels at or above it, so
+    off-tissue zeros never drag it down; otherwise it is an absolute intensity and the mask
+    keeps pixels strictly above it. Holes are filled and islands under ``min_pixels`` dropped, so the
+    result is a solid region rather than a speckle map."""
+    v = np.asarray(values, dtype=float).ravel()
+    v = np.where(np.isfinite(v), v, 0.0)
+    if percentile:
+        pos = v[v > 0]
+        thr = float(np.percentile(pos, float(cut))) if pos.size else np.inf
+        mask = (v >= thr) & (v > 0)          # at-or-above the cut, signal pixels only
+    else:
+        mask = v > float(cut)
+    if fill_holes:
+        mask = _fill_holes(ds, mask)
+    if min_pixels:
+        mask = drop_small(ds, mask, min_pixels)
+    return mask
+
+
+_fill_holes = fill_holes        # the keyword on threshold_mask shadows the function name
+
+
 _MORANS_CHUNK_BYTES = 64 << 20     # transient budget per Moran's chunk (~64 MB)
 
 
@@ -933,6 +1002,14 @@ class SpatialFeatures:
     suggested_ppm: float         # median auto-width of the survivors (NaN if none)
     params: dict
     n_after_collapse: int = -1   # survived isotope collapse (== len(peaks)); -1 if collapse off
+    n_detected: int = -1         # peaks detected before the max_candidates cap; -1 if unknown
+
+    @property
+    def candidates_capped(self) -> bool:
+        """True when ``max_candidates`` truncated the pool, so ``n_candidates`` is the cap
+        rather than a measurement — two runs that both report the cap have not been shown
+        to detect the same number of ions."""
+        return self.n_detected > self.n_candidates
 
 
 def _merge_candidates(primary, extra, tol_ppm: float, max_candidates: int):
@@ -949,7 +1026,11 @@ def _merge_candidates(primary, extra, tol_ppm: float, max_candidates: int):
         out.append(p)
         arr = np.append(arr, mz)
     out.sort(key=lambda d: d["intensity"], reverse=True)
-    return out[:max_candidates]
+    from .msi import PeakList
+    # both inputs arrive uncapped (see _pick_candidates), so this is the true union count
+    n_det = max(len(out), getattr(primary, "n_detected", 0), getattr(extra, "n_detected", 0))
+    return PeakList(out[:max_candidates] if max_candidates and max_candidates > 0 else out,
+                    n_det)
 
 
 def _pick_candidates(ds, projection, snr, min_rel_intensity, max_candidates, mask,
@@ -974,11 +1055,14 @@ def _pick_candidates(ds, projection, snr, min_rel_intensity, max_candidates, mas
                              max_peaks=max_candidates, projection=proj, mask=mask,
                              prominence=prominence)
     if proj in ("both", "mean+max", "union"):
+        # Both branches pick UNCAPPED and the cap is applied once, after the union. Capping
+        # each branch first would both undercount the true detection total and throw away
+        # skyline-only ions that would have survived the merge.
         mean = ds.pick_peaks(snr=snr, min_rel_intensity=min_rel_intensity,
-                             max_peaks=max_candidates, projection="mean", mask=mask,
+                             max_peaks=0, projection="mean", mask=mask,
                              prominence=prominence)
         mx = ds.pick_peaks(snr=snr, min_rel_intensity=min_rel_intensity,
-                           max_peaks=max_candidates, projection="max", mask=mask,
+                           max_peaks=0, projection="max", mask=mask,
                            prominence=prominence)
         return _merge_candidates(mean, mx, tol_ppm=tol_ppm, max_candidates=max_candidates)
     raise ValueError(f"unknown projection {projection!r}; use 'mean', 'max', or 'both'")
@@ -1037,6 +1121,11 @@ def find_spatial_features(ds, snr: float = 3.0, min_rel_intensity: float = 0.0,
     :class:`SpatialFeatures` whose ``peaks`` are ready to drop into the working set;
     each carries ``frequency``, ``morans_i`` and (when ``auto_width``) ``width_ppm`` /
     ``fwhm_mz`` alongside the usual ``mz`` / ``intensity`` / ``rel_intensity`` / ``snr``.
+
+    ``max_candidates`` caps the candidate pool by descending intensity; set it to ``0`` for
+    no cap. The result reports the uncapped detection count as ``n_detected``, so a run that
+    saturates the cap says so (``candidates_capped``) rather than reporting the cap as if it
+    were a measurement. Raising it costs a Moran's I pass per extra candidate.
     """
     params = dict(snr=snr, min_rel_intensity=min_rel_intensity, projection=projection,
                   min_frequency=min_frequency, min_morans=min_morans, tol_ppm=tol_ppm,
@@ -1045,8 +1134,10 @@ def find_spatial_features(ds, snr: float = 3.0, min_rel_intensity: float = 0.0,
                   collapse_isotopes=collapse_isotopes)
     cand = _pick_candidates(ds, projection, snr, min_rel_intensity, max_candidates,
                             mask, prominence, tol_ppm)
+    params["max_candidates"] = int(max_candidates or 0)
     if not cand:
-        return SpatialFeatures([], 0, 0, 0, float("nan"), params)
+        return SpatialFeatures([], 0, 0, 0, float("nan"), params, -1,
+                               int(getattr(cand, "n_detected", 0)))
     mzs = [p["mz"] for p in cand]
     # one raw feature matrix built here is reused by both gates below (same peaks/
     # tol/reduce → cache hit in feature_frequency and spatial_autocorrelation)
@@ -1105,7 +1196,8 @@ def find_spatial_features(ds, snr: float = 3.0, min_rel_intensity: float = 0.0,
     suggested = float(np.median(widths)) if widths else float("nan")
     if progress is not None:
         progress(100, 100)
-    return SpatialFeatures(out, len(cand), n_after_freq, n_spatial, suggested, params, n_collapsed)
+    return SpatialFeatures(out, len(cand), n_after_freq, n_spatial, suggested, params,
+                           n_collapsed, int(getattr(cand, "n_detected", len(cand))))
 
 
 # --------------------------------------------------------------------------- #
@@ -1121,6 +1213,13 @@ class CoherentFeatures:
     n_after_quality: int         # survived the artifact-rejection quality gate (== len(peaks))
     suggested_ppm: float         # median auto-width of the survivors (NaN if none)
     params: dict
+    n_detected: int = -1         # peaks detected before the max_candidates cap; -1 if unknown
+
+    @property
+    def candidates_capped(self) -> bool:
+        """True when ``max_candidates`` truncated the pool (see
+        :attr:`SpatialFeatures.candidates_capped`)."""
+        return self.n_detected > self.n_candidates
 
 
 def _composite_quality(morans, chaos, hotspot) -> float:
@@ -1189,7 +1288,8 @@ def find_coherent_features(ds, *, snr: float = 3.0, min_rel_intensity: float = 0
     params.update(min_quality=min_quality, max_hotspot=max_hotspot, stage="coherent")
     survivors = sf.peaks
     if not survivors:
-        return CoherentFeatures([], sf.n_candidates, 0, 0, float("nan"), params)
+        return CoherentFeatures([], sf.n_candidates, 0, 0, float("nan"), params,
+                                sf.n_detected)
     mzs = [float(p["mz"]) for p in survivors]
     chaos = spatial_chaos(ds, mzs, tol_ppm=tol_ppm, norm=norm)
     if progress is not None:
@@ -1213,7 +1313,8 @@ def find_coherent_features(ds, *, snr: float = 3.0, min_rel_intensity: float = 0
     suggested = float(np.median(widths)) if widths else sf.suggested_ppm
     if progress is not None:
         progress(100, 100)
-    return CoherentFeatures(out, sf.n_candidates, len(survivors), len(out), suggested, params)
+    return CoherentFeatures(out, sf.n_candidates, len(survivors), len(out), suggested, params,
+                            sf.n_detected)
 
 
 def _silhouette(scores, labels):

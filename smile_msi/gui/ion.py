@@ -11,7 +11,15 @@ from .common import (PIXEL_COLORS, ROI_COLOR, colormap, _spectrum_view, Spectrum
                      lock_legend, fill_table, hex_to_rgba, ControlBar, dark_image_view,
                      pick_and_build, find_spatial, enable_pinch_zoom, tool_button,
                      signal_mz_range, plot_caption, confirm, icon, guarded, ACCENT, DANGER,
-                     NoScrollComboBox, NoScrollSpinBox)
+                     NoScrollComboBox, NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollSlider,
+                     note, section_title)
+
+# Refine pill entries → spatial.ring_mask mode (None = the filled mask as-is,
+# "invert" = every acquired pixel the mask does NOT cover).
+REFINE_MODES = (("Filled", None), ("Inner rim", "inner"), ("Outer collar", "outer"),
+                ("Band", "band"), ("Everything else", "invert"))
+ROI_SOURCE_THRESHOLD = "Threshold (signal)"
+ROI_SOURCE_REGION = "Existing region"
 
 
 def _apex_bin(axis, y, mz, rel_win=5e-5):
@@ -115,15 +123,98 @@ class IonTabMixin:
         self.roi_shape = NoScrollComboBox()
         self.roi_shape.addItems(["Rectangle", "Circle", "Polygon", "Polygon (click)",
                                  "Freehand (brush)"])
-        self.roi_shape.setToolTip("ROI shape:\n"
+        # Sources beyond drawing: the mask starts from a signal threshold or from a region
+        # that already exists, and the Refine pill then grows a rim / collar / band or
+        # inverts it — the whole nerve-compartment build without the brush.
+        self.roi_shape.insertSeparator(self.roi_shape.count())
+        self.roi_shape.addItems([ROI_SOURCE_THRESHOLD, ROI_SOURCE_REGION])
+        self.roi_shape.setToolTip("Where the ROI mask starts from:\n"
                                   "• Rectangle — drag a box\n"
                                   "• Circle — drag to size a circle (interior + edge included)\n"
                                   "• Polygon — drag the 4 vertices (right-click an edge to add one)\n"
                                   "• Polygon (click) — click to drop each vertex, double-click or "
                                   "click the first point to close\n"
                                   "• Freehand (brush) — drag on the image to paint pixels "
-                                  "(set the brush radius); click to dab")
+                                  "(set the brush radius); click to dab\n"
+                                  "• Threshold (signal) — pixels where a feature, a lipid class or "
+                                  "a sum of features reaches a cut (holes filled)\n"
+                                  "• Existing region — start from a saved region, then refine it "
+                                  "(e.g. grow an outer collar)")
         self.roi_shape.currentTextChanged.connect(self._roi_shape_changed)
+        # ---- Threshold source: a small popup (signal · cut · fill · islands) ----
+        self.thr_btn = QtWidgets.QToolButton()
+        self.thr_btn.setText("Threshold")
+        self.thr_btn.setObjectName("menuButton")
+        self.thr_btn.setIcon(icon("settings"))
+        self.thr_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.thr_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        self.thr_btn.setToolTip("Which signal to threshold and where to cut it. The mask "
+                                "updates live on the image as you change it.")
+        _thr_menu = QtWidgets.QMenu(self.thr_btn)
+        _thr_box = QtWidgets.QWidget()
+        _thr_col = QtWidgets.QVBoxLayout(_thr_box)
+        _thr_col.setContentsMargins(12, 10, 12, 10); _thr_col.setSpacing(7)
+        _thr_col.addWidget(section_title("Signal"))
+        self.thr_signal = NoScrollComboBox()
+        self.thr_signal.setMinimumWidth(220)
+        self.thr_signal.setToolTip("The active feature, a lipid class (composite of its "
+                                   "members) or a sum of features you pick")
+        self.thr_signal.currentIndexChanged.connect(self._thr_signal_changed)
+        self.thr_pick_btn = tool_button(name="settings", tooltip="Choose the features to sum…",
+                                        slot=self._pick_threshold_sum)
+        _srow = QtWidgets.QHBoxLayout(); _srow.setContentsMargins(0, 0, 0, 0); _srow.setSpacing(4)
+        _srow.addWidget(self.thr_signal, 1); _srow.addWidget(self.thr_pick_btn)
+        _thr_col.addLayout(_srow)
+        self._thr_sum_mzs = []
+        self._thr_cache = None
+        _thr_col.addWidget(section_title("Cut"))
+        self.thr_slider = NoScrollSlider(QtCore.Qt.Horizontal)
+        self.thr_slider.setRange(0, 100)
+        self.thr_slider.setValue(60)
+        self.thr_slider.setToolTip("Percentile of the signal pixels (pixels with signal > 0)")
+        self.thr_cut = NoScrollDoubleSpinBox()
+        self.thr_cut.setRange(0, 100)
+        self.thr_cut.setDecimals(0)
+        self.thr_cut.setValue(60)
+        self.thr_cut.setSuffix(" %")
+        self.thr_cut.setToolTip("Keep pixels at or above this percentile of the signal pixels "
+                                "(60 = the brightest 40 %). Tick 'absolute' to cut on intensity.")
+        self.thr_absolute = QtWidgets.QCheckBox("absolute intensity")
+        self.thr_absolute.setToolTip("Cut on raw intensity instead of a percentile")
+        _crow = QtWidgets.QHBoxLayout(); _crow.setContentsMargins(0, 0, 0, 0); _crow.setSpacing(6)
+        _crow.addWidget(self.thr_slider, 1); _crow.addWidget(self.thr_cut)
+        _thr_col.addLayout(_crow)
+        _thr_col.addWidget(self.thr_absolute)
+        self.thr_slider.valueChanged.connect(self._thr_slider_moved)
+        self.thr_cut.valueChanged.connect(self._thr_cut_changed)
+        self.thr_absolute.toggled.connect(self._thr_absolute_toggled)
+        _thr_col.addWidget(section_title("Clean up"))
+        self.thr_fill = QtWidgets.QCheckBox("Fill holes")
+        self.thr_fill.setChecked(True)
+        self.thr_fill.setToolTip("Fill enclosed holes so a fascicle interior reads as solid")
+        self.thr_fill.toggled.connect(lambda *_: self._roi_spectrum())
+        self.thr_min_px = NoScrollSpinBox()
+        self.thr_min_px.setRange(0, 100000)
+        self.thr_min_px.setValue(0)
+        self.thr_min_px.setPrefix("drop islands < ")
+        self.thr_min_px.setSuffix(" px")
+        self.thr_min_px.setToolTip("Drop connected islands smaller than this (0 = keep all)")
+        self.thr_min_px.valueChanged.connect(lambda *_: self._roi_spectrum())
+        _thr_col.addWidget(self.thr_fill)
+        _thr_col.addWidget(self.thr_min_px)
+        self.thr_info = note("—")
+        _thr_col.addWidget(self.thr_info)
+        _twa = QtWidgets.QWidgetAction(_thr_menu); _twa.setDefaultWidget(_thr_box); _thr_menu.addAction(_twa)
+        _thr_menu.aboutToShow.connect(self._refresh_threshold_signals)
+        self.thr_btn.setMenu(_thr_menu)
+        self.thr_btn.hide()
+        # ---- Existing-region source: pick the region the mask starts from ----
+        self.src_region = NoScrollComboBox()
+        self.src_region.setMinimumWidth(140)
+        self.src_region.setToolTip("The saved region this ROI starts from — refine it with a "
+                                   "rim / collar / band, or take everything else")
+        self.src_region.currentIndexChanged.connect(lambda *_: self._roi_spectrum())
+        self.src_region.hide()
         # brush radius (px) — only used by the Freehand brush
         self.brush_size = NoScrollSpinBox()
         self.brush_size.setRange(1, 80)
@@ -138,23 +229,33 @@ class IonTabMixin:
                                    "• Draw — add painted pixels to the ROI\n"
                                    "• Erase — rub painted pixels back out\n"
                                    "(⌘Z undoes the last stroke)")
-        # border / ring: keep only a band of this width around the shape's edge
+        # Refine: keep the source mask as-is, reduce it to a rim / collar / band of this
+        # width around its boundary, or invert it. Same widgets as the old hidden Border
+        # popup (same names), now a visible pill with a µm readout beside the px width.
         self.border_spin = NoScrollSpinBox()
-        self.border_spin.setRange(0, 80)
-        self.border_spin.setValue(0)
-        self.border_spin.setPrefix("border ")
+        self.border_spin.setRange(0, 500)
+        self.border_spin.setValue(6)
+        self.border_spin.setPrefix("width ")
         self.border_spin.setSuffix(" px")
-        self.border_spin.setToolTip("0 = filled ROI. >0 keeps only a ring of this width around "
-                                    "the boundary (e.g. a 28 px rim), dropping the interior — "
-                                    "applies to every ROI shape, live.")
-        self.border_spin.valueChanged.connect(lambda *_: self._roi_spectrum())
+        self.border_spin.setToolTip("Width of the rim / collar / band in pixels (the µm readout "
+                                    "uses the slide's pixel size). Applies to every source, live.")
+        self.border_spin.valueChanged.connect(self._refine_changed)
         self.border_mode = NoScrollComboBox()
-        self.border_mode.addItems(["Inner", "Outer", "Band"])
-        self.border_mode.setToolTip("Where the border sits relative to the drawn edge:\n"
-                                    "• Inner — rim inside the shape (excludes the core)\n"
-                                    "• Outer — collar of tissue outside the shape\n"
-                                    "• Band — both sides of the boundary")
-        self.border_mode.currentTextChanged.connect(lambda *_: self._roi_spectrum())
+        self.border_mode.addItems([label for label, _ in REFINE_MODES])
+        self.border_mode.setToolTip("How the source mask becomes the ROI:\n"
+                                    "• Filled — the mask as-is\n"
+                                    "• Inner rim — a rim inside the boundary (drops the core)\n"
+                                    "• Outer collar — a collar of tissue outside the boundary "
+                                    "(perineurium around an endoneurium)\n"
+                                    "• Band — both sides of the boundary\n"
+                                    "• Everything else — every acquired pixel the mask does "
+                                    "not cover (epineurium = not endo, not peri)")
+        self.border_mode.currentTextChanged.connect(self._refine_changed)
+        self.border_um = QtWidgets.QLabel("")
+        self.border_um.setToolTip("The width in µm, from the slide's pixel size")
+        self.refine_tools = self._toolbar_group(QtWidgets.QLabel("Refine"), self.border_mode,
+                                                self.border_spin, self.border_um)
+        self.refine_tools.hide()
         b_clear_roi = tool_button("✕", "Clear ROI — hide it, remove its spectrum overlay, and "
                                   "clear any regions assigned from it", self._clear_roi,
                                   name="remove")
@@ -184,6 +285,22 @@ class IonTabMixin:
             "Features ▸ Feature set selector.")
         self.b_roi_features.setObjectName("primaryAction")  # headline one-click action of the ROI bar
         self.b_roi_features.clicked.connect(lambda: self.features_from_region(prefer_roi=True))
+        # Save the built mask as a named region (name pre-filled from the source + refine).
+        self.b_roi_region = QtWidgets.QPushButton("Save as region")
+        self.b_roi_region.setIcon(icon("add"))
+        self.b_roi_region.setToolTip("Save the current ROI mask (after Refine) as a named region "
+                                     "in the Regions panel — the name is pre-filled from the "
+                                     "source, e.g. 'endo · outer collar 6 px' or 'not endo'.")
+        self.b_roi_region.clicked.connect(self._save_roi_as_region)
+        # The whole nerve build in one dialog: threshold → outer collar → everything else.
+        self.b_compartments = QtWidgets.QPushButton("Compartments…")
+        self.b_compartments.setIcon(icon("add"))
+        self.b_compartments.setToolTip("Build endoneurium / perineurium / epineurium regions in "
+                                       "one go: threshold a signal for the endoneurium, grow a "
+                                       "collar outside it for the perineurium, take everything "
+                                       "else for the epineurium — previewed, then created as "
+                                       "three grouped regions.")
+        self.b_compartments.clicked.connect(self._open_compartments_dialog)
         # The shape picker carried the whole ROI vocabulary ("Freehand (brush)") yet got
         # squeezed to a few characters on the tight strip — give it room to show its label.
         self.roi_shape.setMinimumWidth(150)
@@ -192,14 +309,12 @@ class IonTabMixin:
         # cramming the brush mode/size combos inline (where they truncated to "Dr" / "n 3
         # px" and ate the toolbar's stretch). The widgets are reparented as-is — same
         # objects, same signal connections.
-        from .common import section_title
         self.roi_opts_btn = QtWidgets.QToolButton()
         self.roi_opts_btn.setText("ROI options")          # ▾ drawn by QSS (menuButton chevron)
         self.roi_opts_btn.setObjectName("menuButton")     # shared dropdown pill (single arrow)
         self.roi_opts_btn.setIcon(icon("settings"))       # a configure-this menu (brush / size / colour)
         self.roi_opts_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
-        self.roi_opts_btn.setToolTip("Freehand brush action / size, border ring width / "
-                                     "placement, and the ROI drawing colour")
+        self.roi_opts_btn.setToolTip("Freehand brush action / size and the ROI drawing colour")
         self.roi_opts_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         _roi_menu = QtWidgets.QMenu(self.roi_opts_btn)
         _roi_box = QtWidgets.QWidget()
@@ -214,18 +329,19 @@ class IonTabMixin:
         _brush_col.addWidget(self.brush_mode)
         _brush_col.addWidget(self.brush_size)
         _roi_col.addWidget(self.brush_tools)
-        _roi_col.addWidget(section_title("Border"))
-        _roi_col.addWidget(self.border_spin)
-        _roi_col.addWidget(self.border_mode)
         _roi_col.addWidget(section_title("Colour"))
         _crow = QtWidgets.QHBoxLayout(); _crow.setContentsMargins(0,0,0,0); _crow.setSpacing(6)
         _crow.addWidget(QtWidgets.QLabel("ROI colour")); _crow.addWidget(self.roi_color_btn, 1)
         _roi_col.addLayout(_crow)
         _wa = QtWidgets.QWidgetAction(_roi_menu); _wa.setDefaultWidget(_roi_box); _roi_menu.addAction(_wa)
         self.roi_opts_btn.setMenu(_roi_menu)
-        self.roi_tools = self._toolbar_group(self.b_roi_features, self.roi_shape,
-                                             self.roi_opts_btn, b_clear_roi)
+        # Three flow items (source · refine · actions) rather than one, so a narrow panel
+        # wraps them as whole groups instead of squeezing the widgets.
+        self.roi_tools = self._toolbar_group(self.roi_shape, self.thr_btn, self.src_region)
         self.roi_tools.hide()
+        self.roi_actions = self._toolbar_group(self.b_roi_region, self.b_roi_features,
+                                               self.b_compartments, self.roi_opts_btn, b_clear_roi)
+        self.roi_actions.hide()
         # image zoom controls — trackpad pinch / scroll-wheel zoom about the cursor are
         # always live (see enable_pinch_zoom below); these buttons add explicit zoom in/out
         # and a fit-to-image, handy while drawing an ROI.
@@ -263,6 +379,8 @@ class IonTabMixin:
         # is on, reserve no space meanwhile — FlowLayout skips empty items).
         bar.add(self.roi_chk)
         bar.add(self.roi_tools)
+        bar.add(self.refine_tools)
+        bar.add(self.roi_actions)
         # Colormap picker — promoted onto the render toolbar (it used to be tucked into the
         # right-hand panel). Drives the single-ion image; greyed out while the multi-channel
         # Color overlay is on, since each feature carries its own colour then. Created here
@@ -543,8 +661,19 @@ class IonTabMixin:
         # pixel off disk on the GUI thread. Without a cube, fall back to the exact stream.
         cube_spec = (self.ds.cube_max_spectrum() if proj == "max"
                      else self.ds.cube_mean_spectrum())
+        pending = False
         if cube_spec is not None:
             axis, spec = cube_spec
+        elif (proj == "max" and getattr(self, "_cube_building", False)
+              and self.ds.skyline_needs_disk_pass()):
+            # The skyline would stream every spectrum off disk on the GUI thread (minutes
+            # on a large slide). Show the already-primed mean and swap in the cube-served
+            # skyline when the fast cache lands (_on_fast_cache_ready re-plots).
+            axis, spec = self.ds.mean_spectrum()
+            pending = True
+            self._pending_spectrum_refresh = True
+            self.statusBar().showMessage(
+                "Showing the mean spectrum — the skyline appears when the fast cache finishes.")
         else:
             axis, spec = (self.ds.max_spectrum() if proj == "max" else self.ds.mean_spectrum())
         self._disp_axis = np.asarray(axis, dtype=float)
@@ -552,7 +681,8 @@ class IonTabMixin:
         self.spectrum.clear()
         self.spectrum.addItem(self.mz_line)
         self.spectrum.addItem(self.peak_marker)        # survives the clear()
-        name = "skyline (max)" if proj == "max" else "mean"
+        name = ("mean (skyline pending fast cache)" if pending
+                else "skyline (max)" if proj == "max" else "mean")
         base = self.spectrum.plot(axis, spec, pen=pg.mkPen("#7aa6da", width=1), name=name)
         base._overlay_name = f"{name} spectrum"
         base._overlay_color = "#7aa6da"
@@ -651,6 +781,343 @@ class IonTabMixin:
         return (getattr(self, "roi_shape", None) is not None
                 and self.roi_shape.currentText() == "Polygon (click)")
 
+    # ----- sources beyond drawing (threshold / existing region) ------------- #
+    def _threshold_mode(self):
+        return (getattr(self, "roi_shape", None) is not None
+                and self.roi_shape.currentText() == ROI_SOURCE_THRESHOLD)
+
+    def _region_source_mode(self):
+        return (getattr(self, "roi_shape", None) is not None
+                and self.roi_shape.currentText() == ROI_SOURCE_REGION)
+
+    def _source_mode(self):
+        """True when the ROI mask comes from a signal threshold or a saved region rather
+        than a drawn shape — there is no outline then, so the footprint is always painted."""
+        return self._threshold_mode() or self._region_source_mode()
+
+    def _sync_source_tools(self):
+        thr, reg = self._threshold_mode(), self._region_source_mode()
+        if getattr(self, "thr_btn", None) is not None:
+            self.thr_btn.setVisible(thr)
+        if getattr(self, "src_region", None) is not None:
+            self.src_region.setVisible(reg)
+        if thr:
+            self._refresh_threshold_signals()
+        if reg:
+            self._refresh_source_regions()
+
+    def _refresh_source_regions(self):
+        combo = self.src_region
+        keep = combo.currentText()
+        names = [rg["name"] for rg in (self.regions or [])]
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(names)
+        if keep in names:
+            combo.setCurrentText(keep)
+        combo.blockSignals(False)
+        combo.setEnabled(bool(names))
+        combo.setToolTip("Draw or save a region first" if not names else
+                         "The saved region this ROI starts from — refine it with a rim / "
+                         "collar / band, or take everything else")
+
+    def _region_source_mask(self):
+        name = self.src_region.currentText()
+        rg = next((r for r in (self.regions or []) if r.get("name") == name), None)
+        if rg is None:
+            return None
+        mask = self._region_pixel_mask(rg)
+        return mask if mask is not None and mask.any() else None
+
+    @staticmethod
+    def _peak_label(p):
+        lip = (p.get("lipid") or "").strip() if p else ""
+        return lip if lip else (f"m/z {float(p['mz']):.4f}" if p else "—")
+
+    def _active_peak(self):
+        if self.active_mz is None:
+            return None
+        return next((p for p in (self.peaks or [])
+                     if abs(float(p["mz"]) - float(self.active_mz)) < 1e-4), None)
+
+    def _signal_options(self, sum_mzs=()):
+        """``[(label, kind)]`` for a signal picker: the active feature, each lipid class
+        (composite of its members), and a hand-picked sum of features."""
+        ap = self._active_peak()
+        active_label = self._peak_label(ap) if ap else (
+            f"m/z {self.active_mz:.4f}" if self.active_mz is not None else "none selected")
+        out = [(f"Active feature ({active_label})", ("active",))]
+        cmap = getattr(self, "_class_map", {}) or {}
+        for cls in sorted(cmap, key=lambda c: -len(cmap[c])):
+            out.append((f"Class: {cls} ({len(cmap[cls])} ions)", ("class", cls)))
+        n = len(sum_mzs)
+        out.append((f"Sum of features… ({n} chosen)" if n else "Sum of features…", ("sum",)))
+        return out
+
+    @staticmethod
+    def _fill_signal_combo(combo, options):
+        keep = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        for label, kind in options:
+            combo.addItem(label, kind)
+        idx = next((i for i in range(combo.count()) if combo.itemData(i) == keep), 0)
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _refresh_threshold_signals(self):
+        self._fill_signal_combo(self.thr_signal, self._signal_options(self._thr_sum_mzs))
+
+    def _thr_signal_changed(self, *_):
+        self._thr_cache = None
+        kind = self.thr_signal.currentData() or ("active",)
+        if kind[0] == "sum" and not self._thr_sum_mzs:
+            self._pick_threshold_sum()
+            return
+        self._roi_spectrum()
+
+    def _pick_threshold_sum(self):
+        chosen = self._pick_feature_sum(self._thr_sum_mzs)
+        if chosen is None:
+            return
+        self._thr_sum_mzs = chosen
+        self._thr_cache = None
+        self._refresh_threshold_signals()
+        self._roi_spectrum()
+
+    def _pick_feature_sum(self, initial=()):
+        """Multi-pick the features whose per-pixel intensities are summed into one signal.
+        Returns the chosen m/z list, or ``None`` when cancelled / nothing to pick from."""
+        peaks = list(self.peaks or [])
+        if not peaks:
+            self.statusBar().showMessage("Find peaks first — there are no features to sum.")
+            return None
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Sum of features")
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.addWidget(note("Tick the features to add together (e.g. the sulfatide species)."))
+        lst = QtWidgets.QListWidget()
+        lst.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        chosen = {round(m, 4) for m in initial}
+        for p in peaks:
+            it = QtWidgets.QListWidgetItem(f"{self._peak_label(p)}   ({float(p['mz']):.4f})")
+            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+            it.setCheckState(QtCore.Qt.Checked if round(float(p["mz"]), 4) in chosen
+                             else QtCore.Qt.Unchecked)
+            it.setData(QtCore.Qt.UserRole, float(p["mz"]))
+            lst.addItem(it)
+        v.addWidget(lst, 1)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        dlg.resize(380, 460)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None
+        return [float(lst.item(i).data(QtCore.Qt.UserRole)) for i in range(lst.count())
+                if lst.item(i).checkState() == QtCore.Qt.Checked]
+
+    def _thr_slider_moved(self, v):
+        if self.thr_absolute.isChecked():
+            return
+        self.thr_cut.blockSignals(True)
+        self.thr_cut.setValue(float(v))
+        self.thr_cut.blockSignals(False)
+        self._roi_spectrum()
+
+    def _thr_cut_changed(self, v):
+        if not self.thr_absolute.isChecked():
+            self.thr_slider.blockSignals(True)
+            self.thr_slider.setValue(int(round(float(v))))
+            self.thr_slider.blockSignals(False)
+        self._roi_spectrum()
+
+    def _thr_absolute_toggled(self, on):
+        self.thr_slider.setEnabled(not on)
+        self.thr_cut.blockSignals(True)
+        if on:
+            vec, _ = self._threshold_signal_vector()
+            top = float(np.nanmax(vec)) if vec is not None and vec.size else 1.0
+            self.thr_cut.setSuffix("")
+            self.thr_cut.setDecimals(3)
+            self.thr_cut.setRange(0.0, max(top, 1.0) * 10)
+            pos = vec[vec > 0] if vec is not None else np.array([])
+            self.thr_cut.setValue(float(np.percentile(pos, self.thr_slider.value())) if pos.size else 0.0)
+        else:
+            self.thr_cut.setSuffix(" %")
+            self.thr_cut.setDecimals(0)
+            self.thr_cut.setRange(0, 100)
+            self.thr_cut.setValue(float(self.thr_slider.value()))
+        self.thr_cut.blockSignals(False)
+        self._roi_spectrum()
+
+    def _threshold_signal_vector(self):
+        """``(per-pixel signal, label)`` for the Threshold source — memoised on its inputs
+        so dragging the cut never re-extracts."""
+        if self.ds is None:
+            return None, ""
+        kind = self.thr_signal.currentData() or ("active",)
+        vec, label, key = self._signal_vector_for(kind, self._thr_sum_mzs, compute=False)
+        if vec is None and key is not None:
+            cached = self._thr_cache
+            if cached is not None and cached[0] == key:
+                return cached[1], label
+            vec, label, key = self._signal_vector_for(kind, self._thr_sum_mzs)
+            self._thr_cache = (key, vec)
+        return vec, label
+
+    def _signal_vector_for(self, kind, sum_mzs=(), compute=True):
+        """``(vector, label, cache key)`` for a signal kind (``("active",)``, ``("class",
+        name)`` or ``("sum",)``) at the bar's ppm / reduce / norm — the active feature (class
+        composites included), a lipid class, or the given sum. With ``compute=False`` only the
+        label and key come back (vector ``None``) so a caller can consult its own cache."""
+        if self.ds is None:
+            return None, "", None
+        weight = self.composite_weight
+        if kind[0] == "class":
+            mzs = [self._apex_mz(m) for m in (getattr(self, "_class_map", {}) or {}).get(kind[1], [])]
+            label = f"class {kind[1]}"
+        elif kind[0] == "sum":
+            mzs = [self._apex_mz(m) for m in sum_mzs]
+            label = f"sum of {len(mzs)} features"
+        else:
+            ap = self._active_peak()
+            if ap is not None and ap.get("is_class"):
+                mzs = [self._apex_mz(m) for m in (ap.get("members") or [])]
+            elif self.active_mz is not None:
+                mzs = [self._apex_mz(float(self.active_mz))]
+            else:
+                mzs = []
+            label = self._peak_label(ap) if ap else (
+                f"m/z {self.active_mz:.4f}" if self.active_mz is not None else "")
+        if not mzs:
+            return None, label, None
+        key = (kind, tuple(round(float(m), 5) for m in mzs), self.ppm, self.reduce, self.norm,
+               weight, id(self.ds), getattr(self.ds, "_cache_gen", 0))
+        if not compute:
+            return None, label, key
+        if len(mzs) == 1 and kind[0] == "active":
+            vec = self.ds.ion_vector(mzs[0], tol_ppm=self.ppm, reduce=self.reduce, norm=self.norm)
+        else:
+            vec = self.ds.composite_vector(mzs, tol_ppm=self.ppm, reduce=self.reduce,
+                                           norm=self.norm, weight=weight)
+        return np.asarray(vec, dtype=float), label, key
+
+    def _threshold_source_mask(self):
+        vec, _ = self._threshold_signal_vector()
+        if vec is None:
+            if getattr(self, "thr_info", None) is not None:
+                self.thr_info.setText("Select a feature (or pick a class / sum) to threshold.")
+            return None
+        absolute = self.thr_absolute.isChecked()
+        mask = spatial.threshold_mask(self.ds, vec, float(self.thr_cut.value()),
+                                      percentile=not absolute,
+                                      fill_holes=self.thr_fill.isChecked(),
+                                      min_pixels=int(self.thr_min_px.value()))
+        n = int(mask.sum())
+        self.thr_info.setText(f"{n:,} of {self.ds.n_pixels:,} px kept")
+        return mask if n else None
+
+    # ----- refine (rim / collar / band / invert) ----------------------------- #
+    def _refine_kind(self):
+        if getattr(self, "border_mode", None) is None:
+            return None
+        return dict(REFINE_MODES).get(self.border_mode.currentText())
+
+    def _refine_active(self):
+        """True when Refine changes the footprint (a ring of >0 px, or the inversion)."""
+        kind = self._refine_kind()
+        if kind is None:
+            return False
+        return kind == "invert" or float(self.border_spin.value()) > 0
+
+    def _refine_tag(self):
+        kind = self._refine_kind()
+        if kind is None:
+            return ""
+        if kind == "invert":
+            return "  ·  everything else"
+        w = float(self.border_spin.value())
+        return f"  ·  {self.border_mode.currentText().lower()} {w:.0f} px" if w > 0 else ""
+
+    def _sync_refine_tools(self):
+        kind = self._refine_kind()
+        ring = kind in ("inner", "outer", "band")
+        if getattr(self, "border_spin", None) is not None:
+            self.border_spin.setEnabled(ring)
+        if getattr(self, "border_um", None) is not None:
+            px = getattr(self.ds, "pixel_size_um", None) if self.ds is not None else None
+            w = float(self.border_spin.value())
+            self.border_um.setText(f"= {w * float(px):g} µm" if (px and ring) else
+                                   ("(no pixel size)" if ring else ""))
+
+    def _refine_changed(self, *_):
+        self._sync_refine_tools()
+        self._roi_spectrum()
+
+    def _roi_source_label(self):
+        """A name for the current ROI build, pre-filled into 'Save as region' — the source
+        ('ST 42:2;O3 ≥ p60', 'endo', 'ROI 3') plus the refine ('· outer collar 6 px', 'not …')."""
+        if self._threshold_mode():
+            _, label = self._threshold_signal_vector()
+            cut = float(self.thr_cut.value())
+            base = f"{label or 'signal'} {'> ' + format(cut, 'g') if self.thr_absolute.isChecked() else '≥ p' + format(cut, 'g')}"
+        elif self._region_source_mode():
+            base = self.src_region.currentText() or "region"
+        else:
+            base = f"ROI {len(self.regions) + 1}"
+        kind = self._refine_kind()
+        if kind == "invert":
+            return f"not {base}"
+        if kind and float(self.border_spin.value()) > 0:
+            return f"{base} · {self.border_mode.currentText().lower()} {float(self.border_spin.value()):g} px"
+        return base
+
+    def _open_compartments_dialog(self):
+        """Open (building once) the endo / peri / epi Compartments dialog; returns it."""
+        if self.ds is None:
+            self.statusBar().showMessage("Load a dataset first.")
+            return None
+        dlg = getattr(self, "_compartments_dialog", None)
+        if dlg is None:
+            from .compartments import CompartmentsDialog
+            dlg = self._compartments_dialog = CompartmentsDialog(self)
+        dlg.refresh()
+        self._show_dialog(dlg)
+        return dlg
+
+    def _save_roi_as_region(self):
+        """'Save as region': the current mask (source + refine) becomes a named region, the
+        name prompted with a pre-fill from the build. A refined *existing region* nests under
+        its source. Returns the new region's index, or -1."""
+        if self.ds is None:
+            self.statusBar().showMessage("Load a dataset first.")
+            return -1
+        mask = self._roi_mask()
+        if mask is None or not mask.any():
+            self.statusBar().showMessage("Nothing to save — draw an ROI, or pick a Threshold / "
+                                         "Existing-region source that keeps some pixels.")
+            return -1
+        default = self._roi_source_label()
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save as region", "Region name:", text=default)
+        if not ok or not name.strip():
+            return -1
+        kind = self._refine_kind()
+        parent = (self.src_region.currentText()
+                  if self._region_source_mode() and kind in ("inner", "outer", "band")
+                  and float(self.border_spin.value()) > 0 else None)
+        self.record_undo("ROI → region", domains=("regions",))
+        ri = self._new_region(name.strip(), mask=mask, parent=parent)
+        if self.prov is not None:
+            self.prov.step("region_derive", source=self.roi_shape.currentText(),
+                           op=kind or "filled", width_px=float(self.border_spin.value()),
+                           cut=(float(self.thr_cut.value()) if self._threshold_mode() else None),
+                           region=self.regions[ri]["name"])
+        self._dismiss_roi()
+        self._mark_dirty()
+        self.statusBar().showMessage(
+            f"Region '{self.regions[ri]['name']}' saved: {int(mask.sum()):,} px.")
+        return ri
+
     # ----- freehand brush -------------------------------------------------- #
     def _brush_mode(self):
         return (getattr(self, "roi_shape", None) is not None
@@ -736,6 +1203,7 @@ class IonTabMixin:
 
     def _roi_shape_changed(self, *_):
         self._sync_brush_tools()                      # brush options only for the Freehand shape
+        self._sync_source_tools()                     # threshold panel / region picker per source
         if getattr(self, "roi_chk", None) is not None and self.roi_chk.isChecked():
             self._toggle_roi(True)                    # re-show with the newly-chosen shape
 
@@ -745,9 +1213,12 @@ class IonTabMixin:
             self.brush_tools.setVisible(self._brush_mode())
 
     def _toggle_roi(self, on):
-        if getattr(self, "roi_tools", None) is not None:
-            self.roi_tools.setVisible(on)             # ROI sub-controls only while drawing
+        for grp in ("roi_tools", "refine_tools", "roi_actions"):
+            if getattr(self, grp, None) is not None:
+                getattr(self, grp).setVisible(on)     # ROI sub-controls only while drawing
         self._sync_brush_tools()
+        self._sync_source_tools()
+        self._sync_refine_tools()
         for shp in self._roi_shapes():                # only the active shape is shown
             shp.hide()
         self._poly_draw_cancel()                      # leaving any in-progress click-draw
@@ -756,6 +1227,16 @@ class IonTabMixin:
             self._clear_brush()
             self.statusBar().showMessage("ROI tool off — click any pixel on the image to "
                                          "overlay its spectrum ('Clear pixels' to reset).")
+            return
+        if self._source_mode():
+            self._clear_brush()                       # no drawn footprint; the band shows the mask
+            self._roi_spectrum()
+            self.statusBar().showMessage(
+                "Threshold: pick the signal and cut in 'Threshold ▾'; Refine grows a rim / "
+                "collar or inverts; 'Save as region' keeps it."
+                if self._threshold_mode() else
+                "Existing region: pick the source region, then Refine (outer collar = a "
+                "perineurium around it; everything else = the rest) and 'Save as region'.")
             return
         if self._brush_mode():
             self._clear_brush()                       # fresh canvas; drag on the image to paint
@@ -835,16 +1316,21 @@ class IonTabMixin:
         return self._apply_border(self._roi_mask_filled())
 
     def _apply_border(self, mask):
-        """If 'border' > 0, reduce a filled mask to a ring of that width around its edge
-        (Inner/Outer/Band) — the '28 px rim, not the interior' option."""
+        """Apply the Refine pill: reduce a filled mask to a rim / collar / band of the chosen
+        width around its edge, or invert it to 'everything else'. 'Filled' (or a 0 px width)
+        returns the mask untouched."""
         if mask is None or self.ds is None:
             return mask
+        kind = self._refine_kind()
+        if kind is None:
+            return mask
+        if kind == "invert":
+            inv = spatial.invert_mask(self.ds, mask)
+            return inv if inv.any() else mask
         w = float(self.border_spin.value()) if getattr(self, "border_spin", None) is not None else 0.0
         if w <= 0:
             return mask
-        mode = (self.border_mode.currentText().lower()
-                if getattr(self, "border_mode", None) is not None else "inner")
-        ring = spatial.ring_mask(self.ds, mask, w, mode=mode)
+        ring = spatial.ring_mask(self.ds, mask, w, mode=kind)
         return ring if ring.any() else mask           # never silently empty the ROI
 
     def _roi_mask_filled(self):
@@ -854,6 +1340,10 @@ class IonTabMixin:
         falling back to the rectangle."""
         if self.ds is None:
             return None
+        if self._threshold_mode():
+            return self._threshold_source_mask()
+        if self._region_source_mode():
+            return self._region_source_mask()
         if self._brush_mode():
             bm = getattr(self, "_brush_mask", None)
             return bm if bm is not None and bm.any() else None
@@ -951,16 +1441,21 @@ class IonTabMixin:
     def _roi_spectrum(self):
         brush = (self._brush_mode() and getattr(self, "_brush_mask", None) is not None
                  and self._brush_mask.any())
-        if self.ds is None or not (brush or any(s.isVisible() for s in self._roi_shapes())):
+        source = (self._source_mode() and getattr(self, "roi_chk", None) is not None
+                  and self.roi_chk.isChecked())
+        if self.ds is None or not (brush or source or any(s.isVisible() for s in self._roi_shapes())):
             self._render_band_overlay(None)        # nothing selected → drop the band fill
             return
         mask = self._roi_mask()
         if mask is None or mask.sum() == 0:
             self._render_band_overlay(None)
+            self._remove_overlays("ROI")
+            if source:
+                self.statusBar().showMessage("ROI: no pixels — loosen the cut, or pick another "
+                                             "signal / region.")
             return
-        self._render_band_overlay(mask)            # show which pixels the border keeps (cheap, instant)
-        border = float(self.border_spin.value()) if getattr(self, "border_spin", None) is not None else 0.0
-        tag = f"  ·  {self.border_mode.currentText().lower()} border {border:.0f} px" if border > 0 else ""
+        self._render_band_overlay(mask)            # show which pixels the refine keeps (cheap, instant)
+        tag = self._refine_tag()
         npx = int(mask.sum())
         # Prefer the fast cube path (in-RAM, instant). Without the cube the masked mean
         # streams every pixel from disk — run that OFF the GUI thread so toggling/resizing
@@ -998,8 +1493,8 @@ class IonTabMixin:
         item = getattr(self, "_band_overlay", None)
         if item is None:
             return
-        border = float(self.border_spin.value()) if getattr(self, "border_spin", None) is not None else 0.0
-        if self.ds is None or mask is None or not np.any(mask) or border <= 0:
+        show = self._refine_active() or self._source_mode()
+        if self.ds is None or mask is None or not np.any(mask) or not show:
             item.hide()
             if self._brush_mode():
                 self._render_brush_overlay()       # restore the full painted footprint
@@ -1124,7 +1619,9 @@ class IonTabMixin:
         # from outside the list. (Rectangle ROIs are dragged via handles, not bare clicks.)
         drawing = getattr(self, "roi_chk", None) is not None and self.roi_chk.isChecked()
         if drawing or self._pix_lookup is None:
-            if self.active_mz is not None:
+            # a Threshold source thresholds the *active* feature — a stray click must not
+            # blank it (and the mask with it)
+            if self.active_mz is not None and not self._source_mode():
                 self._deselect_feature()
             return
         p = vb.mapSceneToView(ev.scenePos())
@@ -1216,6 +1713,7 @@ class IonTabMixin:
                   float(self.minrel_spin.value()), self.ppm, self.reduce,
                   projection=self._projection(), mask=mask,
                   prominence=float(self.prominence_spin.value()),
+                  max_peaks=int(self.maxpeaks_spin.value()),
                   on_done=self._on_peaks, want_progress=True,
                   busy=(f"Picking peaks in {region}…" if region else "Picking peaks & building features…"))
 
@@ -1233,11 +1731,13 @@ class IonTabMixin:
         self.peaks = peaks
         self._active_feature_scope = scope
         self._flist_name = "All slide" if region is None else f"{region} (sample)"
+        n_detected = int(getattr(peaks, "n_detected", len(peaks)))
         if self.prov is not None:
             self.prov.step("peak_picking", snr=float(self.snr_spin.value()),
                            min_rel=float(self.minrel_spin.value()),
                            prominence=float(self.prominence_spin.value()), norm=self.norm,
-                           tol_ppm=self.ppm, n_peaks=len(peaks), scope=scope)
+                           tol_ppm=self.ppm, n_peaks=len(peaks), scope=scope,
+                           max_peaks=int(self.maxpeaks_spin.value()), n_detected=n_detected)
         self._populate_peak_table()
         self._populate_peak_combos()
         self._build_class_map()
@@ -1246,7 +1746,15 @@ class IonTabMixin:
         if peaks:
             self.set_active_mz(peaks[0]["mz"])
         self._mark_dirty()                                # picking isn't undoable → hook here
-        msg = (f"{len(peaks)} peaks picked{f' in {region}' if region else ''}. Features ready."
+        # say so when the cap bound: a capped count is the cap, not a measurement of this
+        # region, and two regions that both stop at it have not been shown to agree
+        capped = (f" of {n_detected} detected — raise Max peaks to keep the rest"
+                  if n_detected > len(peaks) else "")
+        gb = float(getattr(peaks, "cache_gb", 0.0) or 0.0)
+        heavy = (f" Feature cache ≈ {gb:.1f} GB; set Max peaks or raise Min rel. intensity "
+                 "if segmentation or PCA runs out of memory." if gb > 2.0 else "")
+        msg = (f"{len(peaks)} peaks picked{capped}{f' in {region}' if region else ''}. "
+               "Features ready." + heavy
                + (" Switch samples with the Features ▸ Feature set selector." if region else ""))
         if save_list and peaks:
             saved = self._save_feature_list_to_library(
@@ -1309,6 +1817,7 @@ class IonTabMixin:
             "min_frequency": float(self.spatial_freq_spin.value()) / 100.0,
             "min_morans": float(self.spatial_morans_spin.value()),
             "tol_ppm": self.ppm, "norm": self.norm, "reduce": self.reduce,
+            "max_candidates": int(self.spatial_maxcand_spin.value()),
             "projection": proj, "prominence": float(self.prominence_spin.value()),
             "collapse_isotopes": self.spatial_deiso_chk.isChecked(),
             "fdr_max": fdr_max, "mode": self.mode_combo.currentText()}
@@ -1317,6 +1826,7 @@ class IonTabMixin:
                   float(self.minrel_spin.value()), self.ppm, self.reduce,
                   float(self.spatial_freq_spin.value()) / 100.0,
                   float(self.spatial_morans_spin.value()), norm=self.norm, mask=mask,
+                  max_candidates=int(self.spatial_maxcand_spin.value()),
                   prominence=float(self.prominence_spin.value()), projection=proj,
                   collapse_isotopes=self.spatial_deiso_chk.isChecked(),
                   fdr_max=fdr_max, mode=self.mode_combo.currentText(), fdr_ppm=self.id_ppm,
@@ -1329,7 +1839,9 @@ class IonTabMixin:
         self._on_peaks(result.peaks)                      # store scope + populate working set
         src = (result.params or {}).get("projection", "mean")
         src = {"max": "skyline", "both": "mean+skyline"}.get(src, "mean")
-        funnel = (f"{result.n_candidates} {src} candidates → {result.n_after_frequency} "
+        cap = (f" (capped from {result.n_detected} detected)"
+               if result.candidates_capped else "")
+        funnel = (f"{result.n_candidates} {src} candidates{cap} → {result.n_after_frequency} "
                   f"reproducible → {result.n_after_morans} spatially structured")
         if result.n_after_collapse >= 0 and result.n_after_collapse != result.n_after_morans:
             funnel += f" → {result.n_after_collapse} after isotope collapse"
@@ -1354,6 +1866,8 @@ class IonTabMixin:
         # counts (which gate dropped what) + the ROIs it was scoped to → audit trail + Report
         audit = dict(getattr(self, "_pending_spatial_audit", {}) or {})
         audit.update({"n_candidates": int(result.n_candidates),
+                      "n_detected": int(result.n_detected),
+                      "candidates_capped": bool(result.candidates_capped),
                       "n_after_frequency": int(result.n_after_frequency),
                       "n_after_morans": int(result.n_after_morans),
                       "n_features": len(result.peaks)})
@@ -1396,6 +1910,7 @@ class IonTabMixin:
                   float(self.minrel_spin.value()), self.ppm, self.reduce,
                   projection=self._projection(), mask=mask,
                   prominence=float(self.prominence_spin.value()),
+                  max_peaks=int(self.maxpeaks_spin.value()),
                   on_done=self._on_region_features, want_progress=True,
                   busy=f"Building feature list for {rg['name']}…")
 
@@ -1428,6 +1943,7 @@ class IonTabMixin:
                   float(self.minrel_spin.value()), self.ppm, self.reduce,
                   projection=self._projection(), mask=mask,
                   prominence=float(self.prominence_spin.value()),
+                  max_peaks=int(self.maxpeaks_spin.value()),
                   on_done=self._on_region_features, want_progress=True,
                   busy=f"Building feature list for {scope}…")
 
@@ -1532,6 +2048,10 @@ class IonTabMixin:
             self._sync_cmp_active(self.active_mz)
         if hasattr(self, "_sync_stats_active"):   # …and the ROI-stats ROC curve
             self._sync_stats_active(self.active_mz)
+        if (self._threshold_mode() and getattr(self, "roi_chk", None) is not None
+                and self.roi_chk.isChecked()):    # a live threshold follows the active feature
+            self._thr_cache = None
+            self._roi_spectrum()
         self._mark_dirty()                        # the active selection is restorable state
 
     def _on_escape(self):
@@ -1683,6 +2203,8 @@ class IonTabMixin:
             return
         self._displayed_mz = mz
         p = self._peak_for_mz(mz)
+        if self._park_ion_until_cache(mz, p):
+            return
         # A class composite renders the composite of its member ions (acts as one feature);
         # a normal feature renders its single ion image.
         img = (self._peak_image(p) if p is not None
@@ -1724,6 +2246,30 @@ class IonTabMixin:
         if strip is not None and strip.count() > 0:
             strip.setTabToolTip(0, f"Ion image — {detail}" if detail else "Ion image")
 
+    def _park_ion_until_cache(self, mz, p):
+        """While the fast cache is still building, an m/z with no extracted column would
+        stream every spectrum off disk *on the GUI thread* — minutes on a large slide, per
+        click. Park the render instead and let ``_on_fast_cache_ready`` redraw it from the
+        cube. Returns True when the render was parked."""
+        if not getattr(self, "_cube_building", False) or self.ds is None:
+            return False
+        ds, ppm, red = self.ds, self.ppm, self.reduce
+        if p is not None and p.get("is_class"):
+            needs = any(ds.ion_needs_disk_pass(self._apex_mz(m), ppm, red)
+                        for m in (p.get("members") or []))
+        elif p is not None:
+            needs = all(ds.ion_needs_disk_pass(m, ppm, red)
+                        for m in (self._apex_mz(p["mz"]), float(p["mz"])))
+        else:
+            needs = ds.ion_needs_disk_pass(float(mz), ppm, red)
+        if not needs:
+            return False
+        self._pending_ion_refresh = True
+        self.statusBar().showMessage(
+            f"m/z {mz:.4f} — the ion image appears when the fast cache finishes building "
+            "(drawing it now would read every spectrum off disk).")
+        return True
+
     def _peak_image(self, p):
         """Displayed image for a feature: a class composite renders the composite of its
         member ions (so a class behaves as one feature everywhere it's drawn); a normal
@@ -1733,8 +2279,14 @@ class IonTabMixin:
             return self.ds.composite_image(members, tol_ppm=self.ppm,
                                            reduce=self.reduce, norm=self.norm,
                                            weight=self.composite_weight)
-        return self.ds.ion_image(self._apex_mz(p["mz"]), tol_ppm=self.ppm,
-                                 reduce=self.reduce, norm=self.norm)
+        mz = self._apex_mz(p["mz"])
+        # Before the cube exists, an apex-snapped m/z that misses the extracted feature
+        # column would stream the whole slide off disk; the catalogued m/z's exact column
+        # (already extracted at this tolerance) is the right image until the cube is ready.
+        if (mz != float(p["mz"]) and self.ds.ion_needs_disk_pass(mz, self.ppm, self.reduce)
+                and not self.ds.ion_needs_disk_pass(float(p["mz"]), self.ppm, self.reduce)):
+            mz = float(p["mz"])
+        return self.ds.ion_image(mz, tol_ppm=self.ppm, reduce=self.reduce, norm=self.norm)
 
     def _windowed(self, img, lo, hi):
         """Normalize an ion image to [0,1] for display using the feature's

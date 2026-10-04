@@ -1,4 +1,6 @@
 """Tests for the spatial MSI engine: ingestion, imaging, analytics, annotation."""
+import os
+
 import numpy as np
 import pytest
 
@@ -2647,3 +2649,286 @@ def test_pixel_size_warning_flags_nonsquare_and_strided():
     strided = _grid_ds(range(0, 10, 2), range(4))
     strided.set_pixel_size(50)
     assert "step" in strided.pixel_size_warning()
+
+
+def _ragged_dataset(seed=7, n_px=300, n_peaks=40):
+    """Processed-mode (per-pixel m/z axis) data: exercises the searchsorted binning branch of
+    prime / max_spectrum / the cube builds, with repeated m/z within a pixel for collisions."""
+    from smile_msi.msi import MemoryStore
+    rng = np.random.RandomState(seed)
+    side = int(np.ceil(np.sqrt(n_px)))
+    coords = np.array([(x, y) for y in range(1, side + 1)
+                       for x in range(1, side + 1)])[:n_px]
+    mzs, ints = [], []
+    for _ in range(n_px):
+        mz = np.sort(rng.uniform(150.0, 900.0, n_peaks))
+        mz[1::2] = mz[::2][: len(mz[1::2])]         # pairs of equal m/z → bin collisions
+        mzs.append(np.sort(mz))
+        ints.append(np.abs(rng.rand(n_peaks)) * 1000.0)
+    return MemoryStore(coords, mzs, ints)
+
+
+class _DiskLikeStore(__import__("smile_msi.msi", fromlist=["SpectrumStore"]).SpectrumStore):
+    """Wrap a MemoryStore so the dataset treats it as disk-backed (not ``in_memory``)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.coordinates = inner.coordinates
+        self.polarity = getattr(inner, "polarity", "")
+        self.spec_mode = getattr(inner, "spec_mode", "")
+        self.pixel_size_um = None
+        self.pixel_size_y_um = None
+        self.in_memory = False
+        self.supports_parallel = False
+
+    def __len__(self):
+        return len(self._inner)
+
+    def get(self, i):
+        return self._inner.get(i)
+
+    def open_reader(self):
+        return None
+
+    def read_with(self, reader, i):
+        return self._inner.get(i)
+
+    def shared_axis(self):
+        return self._inner.shared_axis()
+
+    @property
+    def mz_bounds(self):
+        return self._inner.mz_bounds
+
+
+@pytest.mark.parametrize("max_ram_bytes", [1 << 11, 1 << 16, 1 << 24])
+def test_cube_streaming_build_bit_identical_ragged(tmp_path, max_ram_bytes):
+    """Same byte-identity contract as the shared-axis test, on processed-mode data (the
+    per-pixel searchsorted binning path) and across bucket / sub-band budgets."""
+    ref = MSIDataset(_ragged_dataset()); ref.prime()
+    ref.build_mz_cube(bin_ppm=200, min_intensity=5.0)
+    axis0, csc0, _ = ref._cube
+
+    d = MSIDataset(_ragged_dataset()); d.prime()
+    zp = str(tmp_path / f"rag_{max_ram_bytes}.cube.zarr")
+    store = d.build_mz_cube(bin_ppm=200, min_intensity=5.0, out_path=zp,
+                            fingerprint="rag", max_ram_bytes=max_ram_bytes)
+    full = store.column_slice(0, store.nbins)
+    assert np.array_equal(full.data, csc0.data)
+    assert np.array_equal(full.indices.astype(csc0.indices.dtype), csc0.indices)
+    assert np.array_equal(full.indptr.astype(csc0.indptr.dtype), csc0.indptr)
+    assert np.array_equal(store.colsum(),
+                          np.asarray(csc0.T @ np.ones(csc0.shape[0])).ravel())
+    for mz in [float(axis0[j]) for j in (10, len(axis0) // 2, len(axis0) - 3)]:
+        for red in ("sum", "mean", "max"):
+            assert np.array_equal(ref.ion_vector(mz, tol_ppm=400, reduce=red),
+                                  d.ion_vector(mz, tol_ppm=400, reduce=red)), (mz, red)
+    assert not [f for f in os.listdir(tmp_path) if f.startswith(".cube_spill")]
+    store.close()
+
+
+def test_prime_and_skyline_batched_match_per_pixel():
+    """The batched processed-mode accumulators equal a per-pixel reference: the skyline
+    exactly (max is order-free) and the mean to float rounding."""
+    from smile_msi.msi import _bin_edges
+    d = MSIDataset(_ragged_dataset(seed=3))
+    d.prime()
+    axis, mean = d._mean
+    edges = _bin_edges(axis)
+    acc = np.zeros(len(axis))
+    mx = np.zeros(len(axis))
+    tic = np.zeros(d.n_pixels)
+    for i in range(d.n_pixels):
+        mz, inten = d.store.get(i)
+        idx = np.searchsorted(edges, mz, side="right") - 1
+        ok = (idx >= 0) & (idx < len(axis))
+        acc += np.bincount(idx[ok], weights=inten[ok], minlength=len(axis))
+        tmp = np.zeros(len(axis))
+        np.maximum.at(tmp, idx[ok], inten[ok])
+        mx = np.maximum(mx, tmp)
+        tic[i] = inten.sum()
+    assert np.allclose(mean, acc / d.n_pixels, rtol=1e-12, atol=1e-9)
+    assert np.allclose(d._pix["tic"], tic)
+    assert np.array_equal(d.max_spectrum()[1], mx)
+    mask = np.zeros(d.n_pixels, dtype=bool); mask[::5] = True
+    sub = np.zeros(len(axis))
+    for i in np.flatnonzero(mask):
+        mz, inten = d.store.get(i)
+        idx = np.searchsorted(edges, mz, side="right") - 1
+        ok = (idx >= 0) & (idx < len(axis))
+        np.maximum.at(sub, idx[ok], inten[ok])
+    assert np.array_equal(d.max_spectrum(mask)[1], sub)
+
+
+def test_ion_and_skyline_disk_pass_predicates(tmp_path):
+    """ion_needs_disk_pass / skyline_needs_disk_pass say True only while an m/z (or the
+    skyline) would stream a disk-backed store: a feature column, a cube, an in-RAM store or
+    a cached streamed vector each turn it False."""
+    inner = _ragged_dataset(seed=11)
+    d = MSIDataset(_DiskLikeStore(inner))
+    d.prime()
+    mz0 = float(d.store.get(0)[0][3])
+    assert d.ion_needs_disk_pass(mz0, 50.0, "sum")
+    assert d.skyline_needs_disk_pass()
+    # an extracted feature column serves it without touching disk (same reduce only)
+    d.build_features([mz0], tol_ppm=50.0, reduce="sum")
+    assert not d.ion_needs_disk_pass(mz0, 50.0, "sum")
+    assert d.ion_needs_disk_pass(mz0, 50.0, "max")
+    assert d.ion_needs_disk_pass(mz0 * 1.01, 50.0, "sum")
+    # a streamed vector is cached, so the same request is free afterwards
+    d.ion_vector(mz0 * 1.01, tol_ppm=50.0, reduce="sum")
+    assert not d.ion_needs_disk_pass(mz0 * 1.01, 50.0, "sum")
+    # the cube serves any m/z and the skyline
+    d.build_mz_cube(bin_ppm=200, min_intensity=0.0)
+    assert not d.ion_needs_disk_pass(mz0 * 1.02, 50.0, "sum")
+    assert not d.skyline_needs_disk_pass()
+    # in-RAM stores never need a pass
+    m = MSIDataset(inner); m.prime()
+    assert not m.ion_needs_disk_pass(mz0, 50.0, "sum")
+    assert not m.skyline_needs_disk_pass()
+
+
+def test_mz_range_computed_once_and_parallel():
+    """Processed-mode bounds cost a pass over every spectrum: the dataset computes them once
+    (through the parallel reader) and the store remembers them, so the log-axis builds,
+    cube estimate and fingerprint never re-read the slide."""
+    inner = _ragged_dataset(seed=5, n_px=1200)   # ≥ 1024 so the parallel path engages
+    store = _DiskLikeStore(inner)
+    reads = {"n": 0}
+    orig = store.read_with
+
+    def counting_read(reader, i):
+        reads["n"] += 1
+        return orig(reader, i)
+    store.read_with = counting_read
+    store.get = lambda i: counting_read(None, i)
+    store.supports_parallel = True
+    d = MSIDataset(store)
+    lo, hi = d.mz_range
+    assert reads["n"] == d.n_pixels
+    ref_lo = min(float(inner.get(i)[0].min()) for i in range(d.n_pixels))
+    ref_hi = max(float(inner.get(i)[0].max()) for i in range(d.n_pixels))
+    assert (lo, hi) == (ref_lo, ref_hi)
+    d.mz_range; d._log_axis(10.0); d.estimate_cube_bytes()
+    assert reads["n"] == d.n_pixels + 64          # only the estimate's 64 sample reads
+    assert store.mz_bounds() == (lo, hi)          # handed back to the store
+    # a second dataset over the same store reuses the store's memo (no pass at all)
+    reads["n"] = 0
+    assert MSIDataset(store).mz_range == (lo, hi) and reads["n"] == 0
+
+
+def test_parse_cache_amend_round_trips_mz_bounds(tmp_path):
+    """amend_parse_cache adds arrays to a valid sidecar (and refuses a stale one); the loader
+    surfaces them, so a reopened ImzMLStore starts with its bounds known."""
+    from smile_msi import session
+    imz = tmp_path / "s.imzML"; ibd = tmp_path / "s.ibd"
+    imz.write_bytes(b"<xml/>"); ibd.write_bytes(b"\x00" * 64)
+    assert session.save_parse_cache(str(imz), mz_offsets=[16], mz_lengths=[2], int_offsets=[32],
+                                    int_lengths=[2], mz_precision="d", int_precision="f",
+                                    coordinates=[(1, 1)], polarity="negative", spec_mode="centroid")
+    assert session.load_parse_cache(str(imz))["mz_bounds"] is None
+    assert session.amend_parse_cache(str(imz), mz_bounds=np.array([200.5, 1999.25]))
+    got = session.load_parse_cache(str(imz))
+    assert got["mz_bounds"].tolist() == [200.5, 1999.25] and got["mz_lengths"].tolist() == [2]
+    ibd.write_bytes(b"\x00" * 65)                   # re-exported file → sidecar is stale
+    assert session.amend_parse_cache(str(imz), mz_bounds=np.array([1.0, 2.0])) is None
+    assert session.load_parse_cache(str(imz)) is None
+
+
+def test_on_pass_reports_every_whole_slide_read():
+    """Every bulk read of the store lands on the on_pass hook with a label, its wall time
+    and the number of spectra it touched — the perf-log record of GUI-thread freezes."""
+    d = MSIDataset(_DiskLikeStore(_ragged_dataset(seed=9, n_px=1200)))
+    seen = []
+    d.on_pass = lambda label, secs, n: seen.append((label, n, secs >= 0))
+    d.prime()
+    d.max_spectrum()
+    mask = np.zeros(d.n_pixels, dtype=bool); mask[:10] = True
+    d.mean_spectrum(mask)
+    d.build_features([float(d.store.get(0)[0][2])], tol_ppm=50.0)
+    d.ion_vector(float(d.store.get(1)[0][5]) * 1.001, tol_ppm=50.0)
+    d.build_mz_cube(bin_ppm=200)
+    labels = [s[0] for s in seen]
+    assert labels[0] == "m/z bounds" and seen[0][1] == d.n_pixels          # prime's axis needs it
+    assert "prime (mean spectrum + pixel stats)" in labels
+    assert "skyline (max spectrum)" in labels
+    assert ("ROI mean spectrum (streamed)", 10, True) in seen
+    assert "extract 1 feature(s)" in labels
+    assert any(lab.startswith("ion image m/z") and lab.endswith("(streamed, no cube)") for lab in labels)
+    assert "cube build (in RAM)" in labels
+    assert all(ok for _, _, ok in seen)
+
+
+@pytest.mark.parametrize("max_ram_bytes", [1 << 11, 1 << 22])
+def test_cube_streaming_build_multichunk_stays_in_pixel_order(tmp_path, max_ram_bytes):
+    """With more entries than one chunk holds, pass 1 bins chunks on a pool but must commit
+    them in pixel order — the streamed cube still equals the in-RAM build byte for byte, and
+    pass 1 / pass 2 each report through on_pass."""
+    ref = MSIDataset(_ragged_dataset(seed=13, n_px=3000, n_peaks=40)); ref.prime()
+    ref.build_mz_cube(bin_ppm=200, min_intensity=1.0)
+    _, csc0, _ = ref._cube
+    d = MSIDataset(_ragged_dataset(seed=13, n_px=3000, n_peaks=40)); d.prime()
+    seen = []
+    d.on_pass = lambda label, secs, n: seen.append(label)
+    store = d.build_mz_cube(bin_ppm=200, min_intensity=1.0, fingerprint="mc",
+                            out_path=str(tmp_path / f"mc_{max_ram_bytes}.cube.zarr"),
+                            max_ram_bytes=max_ram_bytes)
+    full = store.column_slice(0, store.nbins)
+    assert np.array_equal(full.data, csc0.data)
+    assert np.array_equal(full.indices.astype(csc0.indices.dtype), csc0.indices)
+    assert np.array_equal(full.indptr.astype(csc0.indptr.dtype), csc0.indptr)
+    assert "cube build pass 1 (bin + spill)" in seen and "cube build pass 2 (sort + write)" in seen
+    store.close()
+
+
+@pytest.mark.parametrize("ragged", [True, False])
+def test_cube_build_with_prime_fused_matches_separate_prime(tmp_path, ragged):
+    """build_mz_cube(prime=True) yields prime()'s mean spectrum and pixel stats from the same
+    read — in RAM and streamed — and stores them in the sidecar; a later prime() is a no-op."""
+    make = (lambda: _ragged_dataset(seed=21, n_px=1500)) if ragged else _streaming_build_dataset
+    ref = MSIDataset(make()); ref.prime()
+    for streamed in (False, True):
+        d = MSIDataset(make())
+        seen = []
+        d.on_pass = lambda label, secs, n: seen.append(label)
+        kw = dict(out_path=str(tmp_path / f"f_{ragged}_{streamed}.cube.zarr"),
+                  fingerprint="fp", max_ram_bytes=1 << 16) if streamed else {}
+        store = d.build_mz_cube(bin_ppm=200, min_intensity=0.0, prime=True, **kw)
+        assert any(lab.endswith("+ prime") for lab in seen), seen
+        assert d._mean is not None and d._pix is not None
+        assert np.array_equal(d._mean[0], ref._mean[0])
+        assert np.allclose(d._mean[1], ref._mean[1], rtol=1e-10, atol=1e-8)
+        for k in ("tic", "rms", "median"):
+            assert np.allclose(d._pix[k], ref._pix[k]), k
+        n_before = len(seen)
+        d.prime()
+        assert len(seen) == n_before                      # nothing to re-read
+        if streamed:
+            mean, pix = store.stored_extras()
+            assert np.allclose(mean[1], ref._mean[1]) and np.allclose(pix["tic"], ref._pix["tic"])
+            store.close()
+
+
+def test_cube_streaming_rebuild_over_the_open_store_at_the_same_path(tmp_path):
+    """Rebuilding into the sidecar that is currently open (preprocessing change, manual
+    rebuild) releases the old handle before the atomic replace and leaves a working store."""
+    d = MSIDataset(_ragged_dataset(seed=22, n_px=1200)); d.prime()
+    zp = str(tmp_path / "same.cube.zarr")
+    first = d.build_mz_cube(bin_ppm=200, out_path=zp, fingerprint="a", max_ram_bytes=1 << 16)
+    assert isinstance(first, CubeStore) and first.path == zp
+    mz = float(first.axis[len(first.axis) // 2])
+    v1 = d.ion_vector(mz, tol_ppm=400)
+    second = d.build_mz_cube(bin_ppm=200, out_path=zp, fingerprint="a", max_ram_bytes=1 << 16)
+    assert second is d._cube and second is not first
+    assert np.array_equal(d.ion_vector(mz, tol_ppm=400), v1)
+    second.close()
+
+
+def test_set_preprocessing_keeps_its_config():
+    from smile_msi import preprocess
+    d = MSIDataset(_ragged_dataset(seed=2, n_px=50))
+    cfg = {"recalibrate": {"refs": [500.0], "tol_ppm": 100.0}}
+    d.set_preprocessing(preprocess.build_pipeline(cfg), config=cfg)
+    assert d.preprocessing == cfg and d.transforms
+    d.set_preprocessing([], config=cfg)              # no transforms → no config either
+    assert d.preprocessing is None and not d.transforms

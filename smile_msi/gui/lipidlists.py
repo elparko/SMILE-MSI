@@ -10,15 +10,16 @@ lists) and persists in the session — but loading one does two extra things:
 * the per-feature **color overlay** switches on, so the classes paint straight onto the tissue —
   each class a different colour on the nerve.
 
-Lists are created from the Lipid-class comparison screen ('Save as lipid list…') and edited
-(recolour / rename / delete) from the Features ⋯ menu → 'Lipid lists…'.
+Lists are created from the Features ⋯ menu → 'New lipid list from identified features…' (the
+visible features' identified ions, grouped by class) and edited (recolour / rename / delete)
+from the same menu → 'Lipid lists…'.
 """
 from __future__ import annotations
 
 import pyqtgraph as pg
 from PySide6 import QtGui, QtWidgets
 
-from .common import REGION_PALETTE, icon
+from .common import REGION_PALETTE, icon, install_table_export
 
 
 class LipidListMixin:
@@ -74,6 +75,27 @@ class LipidListMixin:
             f"Saved lipid list '{nm}' — {len(order)} classes, {n_ions} ions. "
             "Pick it in the Feature set selector to paint the classes on the tissue.")
         return nm
+
+    def _new_lipid_list_from_features(self):
+        """Group the visible features' identified ions by lipid class and save them as a
+        lipid list. A class composite (from a loaded lipid list) keeps its class and members."""
+        by_class = {}
+        for p in self._visible_peaks():
+            if p.get("is_class"):
+                mzs, cls = p.get("members") or [], p.get("lipid_class")
+                by_class.setdefault(cls, []).extend(float(m) for m in mzs)
+                continue
+            mz = float(p["mz"])
+            cls = p.get("lipid_class") or self.ann.class_of(mz)
+            if cls:
+                by_class.setdefault(cls, []).append(mz)
+        if not by_class:
+            self.statusBar().showMessage("None of the visible features is identified as a lipid "
+                                         "— run Identify lipids first.")
+            return None
+        base = (getattr(self, "_active_feature_scope", None)
+                or getattr(self, "_flist_name", None) or "Features").lstrip("★◆ ").strip()
+        return self.save_lipid_list(by_class, suggested=f"{base} classes")
 
     # ----- load → class-coloured overlay ------------------------------------ #
     def _class_composite_peak(self, cls, mzs, color):
@@ -164,8 +186,8 @@ class LipidListMixin:
     # ----- manage (rename / delete / recolour) ------------------------------ #
     def _manage_lipid_lists(self):
         if not self._lipid_lists:
-            self.statusBar().showMessage("No lipid lists yet — save one from the Lipid classes "
-                                         "screen (Stats tab → Lipid classes…).")
+            self.statusBar().showMessage("No lipid lists yet — make one from the Features ⋯ menu "
+                                         "→ New lipid list from identified features…")
             return
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Lipid lists")
@@ -181,6 +203,7 @@ class LipidListMixin:
         table.setHorizontalHeaderLabels(["class", "colour", "ions"])
         table.horizontalHeader().setStretchLastSection(True)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        install_table_export(table, dlg, stem="lipid_list", title="Export lipid list")
         right.addWidget(table, 1)
         btns = QtWidgets.QHBoxLayout()
         b_open = QtWidgets.QPushButton("Open on tissue")

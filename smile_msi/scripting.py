@@ -80,6 +80,7 @@ class ScriptAPI:
         "roi_localization", "region_membership", "colocalize", "coloc_modules",
         "pca", "nmf", "plsda", "embedding", "annotate", "run",
         "region", "group", "region_names", "group_names",
+        "composite", "threshold_mask", "ring", "invert", "add_region",
     )
 
     def __init__(self, ds, *, ppm: float = 10.0, norm: str = "tic", reduce: str = "sum",
@@ -95,6 +96,7 @@ class ScriptAPI:
         self.active_mz = (float(active_mz) if active_mz is not None else None)
         self.segmentation = None                    # last segment() result
         self.last_peaks = []                        # last find_*() peak dicts (for "apply to app")
+        self.new_regions = []                       # add_region() stagings: {name, mask, color}
         self._result = None                         # set by run_script for log routing
 
     # ---- logging -------------------------------------------------------- #
@@ -214,6 +216,68 @@ class ScriptAPI:
         """Names of the groups (A/B/…) tagged on this slide's ROIs."""
         return sorted(self.groups)
 
+    # ---- regions by construction ---------------------------------------- #
+    def composite(self, features, weight: str = "raw"):
+        """Per-pixel summed intensity of several m/z (a lipid class, the sulfatides, …)."""
+        mzs = _mz_list(features)
+        if not mzs:
+            raise ScriptError("composite() needs at least one m/z.")
+        return self.ds.composite_vector(mzs, tol_ppm=self.ppm, reduce=self.reduce,
+                                        norm=self.norm, weight=weight)
+
+    def threshold_mask(self, values, cut, percentile: bool = True, fill_holes: bool = True,
+                       min_pixels: int = 0):
+        """Mask of pixels where a signal (per-pixel vector, or one m/z) reaches ``cut``.
+        ``cut`` is a percentile of the signal pixels by default (``percentile=False`` makes it
+        an absolute intensity); holes are filled and islands under ``min_pixels`` dropped."""
+        from . import spatial
+        v = self.ion_vector(float(values)) if np.ndim(values) == 0 else np.asarray(values, float)
+        if v.shape[0] != self.ds.n_pixels:
+            raise ScriptError(f"threshold_mask() wants one value per pixel ({self.ds.n_pixels}), "
+                              f"got {v.shape[0]}.")
+        return spatial.threshold_mask(self.ds, v, cut, percentile=percentile,
+                                      fill_holes=fill_holes, min_pixels=min_pixels)
+
+    def ring(self, mask, width_px=None, width_um=None, mode: str = "outer"):
+        """A rim (inner) / collar (outer) / band of the given width around a mask's boundary.
+        Euclidean distance transform on the tissue grid; ``width_um`` needs the slide's
+        pixel size, ``width_px`` always works."""
+        from . import spatial
+        if width_px is None:
+            if width_um is None:
+                raise ScriptError("ring() needs width_px= or width_um=.")
+            px = getattr(self.ds, "pixel_size_um", None)
+            if not px:
+                raise ScriptError("this slide records no pixel size — pass width_px= instead.")
+            width_px = float(width_um) / float(px)
+        if mode not in ("inner", "outer", "band"):
+            raise ScriptError("ring() mode must be 'inner', 'outer' or 'band'.")
+        m = self._mask(mask)
+        if m is None:
+            raise ScriptError("ring() needs a mask or region name.")
+        return spatial.ring_mask(self.ds, m, float(width_px), mode=mode)
+
+    def invert(self, mask):
+        """Every acquired pixel NOT in ``mask`` (the 'everything else' region)."""
+        from . import spatial
+        m = self._mask(mask)
+        if m is None:
+            raise ScriptError("invert() needs a mask or region name.")
+        return spatial.invert_mask(self.ds, m)
+
+    def add_region(self, name, mask, color=None):
+        """Stage a named region from a mask (usable by name from here on; pushable into the app).
+        The console's Apply to app ▸ Add regions to the slide creates the staged regions."""
+        m = self._mask(mask)
+        if m is None or not m.any():
+            raise ScriptError(f"region {name!r} has no pixels.")
+        name = str(name)
+        self.masks[name] = m
+        self.new_regions = [r for r in self.new_regions if r["name"] != name]
+        self.new_regions.append({"name": name, "mask": m, "color": color})
+        self._log(f"add_region {name!r} → {int(m.sum()):,} px")
+        return m
+
     # ---- raw signal ----------------------------------------------------- #
     def mean_spectrum(self, mask=None):
         """``(mz_axis, intensities)`` mean spectrum over the whole slide or a region/mask."""
@@ -243,27 +307,94 @@ class ScriptAPI:
         return list(self.features)
 
     def find_peaks(self, snr: float = 3.0, min_rel_intensity: float = 0.0,
-                   max_peaks: int = 500, prominence: float = 1.0, mask=None):
-        """Detect peaks in the mean spectrum → set + return the working feature set."""
+                   max_peaks: int = 0, prominence: float = 1.0, mask=None):
+        """Detect peaks in the mean spectrum → set + return the working feature set.
+        ``max_peaks=0`` (the default) keeps every peak that clears the gates; the result's
+        ``.n_detected`` reports the count before any cap."""
         peaks = self._run_step("find_peaks", {"mask": self._mask(mask)},
                                dict(snr=snr, min_rel_intensity=min_rel_intensity,
                                     max_peaks=max_peaks, prominence=prominence))
         self.features = _mz_list(peaks)
         self.last_peaks = list(peaks)
-        self._log(f"find_peaks → {len(peaks)} peaks")
+        n_det = int(getattr(peaks, "n_detected", len(peaks)))
+        capped = f" (capped from {n_det} detected)" if n_det > len(peaks) else ""
+        self._log(f"find_peaks → {len(peaks)} peaks{capped}")
         return peaks
 
     def find_spatial_features(self, snr: float = 3.0, min_rel_intensity: float = 0.0,
-                              min_frequency: float = 0.0, min_morans: float = 0.0, mask=None):
-        """Spatially-aware peak detection (S/N → reproducibility → Moran's I) → working set."""
+                              min_frequency: float = 0.0, min_morans: float = 0.0, mask=None,
+                              max_candidates: int = 2000):
+        """Spatially-aware peak detection (S/N → reproducibility → Moran's I) → working set.
+        ``max_candidates=0`` lifts the candidate-pool cap (one Moran's I pass per extra
+        candidate); ``.candidates_capped`` says whether the cap bound."""
         res = self._run_step("find_spatial_features", {"mask": self._mask(mask)},
                              dict(snr=snr, min_rel_intensity=min_rel_intensity,
                                   min_frequency=min_frequency, min_morans=min_morans,
+                                  max_candidates=max_candidates,
                                   tol_ppm=self.ppm, norm=self.norm))
         self.features = [float(p["mz"]) for p in res.peaks]
         self.last_peaks = list(res.peaks)
-        self._log(f"find_spatial_features → {len(res.peaks)} of {res.n_candidates} candidates")
+        capped = f" (capped from {res.n_detected} detected)" if res.candidates_capped else ""
+        self._log(f"find_spatial_features → {len(res.peaks)} of "
+                  f"{res.n_candidates} candidates{capped}")
         return res
+
+    # ---- mass calibration ----------------------------------------------- #
+    def measure_calibration(self, region=None, mode: str = "negative", tol_ppm: float = 30.0):
+        """Measure the absolute m/z offset against known anchor ions. ``region`` (name, bool
+        mask or pixel-index list) measures one region instead of the whole slide — samples in
+        different embedding media drift by different amounts, and a slide-wide number is the
+        average of those populations. Returns the :func:`intake.measure_calibration_offset`
+        dict."""
+        from . import intake
+        res = intake.measure_calibration_offset(self.ds, mode=mode, tol_ppm=tol_ppm,
+                                                mask=self._mask(region))
+        where = region if isinstance(region, str) else ("whole slide" if region is None
+                                                        else "region")
+        self._log(f"measure_calibration[{where}] → median {res['median_ppm']:+.2f} ppm "
+                  f"(n={res['n']}, slope {res['slope_ppm_per_da']:+.3f} ppm/Da)")
+        return res
+
+    def calibrate_regions(self, regions=None, mode: str = "negative", tol_ppm: float = 30.0):
+        """Measure every named region separately and apply a **per-region** lock-mass
+        recalibration to the dataset. ``regions`` defaults to every region the script can
+        see. Pixels in no region are left uncorrected. The correction is axis-preserving, so
+        all pixels stay on one shared m/z axis. Returns ``{region: measurement}``."""
+        from . import intake
+        from . import preprocess as pp
+        # names only: the config is persisted and re-resolved by name on reopen, so a raw
+        # mask array has nothing to resolve back to
+        names = [str(n) for n in (regions or self.masks)]
+        if not names:
+            raise ScriptError("no regions to calibrate — draw or load regions first.")
+        from .provenance import mask_fingerprint
+        out, specs = {}, []
+        for n in names:
+            m = self._mask(n)
+            res = intake.measure_calibration_offset(self.ds, mode=mode, tol_ppm=tol_ppm, mask=m)
+            out[n] = res
+            if res["anchors"]:
+                # the window must exceed this region's own offset so recalibrate locks onto
+                # the right apex
+                specs.append((n, m, [round(float(a["ref_mz"]), 4) for a in res["anchors"]],
+                              round(abs(float(res["max_abs_ppm"])) * 3.0 + 10.0, 2)))
+        if not specs:
+            raise ScriptError("no anchor ions matched in any region — check mode/polarity.")
+        # merge into the pipeline already on the slide — a session's baseline / smoothing /
+        # normalization must survive adding a calibration, not be replaced by it
+        cfg = dict(self.ds.preprocessing or {})
+        rc = dict(cfg.get("recalibrate") or {})
+        rc.setdefault("refs", [])
+        rc.setdefault("tol_ppm", 200.0)
+        rc["n_pixels"] = int(self.ds.n_pixels)
+        rc["regions"] = [{"name": n, "refs": r, "tol_ppm": t, "mask_sha1": mask_fingerprint(m)}
+                         for n, m, r, t in specs]
+        cfg["recalibrate"] = rc
+        self.ds.set_preprocessing(
+            pp.build_pipeline(cfg, masks={n: m for n, m, _, _ in specs}), config=cfg)
+        self._log("calibrate_regions → " + ", ".join(
+            f"{n} {out[n]['median_ppm']:+.2f} ppm" for n in names if out[n]["n"]))
+        return out
 
     # ---- segmentation --------------------------------------------------- #
     def segment(self, features=None, n_clusters: int = 0, spatial: bool = True,
@@ -528,6 +659,7 @@ class ScriptResult:
     features: list = field(default_factory=list)
     peaks: list = field(default_factory=list)        # last find_*() peak dicts (apply-to-app)
     segmentation: object = None
+    regions: list = field(default_factory=list)      # add_region() stagings (apply-to-app)
 
     @property
     def ok(self) -> bool:
@@ -545,6 +677,8 @@ class ScriptResult:
             bits.append(f"{len(self.values)} value(s)")
         if self.features:
             bits.append(f"{len(self.features)} features")
+        if self.regions:
+            bits.append(f"{len(self.regions)} region(s)")
         return ", ".join(bits) or "ran (no output surfaced)"
 
 
@@ -621,6 +755,7 @@ def run_script(code: str, api: ScriptAPI, *, extra_globals: dict | None = None,
         result.features = list(api.features)
         result.peaks = list(api.last_peaks)
         result.segmentation = api.segmentation
+        result.regions = list(api.new_regions)
     return result
 
 
@@ -747,6 +882,20 @@ find_peaks(snr=5)
 ranked = colocalize(target_mz=active_mz or 888.62, method="pearson")
 table(ranked[:25], "Most co-localized")
 ''',
+    "Compartments by construction (endo → peri → epi)": '''\
+# Nerve compartments from the signal, not by eye: endoneurium = where the sulfatides
+# are (60th percentile of signal pixels, holes filled); perineurium = a collar grown
+# outside it; epineurium = every other acquired pixel. Then test across the three.
+find_peaks(snr=5)
+sulf = [885.5499, 888.6236]
+endo = threshold_mask(composite(sulf), 60)
+peri = ring(endo, width_px=6, mode="outer")      # 6 px = 30 µm on a 5 µm slide; or width_um=30
+epi = invert(endo | peri)
+add_region("endo", endo); add_region("peri", peri); add_region("epi", epi)
+log(f"endo {int(endo.sum())} px · peri {int(peri.sum())} px · epi {int(epi.sum())} px")
+table(multigroup(groups={"endo": endo, "peri": peri, "epi": epi}), "KW across compartments")
+# Apply to app ▸ Add regions to the slide pushes the three in as named regions.
+''',
 }
 
 
@@ -840,6 +989,11 @@ def capabilities_doc(api: ScriptAPI | None = None) -> str:
         "steps fall back to the latest `segment()` clusters.",
         "- **ppm / norm / reduce** are the extraction defaults; set `api.ppm = 5`, "
         "`api.norm = 'rms'` etc. once at the top to change them for the whole script.",
+        "- **Regions by construction** — build masks from the signal instead of drawing: "
+        "`threshold_mask(composite([...m/z...]), 60)` (60th percentile of signal pixels, holes "
+        "filled), `ring(mask, width_px=6, mode='outer')` (a collar outside it), `invert(mask)` "
+        "(everything else). `add_region('name', mask)` stages a region the console can push "
+        "into the app (Apply to app ▸ Add regions to the slide) and makes it usable by name.",
         "",
         "## Analysis functions (bare names)",
         _api_reference(),

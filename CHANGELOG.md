@@ -6,10 +6,186 @@ All notable changes to SMILE MSI. Format loosely follows
 ## [Unreleased]
 
 ### Added
-
-### Changed
+- **Copying a table copies the table.** Qt gives a grid no copy of its own, so ⌘C over a result
+  table left the clipboard holding whatever was there before, and the one right-click *Copy* that
+  existed sent the selected cells only — click a row, press copy, get one number. ⌘C / Ctrl+C now
+  works over **any** table, tree or list in the app and copies the whole visible grid as **CSV
+  with a header row**, in the order you are looking at (a sorted table copies sorted; filtered-out
+  and hidden rows and columns stay out). Select two or more rows and only those are copied.
+  Checkbox-only columns — the segmentation ✓, the standards *Use* tick — copy as `yes`/`no`
+  instead of an empty column. Excel pastes comma-separated text into one column, so there is also
+  a **Copy for Excel (tab-separated)** that lands in real cells. Every table gained a right-click
+  **Copy table (CSV)** / **Copy selected rows** / **Copy for Excel**,
+  including the ones that previously had no way out at all: the calibration check, the timeline,
+  the report-book table preview, the cohort roster, the lipid tree, the segment table, the
+  feature-lists manager, the shared-cluster table, the co-localization pairs, the cache list and
+  the nested lipid-class test. The status bar says how many rows and columns went.
+- **Calibrate each region separately.** Samples in different embedding media on one slide
+  drift by different amounts, and a single slide-wide lock mass fits the average of those
+  populations and leaves every one of them mis-assigned. Data ▸ Calibration check gained a
+  **Measure over** picker: whole slide, one region, or every region separately. Measuring per
+  region reports each region's offset and the **spread between them** — the number that says
+  whether one slide-wide correction can work at all — and Apply gives each region its own
+  lock mass, with its own tolerance window sized to its own drift. The correction stays
+  axis-preserving, so all pixels keep one shared m/z axis and regions remain comparable bin
+  for bin; pixels in no region fall back to the slide-wide reference m/z. The banner reports
+  the **worst** region, never the best. Saved in the session and re-applied on reopen, with
+  each region's mask fingerprint in the preprocessing hash so redrawing a region invalidates
+  the fast cube instead of silently reusing the old pixel assignment. Scripting:
+  `api.measure_calibration(region=…)` and `api.calibrate_regions()`
+  (`preprocess.recalibrate_regions`, `intake.measure_calibration_offset(mask=…)`).
 
 ### Fixed
+- **Ticking a feature list in the Export Studio no longer hangs the app.** Ticking a list's parent
+  row cascades `itemChanged` over every ion under it, and both listeners — the All/None/Invert
+  bar's live count and the dialog's `n sections × n ions` recount — walked the whole tree on every
+  one of those signals. That is O(N²): measured 0.3 s for a 200-ion list, 7.8 s for 1000 and 70 s
+  for 3000, which is why removing the 500-peak cap turned it into an apparent freeze. The recount
+  is now coalesced (`common.coalesce`) — it runs once at the start of a cascade and once when the
+  event loop next idles, never once per ion. Ticking a 3000-ion list went from ~70 s to **0.18 s**,
+  with the same final count. Every All/None/Invert bar in the app (Export hub, co-localization,
+  feature export, cohort add-samples/regions, cohort segmentation, find-peaks regions) shares the
+  fix.
+- **Exporting a table from a dialog no longer crashes after writing the file.** The result-table
+  `⤓ CSV` button and the Analysis-script console passed their own widget as the export parent, and
+  the status-bar report at the end of the write raised `AttributeError: statusBar` on a completed
+  export. The export now finds the nearest window that owns a status bar, which also restores the
+  `# …` provenance header block on exports launched from a dialog.
+- **Feature lists no longer stop at a hidden cap of 500.** `pick_peaks` truncated to the 500
+  most intense peaks with no control anywhere in the app and no record of what was cut, so
+  three regions that detect 511, 670 and 636 peaks all reported 500 — which reads as the
+  media agreeing when it is only the ceiling. Max peaks is now a visible setting defaulting
+  to **no limit**, the spatial finder's candidate cap (2000) is visible too, and both the
+  status bar and the audit trail report the pre-cap detection count and say when a cap bound.
+  `pick_peaks` returns a `PeakList` carrying `.n_detected`; `SpatialFeatures` /
+  `CoherentFeatures` carry `.n_detected` and `.candidates_capped`.
+- The MCP `find_peaks` tool raised `TypeError: 'SpatialFeatures' object is not iterable` with
+  `spatial=True`, and took no region argument. It now accepts `region=`, returns the funnel
+  counts and `n_detected`, and defaults to no cap.
+- **An AI assistant can drive the engine** — `python -m smile_msi.mcpserver` is a Model
+  Context Protocol (MCP) server exposing 15 tools over the *same* registry steps the app
+  runs: list the slides you have analysed, read the regions, groups, feature lists and past
+  results on one, open a slide, pick peaks, run any registered analysis, render an ion image
+  or a mean spectrum, identify lipids, run a full analysis script, and export the wide
+  feature table. It reads the app's saved sessions and never writes to them — tables and
+  figures go to `~/.smile-msi/mcp-results` and the tool returns the path. Tables come back as
+  a short preview plus that path, so a 700-ion result costs one glance rather than a context
+  window. A project `.mcp.json` is committed; the SDK is the optional `[mcp]` extra and stays
+  out of the frozen app (`mcpserver.py`, `tests/test_mcpserver.py`).
+- **Reopen a saved session without the GUI** (`headless.py`) — the app's live state, rebuilt
+  from the session file: `open_slide("nerve-01.imzML")` returns the dataset with its
+  preprocessing re-applied, the fast cube restored from the sidecar, every named region
+  resolved to pixels (drawn ROIs, cluster-backed regions, aggregate parents, and the
+  region↔slide tie honoured) and the group tags turned into the masks a comparison runs on —
+  bound to the same `ScriptAPI` the in-app Script Console builds. `managed_sessions()` /
+  `session_summary()` answer "what have I worked on and what did it find" from JSON alone,
+  with no dataset opened. Extracted from the GUI load path, which keeps its own copy for now
+  (`tests/test_headless.py`).
+- **Regions by construction** (plan 25): the Draw-ROI bar is a small builder. The shape picker
+  gained two sources — **Threshold (signal)** (the active feature, a lipid class, or a sum of
+  features cut at a percentile of its signal pixels, holes filled, islands dropped, painted live)
+  and **Existing region** — and the hidden Border popup became a visible **Refine** pill (inner
+  rim / outer collar / band with the width in px *and* µm, plus **Everything else**) with a
+  **Save as region** button that pre-fills the name from the build. **Compartments…** runs the
+  nerve recipe in one dialog (threshold → endoneurium, outer collar → perineurium, everything
+  else → epineurium) with an RGB preview and creates the three as grouped regions. The Regions
+  panel's context menu gained **Derive ▸** (rim / collar / band / everything else / fill holes),
+  nested under the source. Engine: `spatial.threshold_mask` / `fill_holes` / `drop_small` /
+  `invert_mask`; script console: `composite`, `threshold_mask`, `ring`, `invert`, `add_region`
+  and *Apply to app ▸ Add regions to the slide*; a `region_derive` provenance step records the
+  recipe (`gui/ion.py`, `gui/compartments.py`, `gui/segment.py`, `scripting.py`, `spatial.py`).
+- **Calibration is now a visible, saved state** (`gui/main.py` calibration dialog,
+  `featurepanel.py` banner, `session.py`). *Apply lock-mass recalibration* used to fill the
+  Preprocessing field, re-prime and re-measure with nothing that said "applied". The dialog
+  now shows a state line (*Applying…* → *✓ Calibrated — ×factor from N anchors; residual
+  +0.3 ppm, was −3.3 ppm, verified 14:24*), the Apply button turns into a disabled *Applied ✓*,
+  the dataset banner in the right dock reads *✓ calibrated (lock-mass, residual …)* or
+  *not calibrated*, and the status bar confirms the verified residual. The verify pass now
+  runs when the re-prime finishes instead of being queued beside it. Clearing the reference
+  m/z and applying drops the state.
+- **The preprocessing pipeline is saved with the session and re-applied on reopen**
+  (`build_session(preprocessing=…, calibration=…)`, `_prepare_imzml`). Before, a reopened
+  slide silently ran on raw spectra while the panel still showed the lock-mass values. The
+  pipeline is applied in the load worker before any pass, the panel widgets are restored
+  from it, and the cube sidecar is keyed by slide fingerprint **plus** pipeline hash so a
+  raw-spectra cube is never served to a recalibrated session (it rebuilds instead).
+- **Data ▸ Manage caches…** (`gui/cachedialog.py`, `session.cache_inventory`) — lists every
+  session, cube, legacy npz cube, run store, thumbnail folder and interrupted-build leftover in
+  the managed store with its size and status, marks what is safe to delete (orphaned companions,
+  older-fingerprint duplicates of the same slide, npz cubes already superseded by a Zarr cube,
+  temporary files) and deletes the selection. *Change folder…* moves the whole store to another
+  disk through a redirect file (`library.set_home_redirect`; `$SMILE_MSI_HOME` still wins when
+  set), for machines whose system disk is nearly full.
+- **Every whole-slide read is now in the perf log** (`MSIDataset.on_pass`, `PASS` lines in
+  `~/smile_msi_perf.log`, shown in Help ▸ Show timeline…). Prime, the m/z bounds pass, skyline,
+  ROI spectra without a cube, feature extraction, streamed ion images and both cube-build passes
+  report their wall time and spectra count, flagged `GUI THREAD` when they ran on the event
+  thread — the freezes that used to leave no trace.
+- **Moved slides are found without asking** (`cohort.find_moved_source`) when a session's imzML
+  is no longer at its recorded path: the unique same-named file (with its `.ibd`) in any folder
+  this machine already reads slides from — roster samples, managed sessions, past manual
+  relocations — is used, and the session JSON and roster entries are repointed. The manual
+  *Locate dataset* prompt remains the fallback.
+
+### Changed
+- **A disk-backed slide is read once on open, not twice** (`MSIDataset.build_mz_cube(prime=True)`,
+  `gui/main.py` `_prepare_imzml`). Prime (mean spectrum, per-pixel TIC/RMS/median) is folded
+  into cube pass 1 for slides that do not fit in RAM, and the load bar now covers the whole
+  build; the background cube build after first paint is gone for them. The same fused pass
+  serves *Apply preprocessing*, which used to re-prime and then rebuild the cube in two reads
+  (and, until now, only rebuilt it on the next ROI click).
+- **Cube bins stay at 15 ppm across the full range and no peak is dropped** (`FULL_CUBE_MAX_BINS`,
+  `_build_cube`). The app's cube builds pass a 200,000-bin cap (the library default of 60,000
+  widened bins to ~38 ppm over 200–2000 m/z, so a 10 ppm window really integrated ±19–38 ppm)
+  and no intensity floor (the old 0.1 %-of-mean-max floor removed ~2 % of peaks). Existing cube
+  sidecars keep their own axis; new builds use the finer one.
+- **File ▸ Open imzML reuses the slide's saved cube and prime stats** (`gui/main.py`
+  `_prepare_imzml`). It used to re-prime and rebuild the cube even when the managed session and
+  its Zarr sidecar existed; only the Samples panel, launcher and File ▸ Open analysis took the
+  fast path. The managed session is now resolved by fingerprint before the load on every path.
+- **Out-of-core cube build bins chunks on a small thread pool** (`msi.py`
+  `_build_mz_cube_streaming`, `MSIDataset.n_bin_workers`): the COO→CSR build and grouping of
+  each pixel chunk run on up to 4 threads while the consumer keeps draining the reader; bucket
+  writes stay in pixel order, so the spill is byte-identical. The read pattern is unchanged.
+- **Out-of-core cube build no longer re-scans its spill once per column band** (`msi.py`
+  `_build_mz_cube_streaming`). Pass 1 now bins pixels in chunks (one block CSR per chunk, the
+  same construction as the in-RAM build) and spills entries into 32 column-range bucket files;
+  pass 2 sorts one bucket at a time, falling back to sub-band scans of *that bucket* only when a
+  bucket exceeds the RAM budget. Spill I/O is now a small constant multiple of the entry count
+  instead of `bands × spill`: a 5 µm centroid slide (143k pixels, 595M entries, 7 GB spill) used
+  to scan the whole spill ~200 times. The build's RAM budget also scales with the machine
+  (a sixteenth of physical RAM, 128 MB–4 GB) instead of a fixed 128 MB. Output is byte-identical
+  (existing and new bit-identity tests, shared-axis and processed-mode).
+- **Processed-mode prime and skyline accumulate in batches of 64 pixels** (`msi.py` `prime`,
+  `max_spectrum`) instead of allocating an axis-long (up to 200k-bin) temporary per spectrum.
+  The skyline is exactly unchanged; the mean differs only by float rounding order.
+
+### Fixed
+- **Analyses ignored the "Data in this analysis" bar** (`gui/analysisdialog.py` `_state`,
+  `gui/scope.py`). Multi-group features (Kruskal-Wallis / ANOVA) and Discriminating features let
+  you *Choose groups…* but ran on the window default — the segmentation clusters, or the Setup
+  group tags — so the test "bound to segments". The dialog now builds its inputs from the bar:
+  the chosen groups replace the segmentation fallback, the chosen feature set is the one used,
+  and the Region-comparison A/B pickers (built but never filled or read before) list every
+  ROI and name the pair. Readiness and the stale-run check use the same state, and the run
+  record now carries the chosen A/B pair.
+- **`MSIDataset.mz_range` re-read every spectrum on each call for processed-mode data**
+  (`msi.py`, `session.py`). Without a shared m/z axis the bounds need a pass over the whole
+  file, and nothing cached them — so every log-axis build (prime, each ROI/region spectrum
+  without a cube, the skyline), the cube size estimate, the cube build and the dataset
+  fingerprint each paid a full *serial* read. On a 7.3 GB centroid slide that was 3–5 minutes
+  per call. The bounds are now computed once per dataset through the parallel reader,
+  remembered on the store, and written into the `.parse.npz` sidecar (`amend_parse_cache`) so
+  a reopen starts with them known.
+- **Opening a large disk-backed slide could freeze the window for minutes after the load bar
+  closed** (`gui/ion.py`, `gui/main.py`). With the spectrum view on *skyline*, the first paint
+  streamed every spectrum off disk on the GUI thread, and clicking a peak before the fast cache
+  existed did the same for each ion image. The fast-cache build now starts before the first
+  paint; while it runs the spectrum view shows the already-primed mean (labelled *skyline
+  pending fast cache*) and an ion-image request with no extracted column is parked with a
+  status message. Both redraw from the cube the moment the build finishes. A picked feature
+  whose apex-snapped m/z misses its extracted column now shows that exact column instead of
+  streaming the slide.
 - **Per-group analyses showed raw integer region ids instead of the assigned group names**
   (`spatial.py`, `registry.py`) — *Multi-group features* wrote a `top_region` column of raw
   integer cluster ids (e.g. `0 1 2 3`) that never reached a group name, and *Markers (shrunken

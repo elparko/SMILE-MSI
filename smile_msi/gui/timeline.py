@@ -19,12 +19,12 @@ import re
 
 from PySide6 import QtCore, QtWidgets
 
-from .common import MUTED_QSS, section_title
+from .common import MUTED_QSS, install_table_export, section_title
 
 # ``[HH:MM:SS] KIND   <label>[ :: <stage>][  (1.23s)]`` — the shape _perf writes.
 _LINE = re.compile(
     r"^\[(?P<time>\d{2}:\d{2}:\d{2})\]\s+"
-    r"(?P<kind>START|STAGE|DONE|ERROR)\s+"
+    r"(?P<kind>START|STAGE|DONE|ERROR|PASS)\s+"
     r"(?P<rest>.*)$"
 )
 _SECONDS = re.compile(r"\((?P<sec>\d+(?:\.\d+)?)s\)\s*$")
@@ -77,6 +77,11 @@ def summarize_operations(events: list[dict]) -> list[dict]:
             op = open_ops.get(label)
             if op is not None and ev["stage"]:
                 op["stages"].append(ev["stage"])
+        elif ev["kind"] == "PASS":
+            # a whole-slide read reported by the dataset layer (MSIDataset.on_pass): its own
+            # completed row, so a GUI-thread stall shows up even with no START around it
+            done.append({"time": ev["time"], "label": label, "seconds": ev["seconds"],
+                         "stages": [], "status": "done"})
         elif ev["kind"] in ("DONE", "ERROR"):
             op = open_ops.pop(label, None)
             if op is None:      # a DONE with no matching START (log rotated mid-op)
@@ -191,4 +196,5 @@ def _readonly_table(headers, rows) -> QtWidgets.QTableWidget:
     t.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
     t.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
     t.setAlternatingRowColors(True)
+    install_table_export(t, stem="startup_timeline", title="Export timeline")
     return t

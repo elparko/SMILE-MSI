@@ -841,3 +841,18 @@ def test_relocate_repoints_session_path_and_rewrites_session_source(tmp_path, mo
     assert s.session_path == local_sess                          # repointed to this machine
     assert report.repointed_sessions == 1
     assert session.load_session(local_sess)["source"] == str(raw)  # session JSON healed too
+
+
+def test_find_moved_source_requires_unique_match_with_ibd(tmp_path):
+    from smile_msi.cohort import find_moved_source
+    a = tmp_path / "a"; b = tmp_path / "b"; c = tmp_path / "c"
+    for d in (a, b, c):
+        d.mkdir()
+    (a / "slide.imzML").write_bytes(b"x"); (a / "slide.ibd").write_bytes(b"y")
+    (c / "slide.imzML").write_bytes(b"x")                    # no .ibd → not a usable copy
+    missing = str(tmp_path / "old" / "slide.imzML")
+    assert find_moved_source(missing, [str(a), str(b), str(c), "", str(tmp_path / "nope")]) == str(a / "slide.imzML")
+    assert find_moved_source(missing, [str(b)]) is None
+    (b / "slide.imzML").write_bytes(b"x"); (b / "slide.ibd").write_bytes(b"y")
+    assert find_moved_source(missing, [str(a), str(b)]) is None    # ambiguous → never guess
+    assert find_moved_source(missing, [str(a), str(a)]) == str(a / "slide.imzML")  # same root twice
