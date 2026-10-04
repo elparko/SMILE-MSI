@@ -2,7 +2,7 @@
 
 A *cohort* is the level **above** a sample's regions. Where a region groups pixels
 *within* one slide, a cohort groups whole slides *across* files, each tagged with a
-**group** label (e.g. ``"control"`` vs ``"synkinetic"``), so the same kind of
+**group** label (e.g. ``"control"`` vs ``"treated"``), so the same kind of
 A-vs-B / multi-group comparison the app already does between regions can run
 sample-to-sample. It is a lightweight roster, not a second data store:
 

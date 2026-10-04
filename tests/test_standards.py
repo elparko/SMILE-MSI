@@ -30,7 +30,7 @@ def _tiny_dataset(polarity="negative", pixel_size_um=25.0):
 
 def _full_meta():
     return standards.AcquisitionMeta(
-        organism="rat", tissue="sciatic nerve", condition="synkinetic",
+        organism="rat", tissue="sciatic nerve", condition="treated",
         sample_prep="fresh-frozen", storage="-80C",
         matrix="DHB", matrix_application="sublimation",
         section_thickness_um=10.0,

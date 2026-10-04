@@ -147,7 +147,7 @@ def _rep_by_pvalue(df, n, ds=None):
 
 
 def _region_name(dct, cl):
-    """Human label for a per-cluster key — the group name the dict carries (e.g. 'Synk'),
+    """Human label for a per-cluster key — the group name the dict carries (e.g. 'Trt'),
     else 'region <n>'. ``dct`` may be a plain dict or a :class:`_DiscResult`."""
     names = getattr(dct, "names", None)
     try:
@@ -202,7 +202,7 @@ def _per_cluster_rep(dct, n, ds=None):
 class _NamedGroups(dict):
     """A ``{cluster_id: DataFrame}`` per-region result that remembers the group ``names``
     aligned to each label id, so every per-region table/list reads the group name (e.g.
-    'Synk') rather than 'region 0'. ``names`` stays None on the segmentation fallback (no
+    'Trt') rather than 'region 0'. ``names`` stays None on the segmentation fallback (no
     user-assigned groups), where ``_region_name`` labels the clusters 'region <n>'."""
     names = None
 
@@ -498,7 +498,7 @@ def _run_classify_cv(ds, inp, p):
         n_components=int(p.get("n_components", 2)), tol_ppm=p["tol_ppm"], norm=p["norm"],
         orthogonal=p.get("orthogonal", False), n_folds=int(p.get("n_folds", 5)))
     # Class ids are integer group labels; relabel with the group names so the confusion-matrix
-    # rows/columns read 'Facial'/'Synk' not '0'/'1'. The matrix stays index-aligned to this list.
+    # rows/columns read 'Normal'/'Trt' not '0'/'1'. The matrix stays index-aligned to this list.
     names = inp.get("names")
     if names is not None:
         r["classes"] = [names[int(c)] if 0 <= int(c) < len(names) else str(c)
@@ -531,7 +531,7 @@ def _run_classify_map(ds, inp, p):
     pred = clf.predict(X)                                  # a class label per pixel
     idx = {c: i for i, c in enumerate(clf.classes)}
     lab = np.array([idx.get(c, -1) for c in pred], dtype=int)
-    # Display the group name per class ('predicted Facial') not the raw id ('predicted 0'). Only
+    # Display the group name per class ('predicted Normal') not the raw id ('predicted 0'). Only
     # the label strings change — `lab`/`idx` stay keyed on clf.classes positions, so the written-
     # back regions still map to the right pixels.
     names = inp.get("names")

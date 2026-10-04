@@ -23,15 +23,6 @@ htmlcov/
 AUC_*.csv
 Lipid_markers_*.xlsx
 FINDINGS_*.md
-# internal IP / patent due-diligence — keep out of the public repo (kept in a sibling
-# private folder); they enumerate perceived exposure and shouldn't ship.
-IP_AUDIT.md
-MATH_AUDIT.md
-PATENT_*.md
-# pre-open-source readiness audit + the history-scrub helper: both ENUMERATE the sensitive
-# set (git-history leaks, the maintainer email/name, security surfaces) — never publish them.
-OSS_READINESS_AUDIT_*.md
-scripts/scrub_history_for_oss.sh
 *.slx
 *.imzML
 *.ibd

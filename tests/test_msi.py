@@ -1385,22 +1385,22 @@ def test_pooled_embedding_pools_samples(peaks):
     a = demo.make_synthetic(width=20, height=16, seed=1); a.prime()
     b = demo.make_synthetic(width=18, height=14, seed=2); b.prime()
     samples = [type("S", (), {"name": "ctrl-A", "group": "control"})(),
-               type("S", (), {"name": "synk-B", "group": "synkinetic"})()]
-    dss = {"ctrl-A": a, "synk-B": b}
+               type("S", (), {"name": "trt-B", "group": "treated"})()]
+    dss = {"ctrl-A": a, "trt-B": b}
     cap = 30
     emb = multivariate.pooled_embedding(
         samples, peaks, loader=lambda s: (dss[s.name], None),
         method="tsne", per_sample_cap=cap)
     assert emb.method == "TSNE"
-    assert emb.sample_names == ["ctrl-A", "synk-B"]
+    assert emb.sample_names == ["ctrl-A", "trt-B"]
     # each slide is capped, so the pooled cloud is exactly the two capped blocks
-    assert emb.counts == {"ctrl-A": cap, "synk-B": cap}
+    assert emb.counts == {"ctrl-A": cap, "trt-B": cap}
     n = emb.coords.shape[0]
     assert n == 2 * cap
     assert emb.sample_id.shape == (n,) and emb.group.shape == (n,)
     assert set(emb.sample_id.tolist()) == {0, 1}
     assert set(emb.group[emb.sample_id == 0]) == {"control"}
-    assert set(emb.group[emb.sample_id == 1]) == {"synkinetic"}
+    assert set(emb.group[emb.sample_id == 1]) == {"treated"}
 
 
 def test_pooled_embedding_honours_region_index_and_skips(peaks):
@@ -1547,8 +1547,8 @@ def test_pooled_region_embedding_one_point_per_region(peaks):
     a = demo.make_synthetic(width=20, height=16, seed=11); a.prime()
     b = demo.make_synthetic(width=18, height=14, seed=12); b.prime()
     dss = {"A": a, "B": b}
-    samples = [type("S", (), {"name": "A", "group": "facial"})(),
-               type("S", (), {"name": "B", "group": "facial"})()]
+    samples = [type("S", (), {"name": "A", "group": "normal"})(),
+               type("S", (), {"name": "B", "group": "normal"})()]
 
     def regions_of(s):
         ds = dss[s.name]

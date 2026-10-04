@@ -176,7 +176,7 @@ def _nested_prov(model="lmm", test="linear mixed model", summary="median"):
     p = provenance.Provenance(title="Nested", started="2026-07-09T00:00:00+00:00")
     p.step("cohort_nested_comparison", model=model, test=test, subject_by="nerve",
            summary=summary, compartments=["endoneurium", "perineurium", "epineurium"],
-           group_a="facial", group_b="synkinetic", df_method="bw",
+           group_a="normal", group_b="treated", df_method="bw",
            now="2026-07-09T00:00:01+00:00")
     return p
 
@@ -199,7 +199,7 @@ def test_methods_paragraph_describes_the_stratified_moderated_t():
                         test="moderated t (empirical-Bayes, limma/Smyth 2004)",
                         summary="mean").methods_paragraph()
     assert "Each compartment was then tested separately" in para
-    assert "facial-versus-synkinetic" in para
+    assert "normal-versus-treated" in para
     assert "the mean of the normalized per-pixel intensities" in para
     assert "empirical Bayes (Smyth 2004)" in para
     assert "(1 | nerve)" not in para              # no mixed model ran

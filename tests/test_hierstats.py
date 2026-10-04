@@ -195,8 +195,8 @@ def test_moderated_t_ids_and_column_contract():
 COMPARTMENTS = ["endoneurium", "perineurium", "epineurium"]
 
 
-INTERACTION_SHIFT = 2.5      # feature 0: synkinetic − facial, epineurium only (log2 units)
-MAIN_SHIFT = 1.8             # feature 1: synkinetic − facial, every compartment
+INTERACTION_SHIFT = 2.5      # feature 0: treated − normal, epineurium only (log2 units)
+MAIN_SHIFT = 1.8             # feature 1: treated − normal, every compartment
 
 
 def _nested_cohort(rng, n_a=3, n_b=6, n_feat=8, subject_sd=0.5):
@@ -212,7 +212,7 @@ def _nested_cohort(rng, n_a=3, n_b=6, n_feat=8, subject_sd=0.5):
     isn't crushed by the pseudocount the way it would be with one flat baseline.
     """
     subjects = [f"nerve{i:02d}" for i in range(n_a + n_b)]
-    groups = ["facial"] * n_a + ["synkinetic"] * n_b
+    groups = ["normal"] * n_a + ["treated"] * n_b
     comp_effect = {"endoneurium": 0.0, "perineurium": 0.8, "epineurium": -0.5}
     base = rng.uniform(4.0, 14.0, n_feat)             # log2 baseline: raw spans 16 … 16384
     base[0] = base[1] = 12.0                          # the planted features sit well above τ
@@ -222,9 +222,9 @@ def _nested_cohort(rng, n_a=3, n_b=6, n_feat=8, subject_sd=0.5):
     for s, g in zip(subjects, groups):
         for c in COMPARTMENTS:
             y = base + offs[s] + comp_effect[c] + rng.normal(0.0, 1.0, n_feat) * sd
-            if g == "synkinetic" and c == "epineurium":
+            if g == "treated" and c == "epineurium":
                 y[0] += INTERACTION_SHIFT             # interaction: epineurium only
-            if g == "synkinetic":
+            if g == "treated":
                 y[1] += MAIN_SHIFT                    # main effect: every compartment
             rows.append(y)
             g_lab.append(g); c_lab.append(c); s_lab.append(s)
@@ -250,7 +250,7 @@ def test_nested_design_columns_are_ordered_as_documented():
 
 def test_nested_mixed_model_recovers_a_planted_interaction():
     X, g, c, s = _nested_cohort(np.random.default_rng(2026))
-    res = hs.nested_mixed_model(X, g, c, s, "facial", "synkinetic", compartments=COMPARTMENTS)
+    res = hs.nested_mixed_model(X, g, c, s, "normal", "treated", compartments=COMPARTMENTS)
     assert res.attrs["n_subjects"] == 9
     assert res.attrs["n_observations"] == 27
     assert res.attrs["df_between"] == 7.0 and res.attrs["df_within"] == 14.0
@@ -276,7 +276,7 @@ def test_nested_mixed_model_recovers_a_planted_interaction():
 
 def test_nested_mixed_model_group_effect_is_the_mean_simple_effect():
     X, g, c, s = _nested_cohort(np.random.default_rng(4))
-    res = hs.nested_mixed_model(X, g, c, s, "facial", "synkinetic", compartments=COMPARTMENTS)
+    res = hs.nested_mixed_model(X, g, c, s, "normal", "treated", compartments=COMPARTMENTS)
     simple = np.vstack([res[f"effect__{c}"].to_numpy() for c in COMPARTMENTS])
     assert res["effect_group"].to_numpy() == pytest.approx(simple.mean(axis=0), abs=1e-8)
 
@@ -287,7 +287,7 @@ def test_nested_mixed_model_bh_families_are_separate():
     from statsmodels.stats.multitest import multipletests
 
     X, g, c, s = _nested_cohort(np.random.default_rng(6), n_feat=40)
-    res = hs.nested_mixed_model(X, g, c, s, "facial", "synkinetic", compartments=COMPARTMENTS)
+    res = hs.nested_mixed_model(X, g, c, s, "normal", "treated", compartments=COMPARTMENTS)
     for pcol, qcol in [("p_interaction", "q_interaction"), ("p_group", "q_group"),
                        ("p__endoneurium", "q__endoneurium"), ("p__epineurium", "q__epineurium")]:
         p, q = res[pcol].to_numpy(), res[qcol].to_numpy()
@@ -308,7 +308,7 @@ def test_nested_mixed_model_bh_families_are_separate():
 def test_nested_mixed_model_reports_log2_fc_from_the_raw_scale():
     X, g, c, s = _nested_cohort(np.random.default_rng(8), n_feat=60)
     raw = np.exp2(X)                               # X is the log2 modelling scale
-    res = hs.nested_mixed_model(X, g, c, s, "facial", "synkinetic",
+    res = hs.nested_mixed_model(X, g, c, s, "normal", "treated",
                                 compartments=COMPARTMENTS, raw=raw)
     # log2_fc is the τ-regularized ratio of raw means, NOT the model coefficient: the mean of
     # exponentials exceeds the exponential of the mean, so it won't equal effect__ exactly.
@@ -323,7 +323,7 @@ def test_nested_mixed_model_reports_log2_fc_from_the_raw_scale():
 
 def test_nested_mixed_model_refuses_an_unestimable_design():
     X, g, c, s = _nested_cohort(np.random.default_rng(10), n_a=1, n_b=6)
-    res = hs.nested_mixed_model(X, g, c, s, "facial", "synkinetic", compartments=COMPARTMENTS)
+    res = hs.nested_mixed_model(X, g, c, s, "normal", "treated", compartments=COMPARTMENTS)
     assert not res["converged"].any()               # 1 subject in group A cannot be fitted
     assert res.attrs["n_testable"] == 0
     assert "subjects per group" in res.attrs["warning"]
@@ -333,7 +333,7 @@ def test_nested_mixed_model_refuses_an_unestimable_design():
 def test_nested_mixed_model_drops_a_missing_compartment_cleanly():
     X, g, c, s = _nested_cohort(np.random.default_rng(12))
     X[c == "epineurium", 3] = np.nan               # feature 3 never seen in the epineurium
-    res = hs.nested_mixed_model(X, g, c, s, "facial", "synkinetic", compartments=COMPARTMENTS)
+    res = hs.nested_mixed_model(X, g, c, s, "normal", "treated", compartments=COMPARTMENTS)
     assert not res["converged"].iloc[3]
     assert np.isnan(res["p_interaction"].iloc[3])
     assert res["converged"].iloc[0]                 # its neighbours are unaffected
@@ -343,9 +343,9 @@ def test_nested_mixed_model_drops_a_missing_compartment_cleanly():
 def test_nested_mixed_model_z_df_is_anticonservative_versus_between_within():
     """The reason `bw` is the default: the normal reference always gives a smaller p."""
     X, g, c, s = _nested_cohort(np.random.default_rng(14))
-    bw = hs.nested_mixed_model(X, g, c, s, "facial", "synkinetic",
+    bw = hs.nested_mixed_model(X, g, c, s, "normal", "treated",
                                compartments=COMPARTMENTS, df_method="bw")
-    z = hs.nested_mixed_model(X, g, c, s, "facial", "synkinetic",
+    z = hs.nested_mixed_model(X, g, c, s, "normal", "treated",
                               compartments=COMPARTMENTS, df_method="z")
     pb, pz = bw["p__epineurium"].to_numpy(), z["p__epineurium"].to_numpy()
     assert np.all(pz <= pb + 1e-12)
@@ -357,7 +357,7 @@ def test_nested_mixed_model_z_df_is_anticonservative_versus_between_within():
 # --------------------------------------------------------------------------- #
 def test_stratified_moderated_t_finds_the_compartment_specific_effect():
     X, g, c, s = _nested_cohort(np.random.default_rng(16), n_feat=60)
-    res = hs.stratified_comparison(X, g, c, s, "facial", "synkinetic",
+    res = hs.stratified_comparison(X, g, c, s, "normal", "treated",
                                    compartments=COMPARTMENTS, method="modt")
     assert res["q__epineurium"].iloc[0] <= 0.05     # interaction feature: hit in epineurium
     assert res["q__endoneurium"].iloc[0] > 0.05     # ...and nowhere else
@@ -370,7 +370,7 @@ def test_stratified_moderated_t_finds_the_compartment_specific_effect():
 
 def test_stratified_rank_test_warns_that_it_cannot_reject():
     X, g, c, s = _nested_cohort(np.random.default_rng(18), n_feat=60)
-    res = hs.stratified_comparison(X, g, c, s, "facial", "synkinetic",
+    res = hs.stratified_comparison(X, g, c, s, "normal", "treated",
                                    compartments=COMPARTMENTS, method="mwu")
     assert "warning" in res.attrs
     assert "cannot return p below" in res.attrs["warning"]
@@ -381,7 +381,7 @@ def test_stratified_rank_test_warns_that_it_cannot_reject():
 
 def test_stratified_comparison_records_per_compartment_feasibility():
     X, g, c, s = _nested_cohort(np.random.default_rng(19), n_feat=60)
-    res = hs.stratified_comparison(X, g, c, s, "facial", "synkinetic",
+    res = hs.stratified_comparison(X, g, c, s, "normal", "treated",
                                    compartments=COMPARTMENTS, method="modt")
     fea = res.attrs["per_compartment"]["endoneurium"]["feasibility"]
     assert fea["n_a"] == 3 and fea["n_b"] == 6 and fea["feasible"] is False

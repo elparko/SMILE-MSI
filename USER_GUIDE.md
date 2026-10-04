@@ -251,7 +251,7 @@ multi-sample batch statistics — without holding every dataset in memory.
     added to the cohort). *Add saved…* adds samples you've already worked on.
   - **Double-click** a sample to switch to it — the app auto-saves the sample you're
     leaving and reloads the picked one, so only one dataset is ever active.
-  - **Right-click** → *Assign to group* (e.g. `control` vs `synkinetic`) or *Remove*.
+  - **Right-click** → *Assign to group* (e.g. `control` vs `treated`) or *Remove*.
   - The roster auto-saves as the "Workspace" cohort and is restored on the next launch.
 - **Cohort** tab — cross-sample comparison. Pick the feature axis (a *Consensus* of peaks
   shared across samples, or the active feature set), choose **Group A vs B**, and *Run

@@ -39,7 +39,7 @@ Two files are written next to --out (default: <cohort>_matrix):
                                ingests directly; group-by and per-sample ratios are one step.
   <out>_features_by_sample.csv literal "features (rows) x samples (columns)": first columns are
                                mz (and lipid, with --annotate), then one column per sample. Row 1
-                               of the header carries each sample's facial/synk group label.
+                               of the header carries each sample's normal/trt group label.
 
 The console prints per-group n and, for the first few features, each group's mean — so you can
 eyeball that the group means equal the differential table you already shared.
@@ -249,7 +249,7 @@ def main() -> None:
                 means.append(f"{v.mean():.4g}" if v.size else "n/a")
             print(f"  {mz:>10.4f}  " + "  ".join(f"{m:>8}" for m in means))
     else:
-        print("\n(Only one group present — assign facial/synk labels in the Samples panel "
+        print("\n(Only one group present — assign normal/trt labels in the Samples panel "
               "for a group cross-check.)")
 
 

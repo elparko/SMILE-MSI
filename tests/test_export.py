@@ -519,7 +519,7 @@ def test_build_book_full(ion, tmp_path):
         "spectra": [("mean spectrum", axis, spec), ("skyline", axis, spec * 1.2)],
         "segmentation": {"image": label, "colors": {0: "#4C72B0", 1: "#DD8452"},
                          "legend": [("#4C72B0", "A"), ("#DD8452", "B")], "title": "Segmentation"},
-        "stats": {"df": stats, "a_label": "Normal", "b_label": "Synkinetic", "title": "Discriminating"},
+        "stats": {"df": stats, "a_label": "Normal", "b_label": "Treated", "title": "Discriminating"},
     }
     out = tmp_path / "book.pdf"
     export.build_book(doc, str(out), theme="dark", dpi=80)
@@ -542,9 +542,9 @@ def test_roc_report_pdf(tmp_path):
         fpr, tpr, auc = spatial.roc_curve(rng.normal(0, 1, 60), rng.normal(0.6, 1, 70))
         curves.append({"mz": float(r["mz"]), "lipid": r["best_lipid"], "fpr": fpr, "tpr": tpr,
                        "auc": auc, "q": float(r["q_value"]), "log2_fc": float(r["log2_fc"]),
-                       "higher": "Synkinetic" if auc >= 0.5 else "Normal"})
+                       "higher": "Treated" if auc >= 0.5 else "Normal"})
     out = tmp_path / "roc.pdf"
-    export.roc_report_pdf(str(out), stats, curves, a_label="Normal", b_label="Synkinetic",
+    export.roc_report_pdf(str(out), stats, curves, a_label="Normal", b_label="Treated",
                           note="60 vs 70 pixels", theme="dark", dpi=80)
     assert _is_pdf(out)
     assert _pdf_page_count(out) >= 2           # overview + at least one ROC grid page
@@ -788,7 +788,7 @@ def test_render_matrix_figure_grid_and_absent_cell(tmp_path):
     grid = [[_cell(5.0), _cell(2.0)], [_cell(3.0), None], [_cell(1.0), _cell(4.0)]]
     fig = export.render_matrix_figure(
         grid, row_labels=["PC 34:1", "PE 40:6", "ST 24:1"],
-        col_labels=["synk_02", "synk_04"], cmap="viridis", row_anchors=[5.0, 3.0, 4.0],
+        col_labels=["trt_02", "trt_04"], cmap="viridis", row_anchors=[5.0, 3.0, 4.0],
         theme="light", dpi=100, title="ions × sections")
     p = tmp_path / "matrix.png"
     export.save_figure(fig, str(p), dpi=100)

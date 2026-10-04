@@ -43,19 +43,19 @@ def home(tmp_path, monkeypatch):
 def test_cohort_save_load_roundtrip(home):
     c = cohort.Cohort(name="Nerve study")
     c.add(cohort.SampleRef(name="A", session_path="/x/a.json", group="control", n_pixels=50))
-    c.add(cohort.SampleRef(name="B", session_path="/x/b.json", group="synkinetic", n_pixels=60))
+    c.add(cohort.SampleRef(name="B", session_path="/x/b.json", group="treated", n_pixels=60))
     # re-adding the same session is idempotent (keyed on session path)
     c.add(cohort.SampleRef(name="A-again", session_path="/x/a.json"))
     assert len(c.samples) == 2
-    assert c.groups() == ["control", "synkinetic"]
-    assert set(c.by_group()) == {"control", "synkinetic"}
+    assert c.groups() == ["control", "treated"]
+    assert set(c.by_group()) == {"control", "treated"}
 
     path = c.save()
     assert path == cohort.cohort_path("Nerve study")
     again = cohort.Cohort.load(path)
     assert again.name == "Nerve study"
     assert [s.name for s in again.samples] == ["A", "B"]
-    assert again.find("/x/b.json").group == "synkinetic"
+    assert again.find("/x/b.json").group == "treated"
 
     # set_group + remove
     assert again.set_group("/x/a.json", "treated")
@@ -176,16 +176,16 @@ def test_group_comparison(home):
         refs.append(cohort.ref_from_session(p, group="control"))
     for i, rel in enumerate([0.80, 0.75, 0.85]):
         p = _write_session(f"/d/syn{i}.imzML", [_peak(t1, rel), _peak(t2, 0.5)], fp=f"s{i}")
-        refs.append(cohort.ref_from_session(p, group="synkinetic"))
+        refs.append(cohort.ref_from_session(p, group="treated"))
 
     tbl = cohort.batch_feature_table(refs, [t1, t2])
-    res = cohort.group_comparison(tbl, "control", "synkinetic")
+    res = cohort.group_comparison(tbl, "control", "treated")
     assert set(res.columns) >= {"mz", "n_A", "n_B", "mean_A", "mean_B", "log2_fc",
                                 "p_value", "q_value"}
-    assert res.attrs["a_label"] == "control" and res.attrs["b_label"] == "synkinetic"
+    assert res.attrs["a_label"] == "control" and res.attrs["b_label"] == "treated"
     row1 = res[res["mz"] == t1].iloc[0]
     assert row1["n_A"] == 3 and row1["n_B"] == 3
-    assert row1["log2_fc"] > 1.0                      # ~8x up in synkinetic
+    assert row1["log2_fc"] > 1.0                      # ~8x up in treated
     row2 = res[res["mz"] == t2].iloc[0]
     assert abs(row2["log2_fc"]) < 0.1                 # flat
     # the discriminating feature sorts to the top (lowest p)
@@ -205,23 +205,23 @@ def test_group_comparison_parametric_methods(home):
         refs.append(cohort.ref_from_session(p, group="control"))
     for i, rel in enumerate([0.80, 0.75, 0.85]):
         p = _write_session(f"/d/syn{i}.imzML", [_peak(t1, rel), _peak(t2, 0.5)], fp=f"s{i}")
-        refs.append(cohort.ref_from_session(p, group="synkinetic"))
+        refs.append(cohort.ref_from_session(p, group="treated"))
     tbl = cohort.batch_feature_table(refs, [t1, t2])
 
     for method, label in [("welch", "Welch's t-test"), ("student", "Student's t-test")]:
-        res = cohort.group_comparison(tbl, "control", "synkinetic", method=method)
+        res = cohort.group_comparison(tbl, "control", "treated", method=method)
         assert res.attrs["test"] == label
         assert res.iloc[0]["mz"] == t1                # discriminating feature still on top
         row1 = res[res["mz"] == t1].iloc[0]
         # p matches scipy run directly on the per-sample values for that feature
         col = f"mz_{t1:.4f}"
         a = tbl[tbl["group"] == "control"][col].to_numpy()
-        b = tbl[tbl["group"] == "synkinetic"][col].to_numpy()
+        b = tbl[tbl["group"] == "treated"][col].to_numpy()
         _, p = ttest_ind(a, b, equal_var=(method == "student"))
         assert abs(row1["p_value"] - p) < 1e-9
 
     with pytest.raises(ValueError):
-        cohort.group_comparison(tbl, "control", "synkinetic", method="bogus")
+        cohort.group_comparison(tbl, "control", "treated", method="bogus")
 
 
 def _paired_refs():
@@ -387,7 +387,7 @@ def test_batch_table_reads_region_scopes(home):
 
 def test_region_samples_as_replicates_in_group_comparison(home):
     # two slides, each split into two regions; the regions are the replicates. Marker up
-    # in the synkinetic slide's regions.
+    # in the treated slide's regions.
     t = 750.0
     p1 = _write_session_scopes("/d/s1.imzML", [_peak(t, 0.1)],
                                {"L": [_peak(t, 0.10)], "R": [_peak(t, 0.12)]}, fp="s1")
@@ -395,14 +395,14 @@ def test_region_samples_as_replicates_in_group_comparison(home):
                                {"L": [_peak(t, 0.80)], "R": [_peak(t, 0.85)]}, fp="s2")
     refs = [cohort.SampleRef(name="s1·L", session_path=p1, region="L", group="control"),
             cohort.SampleRef(name="s1·R", session_path=p1, region="R", group="control"),
-            cohort.SampleRef(name="s2·L", session_path=p2, region="L", group="synkinetic"),
-            cohort.SampleRef(name="s2·R", session_path=p2, region="R", group="synkinetic")]
+            cohort.SampleRef(name="s2·L", session_path=p2, region="L", group="treated"),
+            cohort.SampleRef(name="s2·R", session_path=p2, region="R", group="treated")]
     tbl = cohort.batch_feature_table(refs, [t])
     assert len(tbl) == 4
-    res = cohort.group_comparison(tbl, "control", "synkinetic")
+    res = cohort.group_comparison(tbl, "control", "treated")
     row = res[res["mz"] == t].iloc[0]
     assert row["n_A"] == 2 and row["n_B"] == 2       # two regions per group
-    assert row["log2_fc"] > 1.0                       # up in synkinetic
+    assert row["log2_fc"] > 1.0                       # up in treated
 
 
 def test_consensus_targets_reads_region_scopes(home):
@@ -524,10 +524,10 @@ def test_tested_only_fdr_and_detection_gate(home):
         refs.append(cohort.ref_from_session(p, group="control"))
     for i, rel in enumerate([0.80, 0.85, 0.78, 0.82]):
         p = _write_session(f"/d/syn{i}.imzML", [_peak(t_real, rel), _peak(t_flat, 0.5)], fp=f"s{i}")
-        refs.append(cohort.ref_from_session(p, group="synkinetic"))
+        refs.append(cohort.ref_from_session(p, group="treated"))
 
     tbl = cohort.batch_feature_table(refs, [t_real, t_sparse, t_flat])
-    res = cohort.group_comparison(tbl, "control", "synkinetic")
+    res = cohort.group_comparison(tbl, "control", "treated")
     sparse_row = res[res["mz"] == t_sparse].iloc[0]
     assert sparse_row["n_A"] == 1 and np.isnan(sparse_row["p_value"])   # gated out, not tested
     assert np.isnan(sparse_row["q_value"])
@@ -546,9 +546,9 @@ def test_group_comparison_warns_when_nothing_testable(home):
     pa = _write_session("/d/a.imzML", [_peak(700.0, 0.5)], fp="a")
     pb = _write_session("/d/b.imzML", [_peak(700.0, 0.9)], fp="b")
     refs = [cohort.ref_from_session(pa, group="control"),
-            cohort.ref_from_session(pb, group="synkinetic")]
+            cohort.ref_from_session(pb, group="treated")]
     tbl = cohort.batch_feature_table(refs, [700.0])
-    res = cohort.group_comparison(tbl, "control", "synkinetic")
+    res = cohort.group_comparison(tbl, "control", "treated")
     assert res.attrs["n_testable"] == 0
     assert "warning" in res.attrs
     assert res["p_value"].isna().all() and res["q_value"].isna().all()

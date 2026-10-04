@@ -9,7 +9,7 @@ tags:
   - bioinformatics
   - imzML
 authors:
-  - name: "Parker <SURNAME>" # TODO: replace <SURNAME> with your full name as it should appear in print
+  - name: "Parker Smith"
     orcid: 0000-0000-0000-0000 # TODO: add your ORCID (register free at https://orcid.org)
     corresponding: true
     affiliation: 1

@@ -23,7 +23,7 @@ def _cohort_with_a_class(rng, n_a=3, n_b=7, n_bg=40, m_cls=19, rho=0.6, endo_shi
     """10 nerves × 3 compartments. `m_cls` ions form a correlated class (a chain-length series:
     one shared myelin factor drives them all) that is depleted in group B's endo only."""
     subjects = [f"n{i:02d}" for i in range(n_a + n_b)]
-    groups = ["facial"] * n_a + ["synk"] * n_b
+    groups = ["normal"] * n_a + ["trt"] * n_b
     n_feat = m_cls + n_bg
     base = np.r_[np.full(m_cls, 11.0), rng.uniform(5.0, 13.0, n_bg)]   # log2 baselines
     refs, rows, index = [], [], []
@@ -36,7 +36,7 @@ def _cohort_with_a_class(rng, n_a=3, n_b=7, n_bg=40, m_cls=19, rho=0.6, endo_shi
             factor = rng.normal(size=1)
             y = base + off + rng.normal(0.0, 0.30, n_feat)
             y[:m_cls] += np.sqrt(rho) * factor * 0.8
-            if g == "synk" and comp == "endo":
+            if g == "trt" and comp == "endo":
                 y[:m_cls] += endo_shift                   # the class effect
             refs.append(_ref(f"{s} {comp}", g, comp, s))
             rows.append({"group": g, **dict(zip(cols, np.exp2(y)))})   # raw intensity scale
@@ -63,7 +63,7 @@ def _annotate(res, m_cls, conf=60.0):
 def _run(rng_seed=2026, **kw):
     rng = np.random.default_rng(rng_seed)
     tbl, m = _cohort_with_a_class(rng, **kw)
-    res = cohort.nested_comparison(tbl, "facial", "synk", subject_by="subject",
+    res = cohort.nested_comparison(tbl, "normal", "trt", subject_by="subject",
                                    compartments=COMPARTMENTS)
     return tbl, _annotate(res, m), m
 
@@ -130,10 +130,10 @@ def test_class_test_is_immune_to_a_uniform_per_compartment_scale_offset():
     rng = np.random.default_rng(4)
     tbl, m = _cohort_with_a_class(rng, endo_shift=0.0)
     feat = [c for c in tbl.columns if c != "group"]
-    endo_synk = np.array([r.region == "endo" and r.group == "synk"
+    endo_trt = np.array([r.region == "endo" and r.group == "trt"
                           for r in tbl.attrs["refs"]])
-    tbl.loc[endo_synk, feat] = tbl.loc[endo_synk, feat] * 2 ** 0.6   # +0.6 log2, ALL ions
-    res = _annotate(cohort.nested_comparison(tbl, "facial", "synk", subject_by="subject",
+    tbl.loc[endo_trt, feat] = tbl.loc[endo_trt, feat] * 2 ** 0.6   # +0.6 log2, ALL ions
+    res = _annotate(cohort.nested_comparison(tbl, "normal", "trt", subject_by="subject",
                                              compartments=COMPARTMENTS), m)
     out = cohort.nested_class_comparison(tbl, res, contrast="endo")
     row = out[out["class"] == "Sulfatide"].iloc[0]
@@ -169,7 +169,7 @@ def test_class_test_group_contrast_and_attrs():
     assert "median_log2_fc" not in out.columns         # no per-compartment fold change to show
     assert out.attrs["contrast"] == "group"
     assert out.attrs["statistic"] == "effect_group / se_group"
-    assert out.attrs["a_label"] == "facial" and out.attrs["b_label"] == "synk"
+    assert out.attrs["a_label"] == "normal" and out.attrs["b_label"] == "trt"
     assert out.attrs["n_ions_background"] > out.attrs["n_ions_annotated"]
     assert "Wu & Smyth" in out.attrs["test"]
 
@@ -187,7 +187,7 @@ def test_class_test_rejects_bad_inputs():
 def test_class_test_refuses_a_stratified_result():
     rng = np.random.default_rng(9)
     tbl, m = _cohort_with_a_class(rng)
-    strat = _annotate(cohort.nested_comparison(tbl, "facial", "synk", subject_by="subject",
+    strat = _annotate(cohort.nested_comparison(tbl, "normal", "trt", subject_by="subject",
                                                model="stratified", compartments=COMPARTMENTS), m)
     with pytest.raises(ValueError, match="only the mixed model reports"):
         cohort.nested_class_comparison(tbl, strat, contrast="endo")

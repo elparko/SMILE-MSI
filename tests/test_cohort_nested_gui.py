@@ -22,7 +22,7 @@ from smile_msi.gui import main as M  # noqa: E402
 
 COMPARTMENTS = ["endoneurium", "perineurium", "epineurium"]
 IONS = [700.0, 720.0, 740.0, 760.0, 780.0, 800.0]
-T_INT = 700.0            # planted group×compartment interaction (synkinetic, epineurium only)
+T_INT = 700.0            # planted group×compartment interaction (treated, epineurium only)
 
 
 @pytest.fixture(scope="module")
@@ -68,14 +68,14 @@ def _build_cohort(win, n_a=3, n_b=6, seed=2026, region_namer=_same, label=True):
     rng = np.random.default_rng(seed)
     for i in range(n_a + n_b):
         nerve = f"n{i:02d}"
-        grp = "facial" if i < n_a else "synkinetic"
+        grp = "normal" if i < n_a else "treated"
         off = rng.normal(1.0, 0.04)                       # per-nerve slide level
         scopes = {}
         for k, comp in enumerate(COMPARTMENTS):
             peaks = []
             for j, mz in enumerate(IONS):
                 rel = (0.10 + 0.05 * j) * off * rng.normal(1.0, 0.03)
-                if mz == T_INT and grp == "synkinetic" and comp == "epineurium":
+                if mz == T_INT and grp == "treated" and comp == "epineurium":
                     rel *= 4.0                            # the interaction
                 peaks.append(_peak(mz, rel))
             scopes[region_namer(nerve, comp, k)] = peaks
@@ -98,8 +98,8 @@ def _prepare(win):
     win.nest_prev_spin.setValue(0.0)
     win.nest_tol_spin.setValue(50.0)
     win.nest_summary_combo.setCurrentText("Saved peak values (no reload)")
-    win.nest_ga.setCurrentText("facial")
-    win.nest_gb.setCurrentText("synkinetic")
+    win.nest_ga.setCurrentText("normal")
+    win.nest_gb.setCurrentText("treated")
 
 
 def _win(monkeypatch, tmp_path, **kw):
@@ -127,7 +127,7 @@ def test_group_combos_populate_and_the_mapping_drives_subject_and_compartment(
         app, monkeypatch, tmp_path):
     win = _win(monkeypatch, tmp_path)
     assert {win.nest_ga.itemText(i) for i in range(win.nest_ga.count())} == \
-        {"facial", "synkinetic"}
+        {"normal", "treated"}
     # subject and compartment are read from the per-sample mapping, not from token-rule combos
     assert win._nest_subject_by() == "subject"
     assert win._nest_comp_from() == "meta:compartment"
@@ -180,8 +180,8 @@ def test_design_summary_flags_a_subject_in_both_groups(app, monkeypatch, tmp_pat
     for r in win.cohort.samples:                          # mislabel: subject := compartment
         r.meta = {**r.meta, "subject": r.meta["compartment"]}
     win._refresh_sample_tree()
-    win.nest_ga.setCurrentText("facial")
-    win.nest_gb.setCurrentText("synkinetic")
+    win.nest_ga.setCurrentText("normal")
+    win.nest_gb.setCurrentText("treated")
     win._nest_update_design_summary()
     info = win.nest_info.text()
     assert "appear in BOTH groups" in info
@@ -196,7 +196,7 @@ def test_nested_design_summary_reports_the_design_before_any_fit(app, monkeypatc
     assert "27 region-samples" in info
     assert "9 subjects" in info
     assert "3 compartments" in info
-    assert "facial n=3 vs synkinetic n=6" in info
+    assert "normal n=3 vs treated n=6" in info
 
 
 def test_nested_mixed_model_run_renders_table_volcano_and_dots(app, monkeypatch, tmp_path):
@@ -248,7 +248,7 @@ def test_nested_run_warns_that_a_rank_test_could_not_reject(app, monkeypatch, tm
     assert info.startswith("⚠")
     assert "could not reject anything" in info
     assert "3-vs-6" in info
-    assert "facial (n=3) vs synkinetic (n=6) subjects" in info
+    assert "normal (n=3) vs treated (n=6) subjects" in info
     assert "27 profiles across 3 compartments" in info
 
 
@@ -338,12 +338,12 @@ def test_saved_mapping_survives_names_no_rule_could_parse(app, monkeypatch, tmp_
 
 def test_nest_apply_mapping_rescues_a_group_label_that_hides_the_compartment(
         app, monkeypatch, tmp_path):
-    """The real-world case: Region='S01 endo' (nerve + compartment) and Group='Synk endo'
-    (group + compartment). Neither column carries the facial-vs-synkinetic axis on its own, so
+    """The real-world case: Region='S01 endo' (nerve + compartment) and Group='Trt endo'
+    (group + compartment). Neither column carries the normal-vs-treated axis on its own, so
     picking Group A/B directly would silently collapse the model to one compartment."""
     win = _win(monkeypatch, tmp_path, region_namer=_per_nerve)
-    for r in win.cohort.samples:                         # Group='Facial endoneurium' etc.
-        r.group = f"{'Facial' if r.group == 'facial' else 'Synk'} {r.region.split(' ', 1)[1]}"
+    for r in win.cohort.samples:                         # Group='Normal endoneurium' etc.
+        r.group = f"{'Normal' if r.group == 'normal' else 'Trt'} {r.region.split(' ', 1)[1]}"
     win._refresh_sample_tree()
     assert len(win.cohort.groups()) == 6                 # 2 groups × 3 compartments, tangled
 
@@ -351,15 +351,15 @@ def test_nest_apply_mapping_rescues_a_group_label_that_hides_the_compartment(
     gmap = {g: g.split(" ", 1)[0].lower() for g in win.cohort.groups()}
     win._nest_apply_mapping(cmap, gmap)
 
-    assert sorted(win.cohort.groups()) == ["facial", "synk"]
+    assert sorted(win.cohort.groups()) == ["normal", "trt"]
     assert win._nest_comp_from() == "meta:compartment"   # adopted without being asked
     assert win._nest_compartments() == sorted(COMPARTMENTS)
     info = win.nest_info.text()
     assert "3 compartments" in info and "9 subjects" in info
 
     _prepare(win)
-    win.nest_ga.setCurrentText("facial")
-    win.nest_gb.setCurrentText("synk")
+    win.nest_ga.setCurrentText("normal")
+    win.nest_gb.setCurrentText("trt")
     win._nest_run()
     res = win._nest_res
     assert res.attrs["n_subjects_a"] == 3 and res.attrs["n_subjects_b"] == 6
@@ -386,10 +386,10 @@ def test_nest_apply_mapping_persists_and_excludes_blank_compartments(app, monkey
 def test_nest_design_dialog_seeds_the_mapping_and_applies_it_on_accept(
         app, monkeypatch, tmp_path):
     """Drive the real dialog: accepting it without editing must apply the seeded guess, which
-    for 'n00 endoneurium' / 'Facial endoneurium' is exactly the mapping we want."""
+    for 'n00 endoneurium' / 'Normal endoneurium' is exactly the mapping we want."""
     win = _win(monkeypatch, tmp_path, region_namer=_per_nerve)
     for r in win.cohort.samples:
-        r.group = f"{'Facial' if r.group == 'facial' else 'Synk'} {r.region.split(' ', 1)[1]}"
+        r.group = f"{'Normal' if r.group == 'normal' else 'Trt'} {r.region.split(' ', 1)[1]}"
     win._refresh_sample_tree()
 
     monkeypatch.setattr(QtWidgets.QDialog, "exec",
@@ -397,7 +397,7 @@ def test_nest_design_dialog_seeds_the_mapping_and_applies_it_on_accept(
     win._nest_design_dialog()
 
     assert win._nest_compartments() == sorted(COMPARTMENTS)
-    assert sorted(win.cohort.groups()) == ["Facial", "Synk"]
+    assert sorted(win.cohort.groups()) == ["Normal", "Trt"]
     assert "3 compartment(s)" in win.statusBar().currentMessage()
     # the Subject column seeds from the region's first token, so every nerve is its own subject
     assert {(r.meta or {}).get("subject") for r in win.cohort.samples} == \
@@ -428,17 +428,17 @@ def test_nest_design_dialog_without_region_samples_explains_itself(app, monkeypa
 
 
 def test_nested_run_refuses_group_labels_that_embed_the_compartment(app, monkeypatch, tmp_path):
-    """The run that produced 231 rows of `converged = FALSE`: Group A='Facial endo',
-    B='Synk endo' restricts the table to endo rows while the model still expects three
+    """The run that produced 231 rows of `converged = FALSE`: Group A='Normal endo',
+    B='Trt endo' restricts the table to endo rows while the model still expects three
     compartments, so every design matrix is rank-deficient."""
     win = _win(monkeypatch, tmp_path, region_namer=_per_nerve)
     for r in win.cohort.samples:                          # 6 tangled groups
         comp = r.region.split(" ", 1)[1]
-        r.group = f"{'Facial' if r.group == 'facial' else 'Synk'} {comp}"
+        r.group = f"{'Normal' if r.group == 'normal' else 'Trt'} {comp}"
     win._refresh_sample_tree()
     _prepare(win)
-    win.nest_ga.setCurrentText("Facial endoneurium")
-    win.nest_gb.setCurrentText("Synk endoneurium")
+    win.nest_ga.setCurrentText("Normal endoneurium")
+    win.nest_gb.setCurrentText("Trt endoneurium")
 
     st = win._nest_design_state()
     assert st["n_a"] == 3 and st["n_b"] == 6              # the counts still look fine...
@@ -456,8 +456,8 @@ def test_nested_run_refuses_group_labels_that_embed_the_compartment(app, monkeyp
 
 def test_nested_run_refuses_a_compartment_missing_from_one_group(app, monkeypatch, tmp_path):
     win = _win(monkeypatch, tmp_path)
-    for r in win.cohort.samples:                          # facial nerves have no epineurium
-        if r.group == "facial" and r.region == "epineurium":
+    for r in win.cohort.samples:                          # normal nerves have no epineurium
+        if r.group == "normal" and r.region == "epineurium":
             r.group = "excluded"
     win._refresh_sample_tree()
     _prepare(win)
@@ -558,12 +558,12 @@ def test_nest_seed_helpers_guess_the_mapping():
     assert CohortMixin._nest_seed_compartment("S01 endo") == "endo"
     assert CohortMixin._nest_seed_compartment("s02_peri") == "peri"
     assert CohortMixin._nest_seed_compartment("") == ""
-    # 'Synk endo' → 'Synk' once 'endo' is a known compartment; a clean label is left alone
+    # 'Trt endo' → 'Trt' once 'endo' is a known compartment; a clean label is left alone
     seed = CohortMixin._nest_seed_group
     known = {"endo", "epi", "peri"}
-    assert seed(None, "Synk endo", known) == "Synk"
-    assert seed(None, "Facial epi", known) == "Facial"
-    assert seed(None, "facial", known) == "facial"
+    assert seed(None, "Trt endo", known) == "Trt"
+    assert seed(None, "Normal epi", known) == "Normal"
+    assert seed(None, "normal", known) == "normal"
     assert seed(None, "endo", known) == "endo"           # nothing left → keep the label
 
 
@@ -578,7 +578,7 @@ def test_nested_run_refuses_one_subject_per_group(app, monkeypatch, tmp_path):
     win._nest_run()
     # 1 nerve × 3 compartments must NOT read as n=3 — the guard counts subjects, not rows
     assert "Each group needs ≥2 subjects" in win.statusBar().currentMessage()
-    assert "facial has 1" in win.statusBar().currentMessage()
+    assert "normal has 1" in win.statusBar().currentMessage()
 
 
 def test_nested_csv_export_stamps_the_model_and_the_feasibility_verdict(

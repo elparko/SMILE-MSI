@@ -530,7 +530,7 @@ def test_gui_lipid_list_save_load_persist(win):
 
     # save → a new lipid list (fixture auto-accepts the name prompt with the suggested text)
     n_before = len(win._lipid_lists)
-    name = win.save_lipid_list(mzs_by_class, suggested="Facial vs Synk classes")
+    name = win.save_lipid_list(mzs_by_class, suggested="Normal vs Trt classes")
     assert name and len(win._lipid_lists) == n_before + 1
     entries = win._lipid_lists[name]
     assert len(entries) >= 2 and all(e["color"] and e["mzs"] for e in entries)
@@ -921,7 +921,7 @@ def test_gui_report_builder(win, tmp_path):
     win.last_stats = pd.DataFrame({"mz": [p["mz"] for p in win.peaks[:3]],
                                    "best_lipid": ["A", "B", "C"], "AUC": [0.8, 0.2, 0.6],
                                    "q_value": [1e-3, 2e-3, 3e-3], "log2_fc": [1.0, -1.0, 0.58]})
-    win._region_labels = ("Normal", "Synkinetic")
+    win._region_labels = ("Normal", "Treated")
 
     win._report_add_ion()
     win._report_add_overlay()
@@ -995,7 +995,7 @@ def test_gui_export_auto_logs_to_report(win, tmp_path, monkeypatch):
     win.last_stats = pd.DataFrame({"mz": [p["mz"] for p in win.peaks[:3]],
                                    "best_lipid": ["A", "B", "C"], "AUC": [0.8, 0.2, 0.6],
                                    "q_value": [1e-3, 2e-3, 3e-3], "log2_fc": [1.0, -1.0, 0.58]})
-    win._region_labels = ("Normal", "Synkinetic")
+    win._region_labels = ("Normal", "Treated")
     opts = {"crop_region": None, "roi_outline": False}
 
     # an ion export logs one auto-tagged ion item …

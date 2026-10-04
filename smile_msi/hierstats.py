@@ -8,7 +8,7 @@ sub-measurements of one biological sample, so the unit of replication is the **s
 not the pixel — and a compartment's three values within one subject are correlated,
 so they are not three independent observations either.
 
-    group  (facial | synkinetic)
+    group  (normal | treated)
       └─ subject      ← the unit of replication (a nerve, a donor, an animal)
            └─ compartment   ← repeated measure within the subject
                 └─ pixel    ← pseudoreplicate; summarized away before any test
@@ -410,11 +410,11 @@ def nested_mixed_model(X: np.ndarray, group, compartment, subject, group_a: str,
     Per feature the model yields, via Wald contrasts on the fixed effects:
 
     * ``p_interaction`` — joint test of all ``group:compartment`` terms. "Does the
-      facial-vs-synkinetic difference *itself* differ across compartments?"
+      normal-vs-treated difference *itself* differ across compartments?"
     * ``p_group`` — the group effect averaged over compartments (the mean simple effect,
       which is the interpretable main effect under treatment coding).
     * ``effect__<c>`` / ``se__<c>`` / ``p__<c>`` — the group's **simple effect within each
-      compartment** ``c``, i.e. facial vs synkinetic in the endoneurium alone.
+      compartment** ``c``, i.e. normal vs treated in the endoneurium alone.
 
     Each family of p-values is BH-adjusted independently across features (``q_interaction``,
     ``q_group``, ``q__<c>``), because they answer different questions and are reported

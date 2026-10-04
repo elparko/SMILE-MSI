@@ -1885,7 +1885,7 @@ class CohortMixin:
             "Define compartments…", self._nest_design_dialog,
             tooltip="Map each region name to a compartment, and each group label to a group. "
                     "Use this when the names embed the nerve id, or when the group label mixes "
-                    "the group with the compartment (e.g. 'Synk endo').")
+                    "the group with the compartment (e.g. 'Trt endo').")
         self.b_nest_class = button(
             "Lipid class test…", self._nest_class_dialog,
             tooltip="Roll the per-ion results up to lipid classes and test each class against "
@@ -2177,8 +2177,8 @@ class CohortMixin:
                 "'Add regions as cohort samples' in the Samples panel.")
             return
         subj_vocab, comp_vocab = self._nest_token_roles(refs)
-        # The compartment tokens to strip out of the group labels, so 'Synk endo' collapses to
-        # 'Synk' — otherwise picking Group A/B would silently restrict the model to one
+        # The compartment tokens to strip out of the group labels, so 'Trt endo' collapses to
+        # 'Trt' — otherwise picking Group A/B would silently restrict the model to one
         # compartment. Fall back to the seeded compartment names on a lone slide.
         known = set(comp_vocab) or {self._nest_seed_compartment(rg, comp_vocab).lower()
                                     for rg in {r.region for r in refs}}
@@ -2290,7 +2290,7 @@ class CohortMixin:
         return subjects, compartments
 
     def _nest_seed_group(self, label: str, compartments) -> str:
-        """Best guess at the experimental group inside a group label like ``'Synk endo'``:
+        """Best guess at the experimental group inside a group label like ``'Trt endo'``:
         the label with any known compartment token removed. Falls back to the label itself,
         which is correct whenever the group was already clean."""
         parts = [p for p in re.split(r"[\s_\-]+", (label or "").strip()) if p]
@@ -2319,7 +2319,7 @@ class CohortMixin:
         # cross-slide structure, so the seeds survive names this codebase has never seen.
         subj_vocab, comp_vocab = self._nest_token_roles(refs)
         seeds = {rg: self._nest_seed_compartment(rg, comp_vocab) for rg in regions}
-        # The group seeder strips *known* compartment tokens out of a label like 'Synk endo'.
+        # The group seeder strips *known* compartment tokens out of a label like 'Trt endo'.
         # Feed it the inferred vocabulary, not just the tokens that happened to seed — otherwise
         # a compartment the old rule mis-read stays inside every one of its group labels too.
         known = set(comp_vocab) or {v.lower() for v in seeds.values() if v}
@@ -2555,9 +2555,9 @@ class CohortMixin:
             covered = [c for c in st["compartments"] if c not in st["missing_in_ab"]]
             return (f"Groups '{st['ga']}' and '{st['gb']}' contain no {missing} samples — they "
                     f"only cover {', '.join(covered) or 'nothing'}. Your group labels embed the "
-                    f"compartment ('Synk endo'), so picking them restricts the model to one "
+                    f"compartment ('Trt endo'), so picking them restricts the model to one "
                     f"compartment and nothing can be fitted. Use 'Define compartments…' to "
-                    f"relabel the groups (Facial / Synk), then read the contrast you want "
+                    f"relabel the groups (Normal / Trt), then read the contrast you want "
                     f"('Group within {st['compartments'][0]}').")
         if st["empty_cells"]:
             return (f"Compartment(s) {', '.join(st['empty_cells'])} are missing from one of the "

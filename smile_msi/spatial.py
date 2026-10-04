@@ -1974,7 +1974,7 @@ def multigroup_features(ds, labels, peaks, tol_ppm: float = DEFAULT_TOL_PPM, nor
     in ``df.attrs['test']``.
 
     Pass ``names`` — the group name aligned to each label id — to label ``top_region``
-    with the readable group name (e.g. 'Synk') instead of the raw integer cluster id; a
+    with the readable group name (e.g. 'Trt') instead of the raw integer cluster id; a
     label id outside ``names`` falls back to ``'region <n>'``. When ``names`` is None the
     column keeps the raw integer ids.
 

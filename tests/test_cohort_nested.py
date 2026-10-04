@@ -65,7 +65,7 @@ def test_pseudobulk_table_never_lets_the_streamed_path_normalize():
     slide-wide factors ourselves."""
     raw = np.array([[1.0], [1.0], [1.0], [10.0], [10.0], [10.0]])
     ds = _StubDS(raw, np.ones(6))
-    r = _ref("slideA", group="facial", region="epineurium", subject="n1")
+    r = _ref("slideA", group="normal", region="epineurium", subject="n1")
     loader = _StubLoader({"slideA": (ds, np.array([3, 4, 5]))})
 
     tbl = cohort.pseudobulk_table([r], [700.0], norm="tic", summary="median", loader=loader,
@@ -280,11 +280,11 @@ def _nested_table(rng, n_a=3, n_b=6, n_feat=6, interaction=2.5):
     base[0] = 5000.0                                      # the planted feature sits well above τ
     for i in range(n_a + n_b):
         subj = f"nerve{i:02d}"
-        grp = "facial" if i < n_a else "synkinetic"
+        grp = "normal" if i < n_a else "treated"
         off = rng.normal(1.0, 0.05)                       # multiplicative subject effect
         for comp in COMPARTMENTS:
             y = base * off * rng.normal(1.0, 0.03, n_feat)
-            if grp == "synkinetic" and comp == "epineurium":
+            if grp == "treated" and comp == "epineurium":
                 y[0] *= 2.0 ** interaction                # interaction on feature 0
             refs.append(_ref(f"{subj}::{comp}", group=grp, region=comp, subject=subj))
             rows.append({"group": grp, **dict(zip(cols, y))})
@@ -337,7 +337,7 @@ def test_nested_design_requires_row_aligned_refs():
 # --------------------------------------------------------------------------- #
 def test_nested_comparison_lmm_finds_the_interaction_and_stamps_provenance():
     tbl = _nested_table(np.random.default_rng(2026))
-    res = cohort.nested_comparison(tbl, "facial", "synkinetic", subject_by="subject",
+    res = cohort.nested_comparison(tbl, "normal", "treated", subject_by="subject",
                                    model="lmm", compartments=COMPARTMENTS)
     assert res.attrs["model"] == "lmm"
     assert res.attrs["transform"] == "log2"
@@ -360,7 +360,7 @@ def test_nested_comparison_lmm_finds_the_interaction_and_stamps_provenance():
 
 def test_nested_comparison_carries_the_small_n_feasibility_verdict():
     tbl = _nested_table(np.random.default_rng(5), n_feat=50)
-    res = cohort.nested_comparison(tbl, "facial", "synkinetic", subject_by="subject",
+    res = cohort.nested_comparison(tbl, "normal", "treated", subject_by="subject",
                                    model="lmm", compartments=COMPARTMENTS)
     fea = res.attrs["feasibility"]
     assert fea["n_a"] == 3 and fea["n_b"] == 6 and fea["n_features"] == 50
@@ -371,7 +371,7 @@ def test_nested_comparison_carries_the_small_n_feasibility_verdict():
 
 def test_nested_comparison_stratified_matches_the_lmm_on_the_planted_feature():
     tbl = _nested_table(np.random.default_rng(7), n_feat=20)
-    strat = cohort.nested_comparison(tbl, "facial", "synkinetic", subject_by="subject",
+    strat = cohort.nested_comparison(tbl, "normal", "treated", subject_by="subject",
                                      model="stratified", method="modt",
                                      compartments=COMPARTMENTS)
     assert strat.attrs["model"] == "stratified"
@@ -385,9 +385,9 @@ def test_nested_comparison_stratified_matches_the_lmm_on_the_planted_feature():
 
 def test_nested_comparison_log2_transform_is_applied_and_can_be_disabled():
     tbl = _nested_table(np.random.default_rng(9), n_feat=8)
-    log = cohort.nested_comparison(tbl, "facial", "synkinetic", subject_by="subject",
+    log = cohort.nested_comparison(tbl, "normal", "treated", subject_by="subject",
                                    compartments=COMPARTMENTS, transform="log2")
-    raw = cohort.nested_comparison(tbl, "facial", "synkinetic", subject_by="subject",
+    raw = cohort.nested_comparison(tbl, "normal", "treated", subject_by="subject",
                                    compartments=COMPARTMENTS, transform="none")
     assert log.attrs["transform"] == "log2" and raw.attrs["transform"] == "none"
     # the model coefficient lives on the modelling scale, so it differs; the τ-regularized
@@ -400,11 +400,11 @@ def test_nested_comparison_log2_transform_is_applied_and_can_be_disabled():
 def test_nested_comparison_rejects_bad_arguments():
     tbl = _nested_table(np.random.default_rng(11))
     with pytest.raises(ValueError, match="must differ"):
-        cohort.nested_comparison(tbl, "facial", "facial", subject_by="subject")
+        cohort.nested_comparison(tbl, "normal", "normal", subject_by="subject")
     with pytest.raises(ValueError, match="no samples labelled"):
         cohort.nested_comparison(tbl, "nope", "nada", subject_by="subject")
     with pytest.raises(ValueError, match="unknown model"):
-        cohort.nested_comparison(tbl, "facial", "synkinetic", subject_by="subject", model="glm")
+        cohort.nested_comparison(tbl, "normal", "treated", subject_by="subject", model="glm")
     with pytest.raises(ValueError, match="unknown transform"):
-        cohort.nested_comparison(tbl, "facial", "synkinetic", subject_by="subject",
+        cohort.nested_comparison(tbl, "normal", "treated", subject_by="subject",
                                  transform="sqrt")

@@ -111,7 +111,7 @@ def _demo_res():
     fc, p, q, mz, labels = _demo_arrays()
     res = pd.DataFrame({"mz": mz, "log2_fc": fc, "p_value": p, "q_value": q,
                         "best_lipid": [lab if i % 2 else "" for i, lab in enumerate(labels)]})
-    res.attrs["a_label"] = "Facial"
+    res.attrs["a_label"] = "Normal"
     res.attrs["b_label"] = "Sciatic"
     return res
 
@@ -120,17 +120,17 @@ def test_dialog_builds_and_previews(app):
     from PySide6 import QtWidgets
     from smile_msi.gui.plotexport import VolcanoExportDialog
     win = QtWidgets.QMainWindow()
-    dlg = VolcanoExportDialog(win, _demo_res(), a_label="Facial", b_label="Sciatic")
+    dlg = VolcanoExportDialog(win, _demo_res(), a_label="Normal", b_label="Sciatic")
     assert dlg._pixmap is not None                    # preview rendered
     assert dlg.preset_combo.count() >= 6              # style presets present
-    assert dlg.a_edit.text() == "Facial"
+    assert dlg.a_edit.text() == "Normal"
 
 
 def test_dialog_options_change_and_export(app, tmp_path):
     from PySide6 import QtWidgets
     from smile_msi.gui.plotexport import VolcanoExportDialog
     win = QtWidgets.QMainWindow()
-    dlg = VolcanoExportDialog(win, _demo_res(), a_label="Facial", b_label="Sciatic")
+    dlg = VolcanoExportDialog(win, _demo_res(), a_label="Normal", b_label="Sciatic")
     dlg.theme_combo.setCurrentText("Dark")
     dlg.label_combo.setCurrentIndex(4)                # Top 20
     dlg._render()

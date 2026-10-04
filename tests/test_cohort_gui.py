@@ -62,19 +62,19 @@ def test_cohort_tab_group_comparison(app, monkeypatch, tmp_path):
         win.cohort.add(cohort.ref_from_session(p, group="control"))
     for i, rel in enumerate([0.80, 0.78, 0.83]):
         p = _write_session(f"/d/syn{i}.imzML", [_peak(t_up, rel), _peak(t_flat, 0.5)], fp=f"s{i}")
-        win.cohort.add(cohort.ref_from_session(p, group="synkinetic"))
+        win.cohort.add(cohort.ref_from_session(p, group="treated"))
 
     win._refresh_sample_tree()                       # populates the group combos
     # roster shows two group buckets, each with its samples
     assert win.sample_tree.topLevelItemCount() == 2
     assert {win.cohort_ga.itemText(i) for i in range(win.cohort_ga.count())} == \
-        {"control", "synkinetic"}
+        {"control", "treated"}
 
     win.cohort_feat_combo.setCurrentIndex(0)         # consensus features
     win.cohort_prev_spin.setValue(0.0)
     win.cohort_tol_spin.setValue(50.0)
     win.cohort_ga.setCurrentText("control")
-    win.cohort_gb.setCurrentText("synkinetic")
+    win.cohort_gb.setCurrentText("treated")
     win._cohort_run()
 
     # the comparison ran: table populated, volcano + heatmap rendered
@@ -87,7 +87,7 @@ def test_cohort_tab_group_comparison(app, monkeypatch, tmp_path):
     assert len(win.cohort_volcano.listDataItems()) >= 1
     res = win._cohort_res
     up = res[abs(res["mz"] - t_up) < 0.01].iloc[0]
-    assert up["log2_fc"] > 1.0                        # discriminating ion up in synkinetic
+    assert up["log2_fc"] > 1.0                        # discriminating ion up in treated
     assert up["q_value"] <= 0.2
 
     # CSV export writes a file
@@ -271,7 +271,7 @@ def test_cohort_feature_list_picker_and_group_guard(app, monkeypatch, tmp_path):
     win._run = _sync_run
     win.cohort = cohort.Cohort(name="PickerCohort")
     for i, (rel, grp) in enumerate([(0.20, "control"), (0.25, "control"),
-                                    (0.80, "synkinetic"), (0.85, "synkinetic")]):
+                                    (0.80, "treated"), (0.85, "treated")]):
         p = _write_session(f"/d/s{i}.imzML", [_peak(t_list, rel), _peak(t_other, 0.5)], fp=f"p{i}")
         win.cohort.add(cohort.ref_from_session(p, group=grp))
     win._refresh_sample_tree()
@@ -285,20 +285,20 @@ def test_cohort_feature_list_picker_and_group_guard(app, monkeypatch, tmp_path):
     fc.setCurrentIndex(idx)
     fc.setProperty("user_touched", True)                 # simulate an explicit pick
     win.cohort_tol_spin.setValue(50.0)
-    win.cohort_ga.setCurrentText("control"); win.cohort_gb.setCurrentText("synkinetic")
+    win.cohort_ga.setCurrentText("control"); win.cohort_gb.setCurrentText("treated")
     win._cohort_run()
     res = win._cohort_res
     assert {round(float(m), 1) for m in res["mz"]} == {round(t_list, 1)}   # ran on the ★ list only
 
-    # group-size guard: 1 control vs 1 synkinetic is refused (no comparison produced)
+    # group-size guard: 1 control vs 1 treated is refused (no comparison produced)
     win.cohort = cohort.Cohort(name="Tiny")
     pa = _write_session("/d/a.imzML", [_peak(t_list, 0.2)], fp="a")
     pb = _write_session("/d/b.imzML", [_peak(t_list, 0.8)], fp="b")
     win.cohort.add(cohort.ref_from_session(pa, group="control"))
-    win.cohort.add(cohort.ref_from_session(pb, group="synkinetic"))
+    win.cohort.add(cohort.ref_from_session(pb, group="treated"))
     win._refresh_sample_tree()
     win._cohort_res = None
-    win.cohort_ga.setCurrentText("control"); win.cohort_gb.setCurrentText("synkinetic")
+    win.cohort_ga.setCurrentText("control"); win.cohort_gb.setCurrentText("treated")
     win._cohort_run()
     assert win._cohort_res is None                         # refused before running a 1-vs-1 test
 
@@ -421,7 +421,7 @@ def test_cohort_tab_region_samples(app, monkeypatch, tmp_path):
                                {"L": [_peak(t, 0.10)], "R": [_peak(t, 0.12)]}, fp="s1")
     p2 = _write_session_scopes("/d/s2.imzML", [_peak(t, 0.1)],
                                {"L": [_peak(t, 0.80)], "R": [_peak(t, 0.83)]}, fp="s2")
-    for sp, grp in [(p1, "control"), (p2, "synkinetic")]:
+    for sp, grp in [(p1, "control"), (p2, "treated")]:
         for roi in ("L", "R"):
             win.cohort.add(cohort.SampleRef(name=f"{os.path.basename(sp)} · {roi}",
                                             session_path=sp, region=roi, group=grp))
@@ -440,12 +440,12 @@ def test_cohort_tab_region_samples(app, monkeypatch, tmp_path):
     win.cohort_tol_spin.setValue(50.0)
     win.cohort_norm_combo.setCurrentText("none")      # isolate scope-reading from normalization
     win.cohort_ga.setCurrentText("control")
-    win.cohort_gb.setCurrentText("synkinetic")
+    win.cohort_gb.setCurrentText("treated")
     win._cohort_run()
     res = win._cohort_res
     up = res[abs(res["mz"] - t) < 0.05].iloc[0]
     assert up["n_A"] == 2 and up["n_B"] == 2          # two regions per group
-    assert up["log2_fc"] > 1.0                        # marker up in synkinetic regions
+    assert up["log2_fc"] > 1.0                        # marker up in treated regions
 
 
 def test_cohort_umap_pooled_embedding(app, monkeypatch, tmp_path):
@@ -466,7 +466,7 @@ def test_cohort_umap_pooled_embedding(app, monkeypatch, tmp_path):
     win._run = _sync_run
 
     win.cohort = cohort.Cohort(name="EmbedCohort")
-    for i, grp in enumerate(["control", "control", "synkinetic", "synkinetic"]):
+    for i, grp in enumerate(["control", "control", "treated", "treated"]):
         src = str(tmp_path / f"s{i}.imzML")
         demo.write_synthetic_imzml(src, width=16, height=12, seed=i + 1)
         ds = MSIDataset.from_imzml(src); ds.prime()
@@ -488,7 +488,7 @@ def test_cohort_umap_pooled_embedding(app, monkeypatch, tmp_path):
     assert len(emb.sample_names) == 4                    # all four slides pooled
     assert emb.coords.shape[0] == sum(emb.counts.values())
     assert all(c == 80 for c in emb.counts.values())     # per-sample cap honoured
-    assert set(emb.group) == {"control", "synkinetic"}
+    assert set(emb.group) == {"control", "treated"}
     assert win.b_cembed_png.isEnabled()
 
     win.cembed_color_combo.setCurrentText("Group")
@@ -510,7 +510,7 @@ def test_cohort_umap_region_and_sample_means(app, monkeypatch, tmp_path):
     win._run = _sync_run
     win.cohort = cohort.Cohort(name="AggCohort")
     n_slides = 4
-    for i, grp in enumerate(["control", "control", "synkinetic", "synkinetic"]):
+    for i, grp in enumerate(["control", "control", "treated", "treated"]):
         src = str(tmp_path / f"a{i}.imzML")
         demo.write_synthetic_imzml(src, width=16, height=12, seed=i + 1)
         ds = MSIDataset.from_imzml(src); ds.prime()
