@@ -16,6 +16,8 @@ Endpoints (all but ``/`` need the token, ``?t=`` or the ``X-SMILE-Token`` header
     GET  /                  the chat page
     GET  /api/events        server-sent events: the session's events so far, then live
     POST /api/send          {"text"}  start a turn
+    POST /api/review        {"llm": bool}  referee the analysis so far (rule checks, plus a
+                            model-written report when ``llm``); 409 while a turn is running
     POST /api/stop          stop the running turn after its current step
     POST /api/approve       {"call_id", "approve", "note"}  answer an approval request
     GET  /api/config        current settings (``has_key``, never the key)
@@ -104,6 +106,20 @@ class ChatState:
         slot["answer"] = (bool(ok), str(note or ""))
         slot["event"].set()
         return True
+
+    @staticmethod
+    def run_review(agent: Agent, use_llm: bool):
+        """Worker body for ``POST /api/review`` (the caller has already marked the agent busy
+        so no turn can start meanwhile). Ends with ``done`` like a turn, so the page unlocks."""
+        from .review import review
+
+        try:
+            review(agent, use_llm=use_llm)
+        except BaseException as exc:  # noqa: BLE001 — surface, never kill the worker silently
+            agent._event("error", message=f"Review failed: {type(exc).__name__}: {exc}")
+        finally:
+            agent.busy = False
+            agent._event("done")
 
     def new_conversation(self):
         old = self.agent
@@ -260,6 +276,18 @@ def make_handler(state: ChatState, token: str, port: int):
                                           "still working on the last message")
                     agent.busy = True
                 threading.Thread(target=agent.send, args=(text,), daemon=True).start()
+                return self._send(HTTPStatus.ACCEPTED, {"ok": True})
+            if url.path == "/api/review":
+                if agent is None:
+                    return self._deny(HTTPStatus.CONFLICT,
+                                      state.config_error or "set up a model in Settings first")
+                with state.lock:
+                    if agent.busy:
+                        return self._deny(HTTPStatus.CONFLICT,
+                                          "still working — wait for it (or Stop) first")
+                    agent.busy = True
+                threading.Thread(target=state.run_review, args=(agent, bool(body.get("llm", True))),
+                                 daemon=True).start()
                 return self._send(HTTPStatus.ACCEPTED, {"ok": True})
             if url.path == "/api/stop":
                 if agent is not None:
