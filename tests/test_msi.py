@@ -2017,6 +2017,39 @@ def test_confidence_detail_blend():
     assert isotopes.confidence(0.5, True, 2, 10.0, 2.0) == "High"        # back-compat wrapper
 
 
+def test_confidence_high_needs_the_isotope_check():
+    """Mass accuracy, image structure and sibling adducts can outscore a missing isotope
+    pattern; "High" still requires the isotope check to pass."""
+    cd = isotopes.confidence_detail(0.0, False, 3, ppm_tol=5.0, score_gap=None,
+                                    spectral=0.95, spatial=0.9, morans=0.9)
+    assert cd["score"] >= 70                                    # would have been High
+    assert cd["label"] == "Medium"
+    assert any("isotope check failed" in r for r in cd["reasons"])
+    ok = isotopes.confidence_detail(0.0, True, 3, ppm_tol=5.0, score_gap=None,
+                                    spectral=0.95, spatial=0.9, morans=0.9)
+    assert ok["label"] == "High"
+
+
+def test_narrow_window_still_holds_the_nearest_profile_sample():
+    """The demo's profile axis is a 10 mDa grid; a 10 ppm window at m/z 282 is 5.6 mDa
+    wide, so FA 18:1's M+1 (3.4 mDa off the grid) used to extract nothing, by every path."""
+    d = demo.make_synthetic(width=16, height=12, seed=3)
+    m1 = 281.2486 + isotopes.DELTA_C13
+    assert d.ion_vector(m1, tol_ppm=10).sum() > 0                       # arbitrary-m/z path
+    d.build_features([281.2486, m1], tol_ppm=10)                       # cached-feature path
+    assert d.feature_matrix("none")[:, 1].sum() > 0
+    assert d.ion_vector(m1, tol_ppm=10).sum() > 0                       # … served from the cache
+
+
+def test_window_floor_never_bridges_a_gap_in_the_axis():
+    axis = np.r_[np.arange(500.0, 501.0, 0.01), np.arange(502.0, 503.0, 0.01)]
+    ints = np.ones_like(axis, dtype=np.float32)
+    d = MSIDataset.from_arrays([(1, 1), (2, 1)], [axis, axis], [ints, ints],
+                               polarity="negative", spec_mode="profile")
+    assert d.ion_vector(500.503, tol_ppm=1).sum() == 2                 # nearest sample, 1/pixel
+    assert d.ion_vector(501.5, tol_ppm=10).sum() == 0                  # mid-gap: nothing there
+
+
 def test_fdr_randomized_decoy_reliability(ds):
     pk = [p["mz"] for p in ds.pick_peaks(snr=3, min_rel_intensity=0.01)]
     fdr = annotate.estimate_fdr(pk, mode="negative")

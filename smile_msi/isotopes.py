@@ -232,7 +232,8 @@ def confidence_detail(ppm: float, isotope_ok: bool, n_adducts: int,
 
     ``spectral``/``spatial`` are the [0,1] scores from :func:`isotope_scores`;
     ``morans`` is the feature's Moran's I (negatives clipped). Returns
-    ``{"score": int 0-100, "label": "High"|"Medium"|"Low", "reasons": [...]}``.
+    ``{"score": int 0-100, "label": "High"|"Medium"|"Low", "reasons": [...]}``. "High"
+    needs ``isotope_ok``: a score that would reach it without one is labelled "Medium".
 
     This is the **multi-signal** Features-tab confidence — a different metric from the
     Excel report's "Mass-match confidence" (``pipeline.build_report``), which uses mass
@@ -279,6 +280,11 @@ def confidence_detail(ppm: float, isotope_ok: bool, n_adducts: int,
 
     pct = int(round(100 * score01))
     label = "High" if pct >= 70 else ("Medium" if pct >= 45 else "Low")
+    if label == "High" and not isotope_ok:
+        # mass accuracy and spatial structure alone can outscore a missing isotope pattern;
+        # "High" claims the envelope was seen
+        label = "Medium"
+        reasons.append("capped at Medium: isotope check failed")
     return {"score": pct, "label": label, "reasons": reasons}
 
 

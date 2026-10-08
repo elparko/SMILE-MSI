@@ -7,7 +7,7 @@ You are writing a short **Python script** that analyses one loaded mass-spectrom
 ## Execution model
 - The script is ordinary Python 3. `numpy` is available as `np`. No imports are needed for the analysis functions — they are pre-bound bare names.
 - It runs **against the open slide**, exposed as `ds` (an `MSIDataset`). You do not load data; it is already there.
-- There is no value to `return`. You surface results with the output helpers below; anything you `print()` is captured into the run log too.
+- There is no value to `return`. You surface results with the output helpers below. `print()` output is captured separately from the run log, as the run's `stdout` (the Script Console shows it under *stdout*; the MCP `run_script` result returns it as `stdout`). Use `log()` for lines that belong in the run log.
 - Runs may take seconds (peak picking, segmentation, multivariate). That is normal.
 - The script is sandbox-free (full Python on the user's machine) but should avoid network access and writing files — use the console's *Export* for artifacts.
 
@@ -16,24 +16,27 @@ You are writing a short **Python script** that analyses one loaded mass-spectrom
 - `table(df, title='')` — show a pandas DataFrame (or list-of-dicts) as a table.
 - `image(x, title='')` — show an ion image. `x` is an m/z (float), a per-pixel vector, or a 2-D array.
 - `record(name, value)` — stash a named value to inspect after the run.
+- `ds.ratio_image(num_mz, den_mz, tol_ppm=…, norm='none', eps=1.0)` — an H×W image of one ion over another (e.g. sulfatide/PC); show it with `image(...)`. It takes its own `tol_ppm` (pass `api.ppm` to match the session) and `eps` keeps a ~0 denominator finite.
 
 ## Core concepts
 - **Features** = the working set of m/z the analyses operate on. Produce it with `find_peaks()` / `find_spatial_features()` (they set it as a side effect), or pass `features=[...]` explicitly. Most steps default to the working set.
 - **Regions** = named ROIs drawn in the app; resolve a mask with `region('name')`.
 - **Groups** = ROIs tagged Group A/B/… for comparisons; `group('A')` or pass names to `compare` / `discriminating` / `markers`. With no groups tagged, group-based steps fall back to the latest `segment()` clusters.
 - **ppm / norm / reduce** are the extraction defaults; set `api.ppm = 5`, `api.norm = 'rms'` etc. once at the top to change them for the whole script.
-- **Regions by construction** — build masks from the signal instead of drawing: `threshold_mask(composite([...m/z...]), 60)` (60th percentile of signal pixels, holes filled), `ring(mask, width_px=6, mode='outer')` (a collar outside it), `invert(mask)` (everything else). `add_region('name', mask)` stages a region the console can push into the app (Apply to app ▸ Add regions to the slide) and makes it usable by name.
+- **Regions by construction** — build masks from the signal instead of drawing: `threshold_mask(composite([...m/z...]), 60)`, `ring(mask, width_px=6, mode='outer')` (a collar outside it), `invert(mask)` (everything else). `add_region('name', mask)` stages a region the console can push into the app (Apply to app ▸ Add regions to the slide) and makes it usable by name.
+- **`threshold_mask` fills holes by default** (`fill_holes=True`): it is built for solid compartments, so a **rim or ring** signal comes back as a solid disc covering the core it encloses — pass `fill_holes=False` for one (the run log warns when filling grew the mask a lot). The cut is a **percentile of every pixel with signal > 0**, and off-tissue pixels with any noise count, so `60` is not the 60th percentile of the tissue; for that, threshold `values * tissue_mask`, or pass `percentile=False` and an absolute intensity.
+- **Segmentation clusters every acquired pixel** unless you pass `mask=`: with off-tissue background on the slide, `segment(n_clusters=2)` usually splits tissue from background. Use `segment(mask=tissue)` to cluster the tissue alone.
 
 ## Analysis functions (bare names)
 - `mean_spectrum(mask=None)` — ``(mz_axis, intensities)`` mean spectrum over the whole slide or a region/mask.
 - `ion_image(mz)` — 2-D ion image (H×W array) for one m/z at the current ppm / reduce / norm.
 - `ion_vector(mz)` — Per-pixel intensity vector (length n_pixels) for one m/z.
 - `feature_matrix(features=None)` — The pixels×features intensity matrix for the working (or given) feature set.
-- `find_peaks(snr: float = 3.0, min_rel_intensity: float = 0.0, max_peaks: int = 500, prominence: float = 1.0, mask=None)` — Detect peaks in the mean spectrum → set + return the working feature set.
-- `find_spatial_features(snr: float = 3.0, min_rel_intensity: float = 0.0, min_frequency: float = 0.0, min_morans: float = 0.0, mask=None)` — Spatially-aware peak detection (S/N → reproducibility → Moran's I) → working set.
+- `find_peaks(snr: float = 3.0, min_rel_intensity: float = 0.0, max_peaks: int = 0, prominence: float = 1.0, mask=None)` — Detect peaks in the mean spectrum → set + return the working feature set.
+- `find_spatial_features(snr: float = 3.0, min_rel_intensity: float = 0.0, min_frequency: float = 0.0, min_morans: float = 0.0, mask=None, max_candidates: int = 2000)` — Spatially-aware peak detection (S/N → reproducibility → Moran's I) → working set.
 - `set_features(features)` — Set the working feature set later steps default to (m/z floats or peak dicts).
 - `get_features()` — The current working feature set (list of m/z floats).
-- `segment(features=None, n_clusters: int = 0, spatial: bool = True, spatial_sigma: float = 1.0)` — Cluster pixels into regions (``n_clusters=0`` → auto by silhouette). Sets
+- `segment(features=None, n_clusters: int = 0, spatial: bool = True, spatial_sigma: float = 1.0, mask=None)` — Cluster pixels into regions (``n_clusters=0`` → auto by silhouette). Sets
 - `compare(a, b, features=None, method: str = 'mwu', samples=None)` — Per-ion comparison of two groups A vs B (AUC + signed log2_fc + test) → DataFrame.
 - `discriminating(features=None, groups=None, top_n: int = 15)` — Top ions enriched in each group vs the rest (one-vs-rest AUC + FDR) → {group: df}.
 - `multigroup(features=None, groups=None, method: str = 'kruskal')` — Per-ion test across 3+ groups (Kruskal-Wallis or ANOVA) → DataFrame.
@@ -62,8 +65,8 @@ You are writing a short **Python script** that analyses one loaded mass-spectrom
 Every analysis is also reachable by id through `run()` (forward-compatible escape hatch). `run()` resolves `features` / `groups` / `mask` / `target_mz` for you:
 
 **Peaks**
-- `find_spatial_features` — Spatially-aware peak detection (S/N → reproducibility → Moran's I denoise). Produces the working feature set later steps use. _(needs: —; params: snr, min_rel_intensity, min_frequency, min_morans, tol_ppm, norm)_
-- `find_coherent_features` — Spatial feature detection (S/N → reproducibility → Moran's I) plus an artifact-rejection quality gate (spatial-chaos morphology + hotspot concentration) that screens out delocalization / matrix-crystal ions which pass autocorrelation but aren't real. Produces a working feature set. _(needs: —; params: snr, min_rel_intensity, min_frequency, min_morans, min_quality, max_hotspot, tol_ppm, norm)_
+- `find_spatial_features` — Spatially-aware peak detection (S/N → reproducibility → Moran's I denoise). Produces the working feature set later steps use. _(needs: —; params: snr, min_rel_intensity, min_frequency, min_morans, max_candidates, tol_ppm, norm)_
+- `find_coherent_features` — Spatial feature detection (S/N → reproducibility → Moran's I) plus an artifact-rejection quality gate (spatial-chaos morphology + hotspot concentration) that screens out delocalization / matrix-crystal ions which pass autocorrelation but aren't real. Produces a working feature set. _(needs: —; params: snr, min_rel_intensity, min_frequency, min_morans, min_quality, max_hotspot, max_candidates, tol_ppm, norm)_
 - `find_peaks` — Detect peaks in the mean spectrum (S/N + prominence). Produces the working feature set. _(needs: —; params: snr, min_rel_intensity, prominence, max_peaks)_
 
 **Segmentation**

@@ -5,7 +5,49 @@ All notable changes to SMILE MSI. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+- **The same ion no longer changes intensity mid-session.** `run_analysis(...)` in scripts (and
+  the MCP / chat tool of the same name) let a registry step extract at its own default window
+  (50 ppm) instead of the session's tolerance, so after e.g. segmentation an ion's values were
+  read from a wider window — a 0.81 → 1.39 jump for the same ion on the demo slide. It now uses
+  the session's tolerance and normalization, as the named wrappers always did.
+
 ### Added
+- **Reviewer for chat analyses.** A *Review* button referees the analysis so far: rule checks
+  over the session log (pixel-level p-values under pixel replication, tool failures the reply
+  never acknowledged, lipid IDs stated without hedging, p/q without an effect size, deviations
+  from the setup, no recorded question) plus a model-written referee report (major / minor /
+  well supported). Findings are cited by log entry and land in the Markdown log.
+- **Your chat tools and flows over MCP.** The MCP server gains a stable set of tools to list,
+  run, create, edit and delete user-made tools and to save / run flows — so Claude Desktop (or
+  any MCP client) can use what you built in the chat. Create / edit / delete are marked
+  destructive, so clients ask before running them.
+- **Atlas-style figures (`smile_msi.atlasviz`).** `dot_mosaic` draws an ion or segmentation image
+  as round dots on black (the "lipizones" look) with a scale bar and outline inset;
+  `splitter_movie` writes a GIF in which segments fade into their children level by level, in
+  the tree-aware colours, blended in OKLab.
+- **Plain-language analysis chat — `smile-msi chat`.** A browser chat (local server, standard
+  library only) where you describe an analysis and a model runs it with the MCP server's tools:
+  tool calls stream in as they run, figures appear inline (and the model sees them), and every
+  message, tool call, argument, result, approval, dataset fingerprint and token count goes to an
+  append-only session log, exportable as Markdown ending in a replayable list of tool calls.
+  Bring your own model: Claude through the official SDK (`[agent]` extra) or any
+  OpenAI-compatible local server (Ollama, LM Studio, llama.cpp, vLLM). The model can create,
+  edit and delete its own versioned analysis tools — each such change waits for your approval
+  and shows the code — and save analyses as replayable flows.
+- **Analysis setup before the chat starts.** A setup card (then a sidebar) fixes the question,
+  replication unit, q and AUC thresholds and the method settings from an Analysis Profile before
+  any analysis runs. It is logged, applied to the slide, filled into tool calls, and any call that
+  differs is flagged as a deviation; it can be saved as a profile the desktop app can load.
+- **Chat hardening.** Adversarial testing (model-driven and code review) found ways to wedge a
+  conversation, read files outside the data folder, and get misleading "ok" results; all fixed,
+  with a regression test each (see the commit for the list).
+- **Segments coloured by the tree.** Segmentations cut from the granularity tree are coloured
+  with Tree Colors (Tennekes & de Jonge 2014) in OKLCh instead of a 12-colour cycling palette:
+  sibling segments share a hue family, a segment keeps its hue family as Detail gets finer, and
+  colours no longer repeat past 12 segments. The segment map, live Detail preview, dendrogram,
+  figure export and joint segmentation all use them; manual splits get shades of the parent;
+  the colours are saved with the session.
 - **Copying a table copies the table.** Qt gives a grid no copy of its own, so ⌘C over a result
   table left the clipboard holding whatever was there before, and the one right-click *Copy* that
   existed sent the selected cells only — click a row, press copy, get one number. ⌘C / Ctrl+C now
@@ -36,6 +78,33 @@ All notable changes to SMILE MSI. Format loosely follows
   (`preprocess.recalibrate_regions`, `intake.measure_calibration_offset(mask=…)`).
 
 ### Fixed
+- **A narrow extraction window no longer misses the peak it is centred on.** On a profile
+  axis sampled more coarsely than the tolerance window (the demo's 10 mDa grid against 10 ppm,
+  5.6 mDa at m/z 282), a window between two samples extracted nothing, so FA 18:1's real M+1
+  read as absent (M+1/M 0.0, isotope co-localisation 0.00). Every window on a shared profile
+  axis now holds at least the nearest sample; a gap in the axis is never bridged. FA 18:1 now
+  measures M+1/M 0.19 against a theoretical 0.20.
+- **"High" confidence needs a passing isotope check.** Mass accuracy, Moran's I and sibling
+  adducts could add up to High with no isotope envelope at all; such an ID is now Medium,
+  and says why. An unidentified isotopologue names its parent ("M+1 isotopologue of
+  890.6388"), and scripted/assistant `annotate()` fills the intensity and S/N columns from the
+  picked peaks.
+- **Pixel-level statistics say so.** Multi-group, A-vs-B and discriminating-feature summaries
+  note when their p/q values describe pixels rather than replicates (pseudoreplication), and
+  the MCP `run_analysis` result carries the step's warning.
+- **Discriminating features filter first, then cap.** The per-group `top_n` cut ran before the
+  enriched/q filters, so a group's depleted ions used up its slots and real markers were
+  dropped without a word, and a cut through a run of tied AUCs kept one of them arbitrarily.
+  Ties at the cut are now kept, and the summary reports how many passed but were over the cap.
+- **Scripted and assistant runs use the session's seed and tolerance.** Segmentation, PCA,
+  NMF, embedding, DGMM, cross-validation and SHAP took a fixed seed instead of the active
+  profile's, and `run(step_id, …)` extracted at the registry's default tolerance instead of the
+  session's.
+- **Segmentation reports what it clustered.** `segment()` takes `mask=`; the MCP result echoes
+  the mask and, for a whole-slide run, names the clusters that look like off-tissue background.
+  `threshold_mask` keeps filling holes by default but logs when filling closed a ring, and the
+  scripting guide documents it, the percentile semantics, `print()` → `stdout` and
+  `ds.ratio_image`. `mean_spectrum` reports the same centroid m/z as `find_peaks`.
 - **Ticking a feature list in the Export Studio no longer hangs the app.** Ticking a list's parent
   row cascades `itemChanged` over every ion under it, and both listeners — the All/None/Invert
   bar's live count and the dialog's `n sections × n ions` recount — walked the whole tree on every

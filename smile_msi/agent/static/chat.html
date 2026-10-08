@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SMILE MSI Chat</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e4e4e0;
+  --soft: #f0f0ec; --accent: #4a2e6e; --accent-ink: #ffffff; --ok: #1f7a4d; --bad: #b3261e;
+  --warn: #9a6200; --warn-bg: #fff7e6; --code: #f4f4f1; --user: #ece8f3;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121214; --panel: #1b1b1f; --ink: #ececef; --muted: #9a9aa3; --line: #2c2c33;
+    --soft: #222228; --accent: #b39ddb; --accent-ink: #121214; --ok: #6fcf97; --bad: #f28b82;
+    --warn: #f2c35b; --warn-bg: #2a2416; --code: #18181c; --user: #2a2433;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 var(--sans);
+  display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 15px; font-weight: 650; margin: 0; letter-spacing: .01em; white-space: nowrap; }
+.pill { font: 12px var(--mono); color: var(--muted); background: var(--soft); border: 1px solid var(--line);
+  border-radius: 999px; padding: 2px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40vw; }
+.spacer { flex: 1; }
+button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+button:hover { background: var(--soft); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.primary:hover { filter: brightness(1.08); }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+main { flex: 1; overflow-y: auto; }
+#log { max-width: 880px; margin: 0 auto; padding: 24px 16px 40px; }
+.msg { margin: 18px 0; }
+.user { display: flex; justify-content: flex-end; }
+.user .bubble { background: var(--user); border-radius: 14px 14px 4px 14px; padding: 9px 14px; max-width: 85%;
+  white-space: pre-wrap; }
+.assistant .md > :first-child { margin-top: 0; }
+.md p { margin: .55em 0; }
+.md code { font: 13px var(--mono); background: var(--code); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.md pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+.md pre code { border: 0; padding: 0; background: none; }
+.md table { border-collapse: collapse; margin: .6em 0; font-size: 14px; display: block; overflow-x: auto; }
+.md th, .md td { border: 1px solid var(--line); padding: 4px 9px; text-align: left; }
+.md th { background: var(--soft); }
+.md h1, .md h2, .md h3 { font-size: 1.05em; margin: 1em 0 .4em; }
+details.thinking { color: var(--muted); font-size: 13.5px; margin: 10px 0; }
+details.thinking summary { cursor: pointer; list-style: none; }
+details.thinking summary::before { content: "▸ "; }
+details.thinking[open] summary::before { content: "▾ "; }
+details.thinking .md { border-left: 2px solid var(--line); padding-left: 12px; margin-top: 6px; }
+.tool { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; margin: 8px 0; overflow: hidden; }
+.tool > .head { display: flex; align-items: center; gap: 10px; padding: 7px 12px; cursor: pointer; font-size: 13.5px; }
+.tool .name { font: 600 13px var(--mono); }
+.tool .args { font: 12px var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.tool .time { font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
+.state { width: 16px; height: 16px; flex: none; display: grid; place-items: center; font-size: 13px; }
+.state.run::after { content: ""; width: 11px; height: 11px; border: 2px solid var(--line); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .8s linear infinite; }
+.state.ok { color: var(--ok); } .state.ok::after { content: "✓"; }
+.state.bad { color: var(--bad); } .state.bad::after { content: "✕"; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.tool .body { display: none; border-top: 1px solid var(--line); padding: 10px 12px; }
+.tool.open .body { display: block; }
+.tool pre { font: 12px/1.45 var(--mono); background: var(--code); border-radius: 6px; padding: 8px 10px; margin: 4px 0 8px;
+  max-height: 340px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.figs { display: flex; flex-wrap: wrap; gap: 10px; padding: 0 12px 12px; }
+.figs:empty { display: none; }
+.figs a { display: block; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #fff; }
+.figs img { display: block; max-width: min(420px, 100%); max-height: 360px; }
+.files { padding: 0 12px 10px; font-size: 13px; }
+.files a { color: var(--accent); }
+.approval { border: 1.5px solid var(--warn); background: var(--warn-bg); border-radius: 12px; padding: 12px 14px; margin: 10px 0; }
+.approval h3 { margin: 0 0 4px; font-size: 14.5px; }
+.approval .desc { margin: 4px 0 8px; }
+.approval pre { font: 12px/1.45 var(--mono); background: var(--code); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; max-height: 380px; overflow: auto; }
+.approval .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.approval input { flex: 1; min-width: 160px; font: inherit; padding: 6px 10px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--panel); color: var(--ink); }
+.approval .decided { font-weight: 600; }
+.notice { color: var(--muted); font-size: 13.5px; font-style: italic; margin: 8px 0; }
+.error { color: var(--bad); border: 1px solid var(--bad); border-radius: 8px; padding: 8px 12px; margin: 10px 0; font-size: 14px; }
+.chip { display: inline-block; font: 12px var(--mono); color: var(--muted); border: 1px dashed var(--line); border-radius: 6px; padding: 2px 8px; margin: 4px 0; }
+#working { max-width: 880px; margin: 0 auto; padding: 0 16px 8px; color: var(--muted); font-size: 13px; min-height: 20px; }
+footer { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 16px; }
+.composer { max-width: 880px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+textarea { flex: 1; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px 12px; resize: none; min-height: 46px; max-height: 220px; }
+textarea:focus, input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 0; }
+.empty { text-align: center; color: var(--muted); padding: 10vh 8px 0; }
+.empty h2 { color: var(--ink); font-size: 20px; font-weight: 650; margin: 0 0 6px; }
+.suggest { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
+.suggest button { border-radius: 999px; font-size: 13.5px; }
+aside { position: fixed; top: 0; right: 0; height: 100%; width: min(420px, 100%); background: var(--panel);
+  border-left: 1px solid var(--line); box-shadow: -8px 0 30px rgba(0,0,0,.12); transform: translateX(105%);
+  transition: transform .2s ease; z-index: 10; display: flex; flex-direction: column; }
+aside.open { transform: none; }
+aside .top { display: flex; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+aside .top h2 { font-size: 15px; margin: 0; flex: 1; }
+aside .content { padding: 14px 16px; overflow-y: auto; }
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+.field input, .field select { width: 100%; font: inherit; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg); color: var(--ink); }
+.field .hint { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.lib-item { border-bottom: 1px solid var(--line); padding: 8px 0; }
+.lib-item b { font: 600 13px var(--mono); }
+.lib-item div { font-size: 13px; color: var(--muted); }
+.app { flex: 1; display: flex; min-height: 0; }
+.col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#side { width: 300px; flex: none; border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 14px 16px; }
+#side h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+#side .q { font-size: 14px; margin: 6px 0 10px; }
+.kv { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.kv span:first-child { color: var(--muted); }
+.kv span:last-child { font-family: var(--mono); font-size: 12.5px; text-align: right; }
+.kv.changed span:last-child { color: var(--accent); font-weight: 600; }
+.side-group { margin: 14px 0 4px; font-size: 12px; font-weight: 650; }
+#btn-setup { display: none; }
+@media (max-width: 1099px) {
+  #side { position: fixed; top: 0; right: 0; height: 100%; width: min(360px, 100%); z-index: 10;
+    transform: translateX(105%); transition: transform .2s ease; box-shadow: -8px 0 30px rgba(0,0,0,.12); }
+  #side.open { transform: none; }
+  #btn-setup { display: inline-block; }
+}
+.setup-card { text-align: left; max-width: 720px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 14px; padding: 18px 20px; color: var(--ink); }
+.setup-card h2 { margin: 0 0 4px; }
+.setup-card .lead { color: var(--muted); margin-bottom: 14px; }
+.sgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px; }
+.sgrid .wide { grid-column: 1 / -1; }
+.sfield label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+.sfield input, .sfield select, .sfield textarea { width: 100%; font: inherit; font-size: 14px; padding: 6px 9px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--bg); color: var(--ink); }
+.sfield textarea { resize: vertical; min-height: 44px; }
+.sfield .hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.setup-card details { margin-top: 14px; }
+.setup-card details summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 10px; }
+.setup-card .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+.setup-card .err { color: var(--bad); font-size: 13px; }
+.setup-note { border-left: 3px solid var(--accent); padding: 6px 12px; margin: 12px 0; font-size: 13.5px; color: var(--muted); }
+.review { border: 1px solid var(--line); border-left: 4px solid var(--accent); background: var(--panel); border-radius: 12px;
+  padding: 12px 16px; margin: 16px 0; }
+.review h3 { margin: 0 0 2px; font-size: 15px; }
+.review .meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.review ul.findings { list-style: none; margin: 8px 0; padding: 0; }
+.review ul.findings li { border-left: 3px solid var(--muted); background: var(--soft); border-radius: 0 8px 8px 0; padding: 6px 10px; margin: 6px 0; }
+.review ul.findings li.major { border-left-color: var(--bad); }
+.review ul.findings li.minor { border-left-color: var(--warn); }
+.review .sev { font: 700 11px var(--sans); text-transform: uppercase; letter-spacing: .06em; margin-right: 6px; color: var(--muted); }
+.review li.major .sev { color: var(--bad); }
+.review li.minor .sev { color: var(--warn); }
+.review .detail { font-size: 13.5px; margin-top: 2px; }
+.review .evidence { font: 11.5px var(--mono); color: var(--muted); margin-top: 2px; }
+.review .report { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 4px; }
+.dev { color: var(--warn); font: 600 11.5px var(--sans); white-space: nowrap; }
+@media (max-width: 600px) { header h1 span { display: none; } .pill { max-width: 32vw; } .sgrid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>SMILE MSI <span>· analysis chat</span></h1>
+  <div class="pill" id="model">—</div>
+  <div class="spacer"></div>
+  <button id="btn-lib" title="Your tools and flows">Library</button>
+  <button id="btn-log" title="Download the full session log (Markdown)">Log</button>
+  <button id="btn-review" title="Referee report on the analysis so far">Review</button>
+  <button id="btn-setup" title="Analysis setup">Setup</button>
+  <button id="btn-settings">Settings</button>
+  <button id="btn-new" title="Start a new conversation">New</button>
+</header>
+<div class="app"><div class="col">
+<main id="scroll"><div id="log"></div></main>
+<div id="working"></div>
+<footer>
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="Ask in plain language — e.g. “open the demo slide and show me its main regions”"></textarea>
+    <button class="primary" id="send">Send</button>
+    <button class="danger" id="stop" hidden>Stop</button>
+  </div>
+</footer>
+</div>
+<div id="side" aria-label="Analysis setup"></div>
+</div>
+
+<aside id="settings">
+  <div class="top"><h2>Model settings</h2><button data-close>Close</button></div>
+  <div class="content">
+    <div class="field"><label for="s-provider">Provider</label>
+      <select id="s-provider"><option value="claude">Claude (Anthropic API)</option>
+        <option value="local">Local model (OpenAI-compatible: Ollama, LM Studio, llama.cpp, vLLM)</option></select></div>
+    <div class="field"><label for="s-model">Model</label><input id="s-model" placeholder="claude-opus-5-5">
+      <div class="hint" id="s-model-hint">Leave empty for the default.</div></div>
+    <div class="field" data-for="claude"><label for="s-key">API key</label><input id="s-key" type="password" autocomplete="off" placeholder="sk-ant-…">
+      <div class="hint" id="s-key-hint">Kept in memory only — never logged or saved. Optional if ANTHROPIC_API_KEY is set or you ran <code>ant auth login</code>.</div></div>
+    <div class="field" data-for="claude"><label for="s-effort">Reasoning effort</label>
+      <select id="s-effort"><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option><option>max</option></select></div>
+    <div class="field" data-for="local"><label for="s-url">Server URL</label><input id="s-url" placeholder="http://localhost:11434/v1"></div>
+    <div class="field" data-for="local"><label><input type="checkbox" id="s-vision" style="width:auto"> Model can read images</label>
+      <div class="hint">Turn on for vision models so they see the figures they make.</div></div>
+    <div class="field"><label><input type="checkbox" id="s-scripts" style="width:auto"> Ask before every script the model runs</label>
+      <div class="hint">Creating or editing tools always asks. Scripts run as ordinary Python with your permissions; turn this on to review each one.</div></div>
+    <button class="primary" id="s-save">Save &amp; start new conversation</button>
+    <p class="hint" id="s-logpath" style="font-size:12px;color:var(--muted);word-break:break-all"></p>
+  </div>
+</aside>
+
+<aside id="library">
+  <div class="top"><h2>Library</h2><button data-close>Close</button></div>
+  <div class="content" id="lib-content"></div>
+</aside>
+
+<script>
+"use strict";
+const qs = new URLSearchParams(location.search);
+let T = qs.get("t");
+try { if (T) sessionStorage.setItem("smile-token", T); else T = sessionStorage.getItem("smile-token"); } catch (e) {}
+if (qs.get("t")) history.replaceState(null, "", location.pathname);
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log"), scrollEl = $("scroll"), input = $("input");
+const tools = {}, approvals = {};
+let busy = false, tokensIn = 0, tokensOut = 0, modelLabel = "—";
+
+const api = (path, body) => fetch(path, {
+  method: body === undefined ? "GET" : "POST",
+  headers: { "X-SMILE-Token": T || "", "Content-Type": "application/json" },
+  body: body === undefined ? undefined : JSON.stringify(body),
+}).then(async (r) => { const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(j.error || r.statusText); return j; });
+const fileUrl = (p) => `/api/file?t=${encodeURIComponent(T)}&p=${encodeURIComponent(p)}`;
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html !== undefined) e.innerHTML = html; return e; };
+
+// ---- minimal, escape-first markdown -------------------------------------------------
+function inline(s) {
+  return s.replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+function md(src) {
+  const lines = esc(src).split("\n"); let out = [], i = 0;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (/^```/.test(l)) { const buf = []; i++; while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]); i++;
+      out.push(`<pre><code>${buf.join("\n")}</code></pre>`); continue; }
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+      const row = (r) => r.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim()));
+      const head = row(l); i += 2; const body = [];
+      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) body.push(row(lines[i++]));
+      out.push(`<table><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr>${body.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`).join("")}</table>`); continue; }
+    const h = l.match(/^(#{1,4})\s+(.*)/); if (h) { out.push(`<h3>${inline(h[2])}</h3>`); i++; continue; }
+    if (/^\s*([-*]|\d+\.)\s+/.test(l)) { const ordered = /^\s*\d+\./.test(l); const items = [];
+      while (i < lines.length && /^\s*([-*]|\d+\.)\s+/.test(lines[i])) items.push(inline(lines[i++].replace(/^\s*([-*]|\d+\.)\s+/, "")));
+      out.push(`<${ordered ? "ol" : "ul"}>${items.map((x) => `<li>${x}</li>`).join("")}</${ordered ? "ol" : "ul"}>`); continue; }
+    if (!l.trim()) { i++; continue; }
+    const para = []; while (i < lines.length && lines[i].trim() && !/^(```|#{1,4}\s|\s*([-*]|\d+\.)\s|\s*\|)/.test(lines[i])) para.push(inline(lines[i++]));
+    if (para.length) out.push(`<p>${para.join("<br>")}</p>`); else i++;
+  }
+  return out.join("");
+}
+
+// ---- transcript ----------------------------------------------------------------------
+const nearBottom = () => scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 160;
+function add(node) { const stick = nearBottom(); logEl.appendChild(node); if (stick) scrollEl.scrollTop = scrollEl.scrollHeight; return node; }
+let SETUP = { form: null, current: null, last: null };
+const STUDY_KEYS = ["question", "replicate", "max_q", "min_auc"];
+function setupValue(setup, key) { return setup ? (STUDY_KEYS.includes(key) ? setup.study[key] : setup.params[key]) : undefined; }
+function fieldEl(f, value) {
+  const w = el("div", "sfield" + (f.key === "question" ? " wide" : ""));
+  const id = "sf-" + f.key; let input;
+  if (f.kind === "choice") { input = el("select"); f.choices.forEach((c) => { const o = el("option", "", esc(c)); o.value = c; input.appendChild(o); }); }
+  else if (f.key === "question") { input = el("textarea"); input.rows = 2; input.placeholder = "e.g. Which lipids distinguish the lesion from surrounding white matter?"; }
+  else { input = el("input"); if (f.kind === "float" || f.kind === "int") { input.type = "number"; input.step = f.kind === "int" ? "1" : "any";
+      if (f.lo != null) input.min = f.lo; if (f.hi != null) input.max = f.hi; } }
+  input.id = id; input.dataset.key = f.key; input.dataset.kind = f.kind; input.value = value ?? f.default ?? "";
+  w.innerHTML = `<label for="${id}">${esc(f.label)}</label>`; w.appendChild(input);
+  if (f.help) w.appendChild(el("div", "hint", esc(f.help)));
+  return w;
+}
+function setupCard(onDone, title) {
+  const form = SETUP.form; const base = SETUP.current || SETUP.last;
+  const card = el("div", "setup-card");
+  card.innerHTML = `<h2>${esc(title || "Before we start: analysis setup")}</h2>
+    <div class="lead">These decisions shape every result, so they're fixed up front, written into the log, and applied automatically. You can change them later — changes are recorded.</div>`;
+  const prof = fieldEl({ key: "_profile", label: "Start from profile", kind: "choice", choices: form.profiles.map((p) => p.name),
+    help: "Analysis Profiles are shared with the desktop app." }, base ? base.profile.name : form.profiles[0].name);
+  const ess = el("div", "sgrid"), more = el("div", "sgrid");
+  ess.appendChild(prof);
+  form.fields.forEach((f) => (f.essential ? ess : more).appendChild(fieldEl(f, setupValue(base, f.key))));
+  card.appendChild(ess);
+  const det = el("details"); det.innerHTML = "<summary>More settings</summary>"; det.appendChild(more); card.appendChild(det);
+  prof.querySelector("select").onchange = (e) => {
+    const p = form.profiles.find((x) => x.name === e.target.value); if (!p) return;
+    Object.entries(p.params).forEach(([k, v]) => { const i = card.querySelector(`[data-key="${k}"]`); if (i) i.value = v; }); };
+  const act = el("div", "actions");
+  act.innerHTML = `<button class="primary">${SETUP.current ? "Apply changes" : "Start with these settings"}</button><button>Save as profile…</button><span class="err"></span>`;
+  const [go, save] = act.querySelectorAll("button"), err = act.querySelector(".err");
+  const submit = async (saveAs) => {
+    const values = {}; card.querySelectorAll("[data-key]").forEach((i) => { if (i.dataset.key !== "_profile") values[i.dataset.key] = i.value; });
+    err.textContent = "";
+    try { const r = await api("/api/setup", { profile: prof.querySelector("select").value, values, save_as: saveAs || undefined });
+      SETUP.current = r.setup; SETUP.last = r.setup; if (r.saved_profile) { const f = await api("/api/setup"); SETUP.form = f.form; }
+      renderSide(); onDone && onDone(); } catch (e) { err.textContent = e.message; } };
+  go.onclick = () => submit();
+  save.onclick = () => { const n = prompt("Profile name (an existing name gets a new version):"); if (n) submit(n.trim()); };
+  card.appendChild(act);
+  return card;
+}
+function renderSide() {
+  const side = $("side"), c = SETUP.current;
+  if (!SETUP.form) { side.innerHTML = ""; return; }
+  if (!c) { side.innerHTML = `<h2>Analysis setup</h2><p class="notice">Not set yet — choose it before your first message (the card in the chat). If you skip it, the default profile is recorded as “accepted without review”.</p>`; return; }
+  const ch = new Set(c.changed_from_profile || []);
+  const label = (k) => (SETUP.form.fields.find((f) => f.key === k) || { label: k }).label;
+  let h = `<h2>Analysis setup</h2><div class="kv"><span>Profile</span><span>${esc(c.profile.name)} v${esc(c.profile.version)}</span></div>`;
+  if (c.study.question) h += `<div class="q">“${esc(c.study.question)}”</div>`;
+  h += `<div class="side-group">Study</div>` + ["replicate", "max_q", "min_auc"].map((k) => `<div class="kv"><span>${esc(label(k))}</span><span>${esc(c.study[k])}</span></div>`).join("");
+  h += `<div class="side-group">Method</div>` + Object.entries(c.params).map(([k, v]) => `<div class="kv${ch.has(k) ? " changed" : ""}"><span>${esc(label(k))}</span><span>${esc(v)}</span></div>`).join("");
+  h += `<div style="margin-top:14px"><button id="side-edit">Edit setup</button></div><p class="hint" style="font-size:12px;color:var(--muted)">Highlighted values differ from the profile. Tool calls that use other values are flagged in the chat.</p>`;
+  side.innerHTML = h;
+  $("side-edit").onclick = () => { const host = el("div", "msg"); host.appendChild(setupCard(() => host.remove(), "Change the analysis setup")); add(host);
+    scrollEl.scrollTop = scrollEl.scrollHeight; side.classList.remove("open"); };
+}
+async function loadSetup() {
+  try { SETUP = await api("/api/setup"); } catch (e) { return; }
+  renderSide(); if (logEl.querySelector(".empty")) empty();
+}
+function empty() {
+  logEl.innerHTML = "";
+  if (SETUP.form && !SETUP.current) {
+    const host = el("div", "empty setup-host"); host.style.paddingTop = "4vh";
+    host.appendChild(setupCard(() => host.replaceWith(suggestions()))); logEl.appendChild(host); return;
+  }
+  logEl.appendChild(suggestions());
+}
+function suggestions() {
+  const e = el("div", "empty", `<h2>What would you like to find out?</h2>
+    <div>Describe the analysis in plain language. Every step, figure and tool call is shown here and written to the session log.</div>`);
+  const s = el("div", "suggest");
+  ["Open the demo slide and show me its main tissue regions",
+   "Which lipids best separate the regions on the demo slide?",
+   "What can you do, and what are your limits?"].forEach((t) => {
+    const b = el("button", "", esc(t)); b.onclick = () => { input.value = t; send(); }; s.appendChild(b); });
+  e.appendChild(s); return e;
+}
+function argSummary(args) {
+  const parts = Object.entries(args || {}).map(([k, v]) => {
+    let s = typeof v === "string" ? v : JSON.stringify(v); if (s.length > 40) s = s.slice(0, 38) + "…"; return `${k}=${s}`; });
+  return parts.join(", ");
+}
+function figures(card, images, files) {
+  const figs = card.querySelector(".figs");
+  (images || []).forEach((p) => { const a = el("a"); a.href = fileUrl(p); a.target = "_blank";
+    const img = el("img"); img.src = fileUrl(p); img.alt = p.split(/[\\/]/).pop(); img.loading = "lazy"; a.appendChild(img); figs.appendChild(a); });
+  if (files && files.length) { const f = card.querySelector(".files");
+    f.innerHTML = files.map((p) => `<a href="${fileUrl(p)}" target="_blank">${esc(p.split(/[\\/]/).pop())}</a>`).join(" · "); }
+}
+function setBusy(b) { busy = b; $("send").hidden = b; $("stop").hidden = !b; if (!b) $("working").textContent = ""; }
+function header() { $("model").textContent = modelLabel + (tokensIn + tokensOut ? ` · ${(tokensIn / 1000).toFixed(1)}k in / ${(tokensOut / 1000).toFixed(1)}k out` : ""); }
+
+function reviewCard(ev) {
+  const c = el("div", "review");
+  const fs = ev.findings || [], sev = (s) => (["major", "minor", "note"].includes(s) ? s : "note");
+  c.innerHTML = `<h3>Review</h3><div class="meta">${esc(fs.length)} automatic check${fs.length === 1 ? "" : "s"} flagged` +
+    `${ev.model ? " · report by " + esc(ev.model) : ""}</div>` +
+    (fs.length ? `<ul class="findings">${fs.map((f) => `<li class="${sev(f.severity)}"><span class="sev">${esc(sev(f.severity))}</span><b>${esc(f.title)}</b>` +
+      `<div class="detail">${esc(f.detail)}</div>` +
+      ((f.evidence || []).length ? `<div class="evidence">log: ${f.evidence.map((e) => esc(typeof e === "number" ? "#" + e : e)).join(", ")}</div>` : "") + `</li>`).join("")}</ul>`
+      : `<p class="notice">The automatic checks found nothing to flag.</p>`) +
+    (ev.llm ? `<div class="report md">${md(ev.llm)}</div>` : "") +
+    (ev.llm_error ? `<div class="error">The model review failed: ${esc(ev.llm_error)}</div>` : "");
+  return c;
+}
+
+function handle(ev) {
+  const empt = logEl.querySelector(".empty");
+  if (empt && ["user", "assistant", "tool_call", "error", "notice", "review"].includes(ev.type)) empt.remove();
+  switch (ev.type) {
+    case "reset": tokensIn = tokensOut = 0; Object.keys(tools).forEach((k) => delete tools[k]); SETUP.current = null; empty(); setBusy(false); loadSetup(); break;
+    case "setup": {
+      SETUP.current = { profile: ev.profile, params: ev.params, study: ev.study, changed_from_profile: ev.changed_from_profile }; renderSide();
+      const host = logEl.querySelector(".setup-host"); if (host) host.replaceWith(suggestions());
+      add(el("div", "setup-note", `Analysis setup ${esc(ev.how)} — profile <b>${esc(ev.profile.name)} v${esc(ev.profile.version)}</b>` +
+        (ev.changed_from_profile && ev.changed_from_profile.length ? `, changed: ${esc(ev.changed_from_profile.join(", "))}` : "") +
+        (ev.study.question ? `<br>Question: “${esc(ev.study.question)}”` : ""))); break; }
+    case "setup_applied": add(el("div", "chip", `setup applied to ${esc(ev.ref)}: ` + Object.entries(ev.changes || {}).map(([k, v]) => `${esc(k)} ${esc(v.was)} → ${esc(v.now)}`).join(", "))); break;
+    case "deviation": {
+      const c = tools[ev.call_id]; const txt = ev.deviations.map((d) => `${d.arg} = ${d.used} (setup ${d.setup})`).join("; ");
+      if (c) { const b = el("span", "dev", "⚠ differs from setup"); b.title = txt; c.querySelector(".head").insertBefore(b, c.querySelector(".time"));
+        c.querySelector(".body").insertAdjacentHTML("afterbegin", `<div class="label" style="color:var(--warn)">Deviation from setup</div><pre>${esc(txt)}</pre>`); }
+      break; }
+    case "session": modelLabel = `${ev.provider === "local" ? "local" : "Claude"} · ${ev.model}`; header(); break;
+    case "usage": tokensIn += ev.input_tokens || 0; tokensOut += ev.output_tokens || 0; header(); break;
+    case "status": setBusy(true); $("working").textContent = ev.state === "reviewing" ? "Reviewing…" : "Thinking…"; break;
+    case "review": add(reviewCard(ev)); break;
+    case "user": add(el("div", "msg user", `<div class="bubble">${esc(ev.text)}</div>`)); setBusy(true); break;
+    case "assistant": add(el("div", "msg assistant md", md(ev.text))); break;
+    case "thinking": { const d = el("details", "thinking"); d.innerHTML = `<summary>Reasoning</summary><div class="md">${md(ev.text)}</div>`; add(d); break; }
+    case "tool_call": {
+      const c = el("div", "tool"); c.innerHTML = `<div class="head"><span class="state run"></span><span class="name">${esc(ev.name)}</span>
+        <span class="args">${esc(argSummary(ev.args))}</span><span class="time"></span></div>
+        <div class="body"><div class="label">Arguments</div><pre>${esc(JSON.stringify(ev.args, null, 1))}</pre><div class="res"></div></div>
+        <div class="figs"></div><div class="files"></div>`;
+      c.querySelector(".head").onclick = () => c.classList.toggle("open");
+      tools[ev.call_id] = c; add(c); $("working").textContent = `Running ${ev.name}…`; break; }
+    case "tool_result": {
+      const c = tools[ev.call_id]; if (!c) break;
+      const st = c.querySelector(".state"); st.className = "state " + (ev.ok ? "ok" : "bad");
+      c.querySelector(".time").textContent = `${(ev.duration_s || 0).toFixed(2)}s`;
+      c.querySelector(".res").innerHTML = `<div class="label">${ev.ok ? "Result" : "Error"}</div><pre>${esc(ev.ok ? ev.text : ev.error)}</pre>`;
+      if (!ev.ok) c.classList.add("open");
+      figures(c, ev.images, ev.files); if (nearBottom()) scrollEl.scrollTop = scrollEl.scrollHeight; $("working").textContent = "Thinking…"; break; }
+    case "approval_request": {
+      const a = el("div", "approval");
+      const verb = { create_tool: "Create a new tool", edit_tool: "Edit tool", delete_tool: "Delete tool", run_script: "Run a script" }[ev.tool] || ev.title;
+      const params = ev.parameters ? `<div class="label">Parameters</div><pre>${esc(JSON.stringify(ev.parameters, null, 1))}</pre>` : "";
+      a.innerHTML = `<h3>${esc(verb)}${ev.target ? `: <code>${esc(ev.target)}</code>` : ""}</h3>
+        ${ev.description ? `<div class="desc">${esc(ev.description)}</div>` : ""}${ev.note ? `<div class="desc"><i>${esc(ev.note)}</i></div>` : ""}
+        ${params}${ev.code ? `<div class="label">Code · sha256 ${esc(ev.sha256.slice(0, 12))}</div><pre>${esc(ev.code)}</pre>` : ""}
+        <div class="row"><input placeholder="Optional note to the assistant"><button class="primary">Approve</button><button class="danger">Reject</button></div>`;
+      const [ok, no] = a.querySelectorAll("button"), note = a.querySelector("input");
+      const answer = (yes) => { ok.disabled = no.disabled = true;
+        api("/api/approve", { call_id: ev.call_id, approve: yes, note: note.value }).catch((e) => alert(e.message)); };
+      ok.onclick = () => answer(true); no.onclick = () => answer(false);
+      approvals[ev.call_id] = a; add(a); $("working").textContent = "Waiting for your approval…"; break; }
+    case "approval": {
+      const a = approvals[ev.call_id]; if (!a) break;
+      a.querySelector(".row").outerHTML = `<div class="decided" style="color:var(${ev.decision === "approved" ? "--ok" : "--bad"})">${ev.decision === "approved" ? "✓ Approved" : "✕ Rejected"}${ev.note ? " — " + esc(ev.note) : ""}</div>`; break; }
+    case "dataset": add(el("div", "chip", `dataset ${esc(ev.ref)} · ${esc(ev.n_pixels)} px · fingerprint ${esc(String(ev.fingerprint).slice(0, 12))}`)); break;
+    case "notice": add(el("div", "notice", esc(ev.text))); break;
+    case "error": add(el("div", "error", esc(ev.message))); break;
+    case "done": setBusy(false); break;
+  }
+}
+
+// ---- wiring ---------------------------------------------------------------------------
+function connect() {
+  const es = new EventSource(`/api/events?t=${encodeURIComponent(T || "")}`);
+  es.addEventListener("reset", () => { logEl.innerHTML = ""; empty(); tokensIn = tokensOut = 0; });
+  es.onmessage = (m) => { try { handle(JSON.parse(m.data)); } catch (e) { console.error(e); } };
+  es.onerror = () => { $("working").textContent = "Connection lost — retrying…"; };
+  es.onopen = () => { if (!busy) $("working").textContent = ""; };
+}
+async function send() {
+  const text = input.value.trim(); if (!text || busy) return;
+  input.value = ""; autosize();
+  try { await api("/api/send", { text }); } catch (e) { handle({ type: "error", message: e.message }); }
+}
+function autosize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 220) + "px"; }
+input.addEventListener("input", autosize);
+input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+$("send").onclick = send;
+$("stop").onclick = () => api("/api/stop", {});
+$("btn-setup").onclick = () => $("side").classList.toggle("open");
+$("btn-review").onclick = async () => {
+  if (busy) return;
+  setBusy(true); $("working").textContent = "Reviewing…";      // before the POST: "done" may beat its reply
+  try { await api("/api/review", { llm: true }); }
+  catch (e) { setBusy(false); handle({ type: "error", message: e.message }); }
+};
+$("btn-new").onclick = () => api("/api/reset", {}).catch((e) => alert(e.message));
+$("btn-log").onclick = async () => {
+  const r = await fetch("/api/log.md", { headers: { "X-SMILE-Token": T } }); if (!r.ok) return alert("No log yet.");
+  const blob = new Blob([await r.text()], { type: "text/markdown" }); const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "smile-msi-analysis-log.md"; a.click(); };
+document.querySelectorAll("[data-close]").forEach((b) => b.onclick = () => b.closest("aside").classList.remove("open"));
+
+function showFor(provider) {
+  document.querySelectorAll("[data-for]").forEach((f) => f.hidden = f.dataset.for !== provider);
+  $("s-model").placeholder = provider === "local" ? "e.g. qwen3:14b (see `ollama list`)" : "claude-opus-5-5";
+}
+$("s-provider").onchange = () => showFor($("s-provider").value);
+$("btn-settings").onclick = async () => {
+  const c = await api("/api/config");
+  $("s-provider").value = c.provider || "claude"; $("s-model").value = c.model || ""; $("s-url").value = c.base_url || "";
+  $("s-effort").value = c.effort || "high"; $("s-vision").checked = !!c.vision; $("s-key").value = "";
+  $("s-scripts").checked = !!c.approve_scripts;
+  $("s-key-hint").innerHTML = (c.has_key ? "<b>A key is set.</b> Leave empty to keep it. " : "") +
+    "Kept in memory only — never logged or saved. Optional if ANTHROPIC_API_KEY is set or you ran <code>ant auth login</code>.";
+  $("s-logpath").textContent = c.log_path ? "This session's log: " + c.log_path : (c.error || "");
+  showFor($("s-provider").value); $("settings").classList.add("open");
+};
+$("s-save").onclick = async () => {
+  try { await api("/api/config", { provider: $("s-provider").value, model: $("s-model").value.trim(), api_key: $("s-key").value,
+      base_url: $("s-url").value.trim(), effort: $("s-effort").value, vision: $("s-vision").checked,
+      approve_scripts: $("s-scripts").checked });
+    $("settings").classList.remove("open"); } catch (e) { alert(e.message); }
+};
+$("btn-lib").onclick = async () => {
+  const l = await api("/api/library"); const c = $("lib-content");
+  const tl = l.tools.length ? l.tools.map((t) => `<div class="lib-item"><b>${esc(t.name)}</b> <span class="chip">v${esc(t.version)}</span><div>${esc(t.description)}</div></div>`).join("")
+    : `<p class="notice">No tools of your own yet — ask the assistant to make one when you need something new.</p>`;
+  const fl = l.flows.length ? l.flows.map((f) => `<div class="lib-item"><b>${esc(f.name)}</b><div>${esc(f.description)}</div><div>${esc(f.steps.join(" → "))}${f.params.length ? " · params: " + esc(f.params.join(", ")) : ""}</div></div>`).join("")
+    : `<p class="notice">No saved flows yet — ask the assistant to save an analysis you liked.</p>`;
+  c.innerHTML = `<h3 style="font-size:14px">Your tools</h3>${tl}<h3 style="font-size:14px;margin-top:18px">Saved flows</h3>${fl}
+    <details style="margin-top:18px"><summary class="label" style="cursor:pointer">Built-in tools (${l.builtin.length})</summary>
+    ${l.builtin.map((b) => `<div class="lib-item"><b>${esc(b.name)}</b><div>${esc(b.title)}</div></div>`).join("")}</details>`;
+  $("library").classList.add("open");
+};
+if (!T) { logEl.innerHTML = `<div class="error">Open this page from the link <code>smile-msi chat</code> printed in your terminal — it carries the access token.</div>`; }
+else { empty(); loadSetup().then(connect); }
+</script>
+</body>
+</html>

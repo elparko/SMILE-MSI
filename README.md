@@ -130,6 +130,14 @@ seg  = spatial.auto_segment(ds, peaks)                       # regions
 disc = spatial.discriminating_features(ds, seg.labels, peaks)
 feat = annotate.build_feature_list(ds, peaks, mode="negative")   # identified feature list
 img  = ds.ion_image(peaks[0])                               # numpy (height, width)
+
+# atlas-style figures: tree-coloured segments as dots on black, and a coarse→fine movie
+from smile_msi import atlasviz
+hier = spatial.hierarchy(ds, peaks)
+k = 8
+labels = ds.to_image(spatial.cut(hier, k).astype(float))
+atlasviz.dot_mosaic(labels, "segments.png", colors=spatial.segment_colors(hier, k))
+atlasviz.splitter_movie(hier, ds, "splitting.gif")
 ```
 
 ### Reopen what the app saved (no GUI)
@@ -178,6 +186,54 @@ to `~/.smile-msi/mcp-results` and the tool returns the path. Start an assistant 
 *list the slides* and *what has been run on this one*; both answer from disk without loading
 a dataset. The tools are the same registry steps the app runs, so a result cannot drift from
 what the app would show.
+
+### Plain-language analysis chat (bring your own model)
+
+`smile-msi chat` opens a chat in your browser where you describe an analysis in plain language
+and a model runs it with the same tools the MCP server exposes. Every tool call is shown as it
+runs, figures appear inline as they are made, and the whole session is written to an
+append-only log (`~/.smile-msi/agent/logs/`, downloadable as Markdown with a replayable list of
+the tool calls).
+
+```bash
+uv pip install -e '.[agent]'                       # Claude via the official SDK
+smile-msi chat                                     # API key in Settings, ANTHROPIC_API_KEY, or `ant auth login`
+smile-msi chat --provider local --model qwen3:14b  # any OpenAI-compatible server (Ollama default URL)
+```
+
+- **Your model.** Claude (default `claude-opus-5-5`, effort selectable) or a local model behind an
+  OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp, vLLM — `--base-url`). A local setup
+  needs no extra package and sends nothing off the machine. Tool use is only as good as the
+  model's function calling.
+- **New tools on the fly.** The model can write a new analysis tool (a short script plus declared
+  parameters). Creating, editing or deleting a tool **asks for your approval** and shows the code;
+  running an approved tool does not. Tools are versioned in `~/.smile-msi/agent/tools/` — every
+  version is kept, and each run is logged with its version and code hash.
+- **Analysis setup first.** Before the first message the chat asks for the decisions that shape
+  every result — the question, the unit of replication, the FDR and effect-size thresholds, and
+  the method settings (polarity, mass tolerances, normalization, peak picking, segmentation) from
+  an **Analysis Profile** shared with the desktop app. The setup is logged, applied to the slide
+  and filled into tool calls automatically; a call that uses a different value is flagged in the
+  chat and logged as a deviation. It stays visible in a sidebar (*Setup* on narrow screens),
+  can be changed mid-analysis (recorded), and can be saved as a new profile.
+- **Flows.** An analysis you like can be saved as a flow (an ordered list of tool calls with
+  `{{placeholders}}`) and replayed on another slide.
+- **Safety.** The server binds to `127.0.0.1`, checks the `Host`/`Origin` headers and requires a
+  per-launch token, so other web pages can't drive it; it only shows or serves PNG/JPG/CSV files
+  from the SMILE MSI data folder, as inert content. An API key typed into Settings stays in
+  memory — never written to the log or to disk. It runs in its own process, separate from the
+  desktop app, with the results folder as its working directory.
+- **What approval does and doesn't do.** Approval is a review step for the model's tools, not a
+  sandbox: `run_script` runs ordinary Python with your permissions. To review every script too,
+  tick *Ask before every script* in Settings (or start with `--approve-scripts`).
+- **Review.** *Review* referees the analysis so far — automatic checks for pseudoreplication,
+  ignored tool failures, over-claimed lipid IDs, p-values without effect sizes and deviations
+  from the setup, plus a model-written referee report — all cited to the log.
+- **Use them from other assistants too.** The MCP server exposes your user-made tools and flows
+  (`list_user_tools`, `run_user_tool`, `run_flow`, …), so Claude Desktop can use what you built.
+- **When something hangs.** *Stop* ends the turn: a tool still running after a moment is
+  interrupted (a runaway script stops at its next Python instruction; a long numerical call
+  stops when it returns). *New* does the same and starts fresh at once.
 
 ## Scientific notes & caveats
 - **Lipid IDs are sum-composition level** (e.g. `PE 38:4`) and do not resolve true isobars or
