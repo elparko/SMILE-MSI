@@ -447,6 +447,7 @@ def _block(**kw):
 
 
 def _anthropic_provider(responses):
+    pytest.importorskip("anthropic", reason="Claude support is the optional 'agent' extra")
     from smile_msi.agent.providers import AnthropicProvider
 
     prov = AnthropicProvider(api_key="test-key")

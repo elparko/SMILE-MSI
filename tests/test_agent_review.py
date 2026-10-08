@@ -348,6 +348,7 @@ def _client(create):
 
 
 def test_anthropic_complete_is_a_one_shot_call():
+    pytest.importorskip("anthropic", reason="Claude support is the optional 'agent' extra")
     p = AnthropicProvider(model="m", api_key="sk-test", effort="medium")
     p.add_user("hello")
     seen = {}
@@ -371,6 +372,7 @@ def test_anthropic_complete_is_a_one_shot_call():
 
 
 def test_anthropic_complete_maps_sdk_errors():
+    pytest.importorskip("anthropic", reason="Claude support is the optional 'agent' extra")
     import anthropic
     httpx = pytest.importorskip("httpx2")           # the SDK's HTTP client
 
