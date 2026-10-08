@@ -6,7 +6,12 @@ so the very next turn can call it like any built-in. The script runs in the same
 ``run_script`` / the app's Script Console (``ds``, the analysis functions, ``log`` / ``table``
 / ``image`` / ``record``), with each parameter bound as a variable (and all of them as the
 dict ``params``). Creating, editing and deleting a tool **require the user's approval** — they
-are the only actions that put new code on the machine; running a tool once approved does not.
+are how the model adds code to its toolbox; running a tool once approved does not.
+
+The approval gate is a review step for the model's code, not a sandbox: ``run_script``
+(unless the user requires approval for it) runs ordinary Python with the user's permissions
+and could write files anywhere — so tools found on disk never replace a built-in or agent
+tool, and the code of every version is hashed into the session log when it runs.
 
 Each tool lives in ``<home>/agent/tools/<name>/``: ``tool.json`` (description, parameters,
 current version, a sha256 per version) and ``v1.py``, ``v2.py``, … — every version is kept,
@@ -29,6 +34,87 @@ from .tools import Registry, ToolSpec
 _NAME = re.compile(r"^[a-z][a-z0-9_]{2,47}$")
 _JSON_TYPES = {"number", "integer", "string", "boolean", "array", "object"}
 _PLACEHOLDER = re.compile(r"^\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$")
+_EMBEDDED = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+#: Tools a flow may not contain: they change tools/flows or would recurse.
+_NOT_IN_FLOWS = {"create_tool", "edit_tool", "delete_tool", "save_flow", "run_flow"}
+
+
+def _check_name(name, what="tool") -> str:
+    name = str(name).strip()
+    if not _NAME.match(name):
+        raise ValueError(f"{what} name must be snake_case, 3–48 chars, starting with a letter")
+    return name
+
+
+def _coerce(pname: str, value, prop: dict):
+    """Check ``value`` against a declared parameter type (local models often send numbers
+    as strings — those are converted; anything that doesn't fit is an error)."""
+    t = prop.get("type", "string")
+    if t == "number":
+        if isinstance(value, bool):
+            raise ValueError(f"parameter {pname!r} must be a number, got {value!r}")
+        if isinstance(value, (int, float)):
+            return value
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"parameter {pname!r} must be a number, got {value!r}") from None
+    if t == "integer":
+        if isinstance(value, bool):
+            raise ValueError(f"parameter {pname!r} must be an integer, got {value!r}")
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"parameter {pname!r} must be an integer, got {value!r}") from None
+        if f != int(f):
+            raise ValueError(f"parameter {pname!r} must be an integer, got {value!r}")
+        return int(f)
+    if t == "boolean":
+        if isinstance(value, bool):
+            return value
+        if str(value).lower() in ("true", "false"):
+            return str(value).lower() == "true"
+        raise ValueError(f"parameter {pname!r} must be true or false, got {value!r}")
+    if t == "string":
+        if isinstance(value, (dict, list)):
+            raise ValueError(f"parameter {pname!r} must be text, got {type(value).__name__}")
+        return str(value)
+    if t == "array":
+        if not isinstance(value, list):
+            raise ValueError(f"parameter {pname!r} must be a list, got {type(value).__name__}")
+        return value
+    if t == "object":
+        if not isinstance(value, dict):
+            raise ValueError(f"parameter {pname!r} must be an object, got "
+                             f"{type(value).__name__}")
+        return value
+    return value
+
+
+def _substitute(value, params: dict):
+    """Fill ``{{name}}`` placeholders: a whole-value placeholder keeps the parameter's type;
+    one embedded in text (e.g. inside run_script code) is replaced by its text form."""
+    if isinstance(value, str):
+        m = _PLACEHOLDER.match(value)
+        if m:
+            return params[m.group(1)]
+        return _EMBEDDED.sub(lambda mm: str(params[mm.group(1)]), value)
+    if isinstance(value, dict):
+        return {k: _substitute(v, params) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_substitute(v, params) for v in value]
+    return value
+
+
+def _placeholders_in(value, out: set):
+    if isinstance(value, str):
+        out.update(_EMBEDDED.findall(value))
+    elif isinstance(value, dict):
+        for v in value.values():
+            _placeholders_in(v, out)
+    elif isinstance(value, list):
+        for v in value:
+            _placeholders_in(v, out)
 
 
 def agent_dir(*parts) -> str:
@@ -82,9 +168,15 @@ class Toolbox:
         for spec in self.agent_specs():
             registry.add(spec)
         for name in sorted(os.listdir(self.tools_dir)):      # skips <name>.deleted-<time>
-            if _NAME.match(name) and os.path.isfile(os.path.join(self.tools_dir, name,
-                                                                 "tool.json")):
+            if not (_NAME.match(name) and os.path.isfile(os.path.join(self.tools_dir, name,
+                                                                      "tool.json"))):
+                continue
+            if name in registry:                 # never let a file on disk shadow a built-in
+                continue
+            try:
                 registry.add(self._spec_for(self._meta(name)))
+            except (OSError, ValueError, KeyError):  # a damaged tool folder: skip, don't crash
+                continue
 
     # ------------------------------------------------------------------ #
     # custom tools
@@ -126,10 +218,11 @@ class Toolbox:
         if unknown:
             raise ValueError(f"{name} has no parameter(s) {sorted(unknown)}; "
                              f"it takes {sorted(props)}")
-        params = {k: args.get(k, p.get("default")) for k, p in props.items()}
         missing = [k for k in meta["schema"].get("required", []) if k not in args]
         if missing:
             raise ValueError(f"{name} needs {missing}")
+        params = {k: (_coerce(k, args[k], p) if k in args else p.get("default"))
+                  for k, p in props.items()}
         slide = mcpserver._slide()
         code = self._code(name, meta["version"])
         result = scripting.run_script(code, slide.api,
@@ -139,6 +232,43 @@ class Toolbox:
         out["tool"] = {"name": name, "version": meta["version"],
                        "sha256": meta["versions"][str(meta["version"])]["sha256"][:12]}
         return out
+
+    def precheck(self, tool: str, args: dict) -> str:
+        """Why an approval-gated call would fail anyway (so the user isn't asked to approve
+        it), or ``""``. Mirrors the checks the tool itself makes."""
+        try:
+            if tool == "run_script":
+                if not isinstance(args.get("code"), str):
+                    return "run_script needs code (text)"
+                compile(args["code"], "<run_script>", "exec")
+                return ""
+            name = _check_name(args.get("name", ""))
+            if tool == "create_tool":
+                if name in self.registry:
+                    return f"a tool named {name!r} already exists — use edit_tool to change it"
+                if not isinstance(args.get("code"), str) or not args["code"].strip():
+                    return "create_tool needs code (text)"
+                if not isinstance(args.get("description"), str):
+                    return "create_tool needs a description (text)"
+            elif tool in ("edit_tool", "delete_tool"):
+                spec = self.registry.get(name)
+                if spec is None or spec.source != "custom":
+                    return f"{name!r} is not a user-created tool"
+                if tool == "edit_tool":
+                    if not any(args.get(k) for k in ("code", "description")) \
+                            and args.get("parameters") is None:
+                        return "edit_tool needs a change (code, description or parameters)"
+                    if args.get("code") is not None and not isinstance(args["code"], str):
+                        return "code must be text"
+            if isinstance(args.get("code"), str) and args["code"]:
+                compile(args["code"], f"<tool {name}>", "exec")
+            if args.get("parameters") is not None:
+                if not isinstance(args["parameters"], dict):
+                    return "parameters must be an object {name: {type, description, default}}"
+                _param_schema(args["parameters"])
+        except (SyntaxError, ValueError) as exc:
+            return f"{type(exc).__name__}: {exc}"
+        return ""
 
     def create_tool(self, name: str, description: str, code: str,
                     parameters: dict | None = None) -> dict:
@@ -152,9 +282,7 @@ class Toolbox:
         ``params``); a parameter without ``default`` is required. Write it general (no
         hard-coded m/z or region names that should be parameters) and test it on the open
         slide right after it is approved. Prefer an existing tool when one already fits."""
-        name = str(name).strip()
-        if not _NAME.match(name):
-            raise ValueError("tool name must be snake_case, 3–48 chars, starting with a letter")
+        name = _check_name(name)
         if name in self.registry:
             raise ValueError(f"a tool named {name!r} already exists — use edit_tool to change it")
         compile(code, f"<tool {name}>", "exec")                 # syntax check before saving
@@ -177,6 +305,8 @@ class Toolbox:
         if spec is None or spec.source != "custom":
             raise ValueError(f"{name!r} is not a user-created tool (built-in tools can't be "
                              "edited — create a new tool instead)")
+        if not code and not description and parameters is None:
+            raise ValueError("nothing to change — give new code, description or parameters")
         meta = self._meta(name)
         new_code = code or self._code(name, meta["version"])
         compile(new_code, f"<tool {name}>", "exec")
@@ -198,7 +328,7 @@ class Toolbox:
         spec = self.registry.get(name)
         if spec is None or spec.source != "custom":
             raise ValueError(f"{name!r} is not a user-created tool")
-        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         os.replace(os.path.join(self.tools_dir, name),
                    os.path.join(self.tools_dir, f"{name}.deleted-{stamp}"))
         self.registry.remove(name)
@@ -207,6 +337,9 @@ class Toolbox:
     def get_tool_code(self, name: str, version: int = 0) -> dict:
         """The code, parameters and version history of a user-created tool (``version`` 0 =
         current)."""
+        name = _check_name(name)
+        if self.registry.get(name) is None or self.registry.get(name).source != "custom":
+            raise ValueError(f"{name!r} is not a user-created tool")
         meta = self._meta(name)
         v = int(version) or meta["version"]
         return {"name": name, "version": v, "description": meta["description"],
@@ -217,24 +350,26 @@ class Toolbox:
     # flows
     # ------------------------------------------------------------------ #
     def _flow_path(self, name: str) -> str:
-        return os.path.join(self.flows_dir, f"{name}.json")
+        return os.path.join(self.flows_dir, f"{_check_name(name, 'flow')}.json")
 
     def save_flow(self, name: str, description: str, steps: list) -> dict:
         """Save a reusable analysis flow: an ordered list of tool calls,
         ``[{"tool": "find_peaks", "args": {"snr": 3}}, …]``. An argument written as
         ``"{{name}}"`` becomes a parameter filled in by run_flow(params={…}). Use it to keep
         an analysis the user liked so it can be replayed on other slides."""
-        if not _NAME.match(str(name)):
-            raise ValueError("flow name must be snake_case, 3–48 chars, starting with a letter")
+        name = _check_name(name, "flow")
         clean = []
         for i, st in enumerate(steps or []):
             tool = st.get("tool") if isinstance(st, dict) else None
             spec = self.registry.get(tool)
             if spec is None:
                 raise ValueError(f"step {i + 1}: unknown tool {tool!r}")
-            if spec.approval or spec.source == "flow":
+            if spec.approval or tool in _NOT_IN_FLOWS:
                 raise ValueError(f"step {i + 1}: {tool} can't be part of a flow")
-            clean.append({"tool": tool, "args": dict(st.get("args") or {})})
+            args = st.get("args") or {}
+            if not isinstance(args, dict):
+                raise ValueError(f"step {i + 1}: args must be an object")
+            clean.append({"tool": tool, "args": dict(args)})
         if not clean:
             raise ValueError("a flow needs at least one step")
         flow = {"name": name, "description": str(description), "steps": clean,
@@ -245,12 +380,9 @@ class Toolbox:
 
     @staticmethod
     def _placeholders(steps) -> set:
-        out = set()
+        out: set = set()
         for st in steps:
-            for v in st["args"].values():
-                m = _PLACEHOLDER.match(v) if isinstance(v, str) else None
-                if m:
-                    out.add(m.group(1))
+            _placeholders_in(st["args"], out)
         return out
 
     def list_flows(self) -> list:
@@ -271,37 +403,50 @@ class Toolbox:
         with open(self._flow_path(name), encoding="utf-8") as fh:
             flow = json.load(fh)
         params = dict(params or {})
-        missing = sorted(set(flow.get("params", [])) - set(params))
+        needed = self._placeholders(flow["steps"])
+        missing = sorted(needed - set(params))
         if missing:
             raise ValueError(f"flow {name} needs params {missing}")
+        unknown = sorted(set(params) - needed)
+        if unknown:
+            raise ValueError(f"flow {name} has no params {unknown}; it takes {sorted(needed)}")
+        from .core import _failed
+
         results = []
         for i, st in enumerate(flow["steps"]):
-            args = {}
-            for k, v in st["args"].items():
-                m = _PLACEHOLDER.match(v) if isinstance(v, str) else None
-                args[k] = params[m.group(1)] if m else v
+            args = _substitute(st["args"], params)
             spec = self.registry.get(st["tool"])
-            if spec is None or spec.approval:
+            if spec is None or spec.approval or st["tool"] in _NOT_IN_FLOWS:
                 results.append({"step": i + 1, "tool": st["tool"], "ok": False,
                                 "error": "tool missing or not allowed in a flow"})
                 break
             try:
-                results.append({"step": i + 1, "tool": st["tool"], "args": args, "ok": True,
-                                "result": spec.fn(**args)})
+                res = spec.fn(**args)
             except Exception as exc:  # noqa: BLE001 — report the failing step, stop the flow
                 results.append({"step": i + 1, "tool": st["tool"], "args": args, "ok": False,
                                 "error": f"{type(exc).__name__}: {exc}"})
+                break
+            err = _failed(res)                    # e.g. run_script returning ok: false
+            results.append({"step": i + 1, "tool": st["tool"], "args": args, "ok": not err,
+                            "result": res, **({"error": err} if err else {})})
+            if err:
                 break
         return {"flow": name, "completed": all(r["ok"] for r in results), "steps": results}
 
     # ------------------------------------------------------------------ #
     @staticmethod
     def show_file(path: str, caption: str = "") -> dict:
-        """Show an existing image (PNG/JPG) or table (CSV) to the user in the chat — e.g. a
-        figure a script saved earlier. Results of other tools already show their images."""
-        path = os.path.abspath(os.path.expanduser(str(path)))
+        """Show an image (PNG/JPG) or table (CSV) that an analysis saved to the chat — e.g. a
+        figure a script wrote earlier. Only files under the SMILE MSI data folder (results,
+        sessions) can be shown. Results of other tools already show their images."""
+        from .tools import shareable
+
+        path = os.path.realpath(os.path.expanduser(str(path)))
         if not os.path.isfile(path):
-            raise FileNotFoundError(path)
+            raise FileNotFoundError(os.path.basename(path))
+        if not shareable(path):
+            raise PermissionError("only PNG/JPG/CSV files under the SMILE MSI data folder "
+                                  "can be shown")
         return {"path": path, "caption": caption}
 
     def agent_specs(self) -> list[ToolSpec]:

@@ -23,10 +23,28 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
-from .tools import MAX_MODEL_IMAGES, image_b64
+from .tools import MAX_MODEL_IMAGES, image_b64, model_image_ok
 
 DEFAULT_CLAUDE_MODEL = "claude-opus-5-5"
 DEFAULT_LOCAL_URL = "http://localhost:11434/v1"      # Ollama's OpenAI-compatible endpoint
+#: Images sent to the model over a whole conversation (the API allows 100 per request, and
+#: the history is resent every step). Past this, results say an image exists but don't attach.
+IMAGE_BUDGET = 50
+
+
+def _pick_images(paths, sent: int) -> tuple[list, str]:
+    """The images of one tool result that can go to the model, and a note for the rest."""
+    usable = [p for p in paths if model_image_ok(p)]
+    skipped = len(paths) - len(usable)
+    room = max(0, min(MAX_MODEL_IMAGES, IMAGE_BUDGET - sent))
+    take = usable[:room]
+    notes = []
+    if skipped:
+        notes.append(f"{skipped} image(s) not attached (not PNG/JPEG or too large)")
+    if len(usable) > len(take):
+        notes.append(f"{len(usable) - len(take)} image(s) not attached (image limit for this "
+                     "conversation) — the user still sees them")
+    return take, "; ".join(notes)
 
 
 @dataclass
@@ -85,6 +103,7 @@ class AnthropicProvider:
         self.messages: list = []
         self.system = ""
         self.tools: list = []
+        self.images_sent = 0
 
     def settings(self) -> dict:
         return {"model": self.model, "effort": self.effort, "max_tokens": self.max_tokens}
@@ -98,22 +117,54 @@ class AnthropicProvider:
     def add_user(self, text: str):
         self.messages.append({"role": "user", "content": text})
 
+    def _create(self):
+        return self.client.beta.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=self.system,
+            tools=self.tools,
+            messages=self.messages,
+            thinking={"type": "adaptive", "display": "summarized"},
+            output_config={"effort": self.effort},
+            cache_control={"type": "ephemeral"},
+            # a safety-classifier decline is re-run on Anthropic's recommended model
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+        )
+
+    def _drop_last_images(self) -> bool:
+        """The request was rejected over an image: replace the images in the tool results
+        just added (not yet seen by the model) with a note. Earlier turns are never edited."""
+        last = self.messages[-1] if self.messages else None
+        if not last or last["role"] != "user" or not isinstance(last["content"], list):
+            return False
+        changed = False
+        for block in last["content"]:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                kept = [c for c in block["content"] if c.get("type") != "image"]
+                if len(kept) != len(block["content"]):
+                    kept.append({"type": "text", "text": "(image not attached: the API "
+                                                         "rejected it)"})
+                    block["content"] = kept
+                    changed = True
+        return changed
+
     def step(self) -> Step:
         a = self._anthropic
         try:
-            resp = self.client.beta.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=self.system,
-                tools=self.tools,
-                messages=self.messages,
-                thinking={"type": "adaptive", "display": "summarized"},
-                output_config={"effort": self.effort},
-                cache_control={"type": "ephemeral"},
-                # a safety-classifier decline is re-run on Anthropic's recommended model
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-            )
+            try:
+                resp = self._create()
+            except a.BadRequestError as exc:
+                if "image" in str(exc.message).lower() and self._drop_last_images():
+                    resp = self._create()
+                else:
+                    raise
+        except TypeError as exc:                 # the SDK found no API key / token / profile
+            if "auth" in str(exc).lower():
+                raise ProviderError("No Claude credentials found — paste an API key in "
+                                    "Settings, set ANTHROPIC_API_KEY, or run "
+                                    "`ant auth login`.") from exc
+            raise
         except a.AuthenticationError as exc:
             raise ProviderError("Claude rejected the API key — check it in Settings.") from exc
         except a.PermissionDeniedError as exc:
@@ -129,8 +180,15 @@ class AnthropicProvider:
         except a.APIConnectionError as exc:
             raise ProviderError("Can't reach the Claude API — check the network.") from exc
 
-        # append-only history: the full content (thinking, fallback blocks) goes back as is
-        self.messages.append({"role": "assistant", "content": resp.content})
+        # Append-only history: the content (thinking, fallback blocks) goes back as is — except
+        # tool calls we will not run (a refusal, or a reply cut off mid-call), which would
+        # otherwise sit unanswered and make every later request fail.
+        content = list(resp.content)
+        if resp.stop_reason in ("refusal", "max_tokens"):
+            content = [b for b in content if b.type != "tool_use"]
+            if not content:
+                content = [{"type": "text", "text": "(no reply)"}]
+        self.messages.append({"role": "assistant", "content": content})
         out = Step(stop=resp.stop_reason or "")
         texts, thoughts = [], []
         for block in resp.content:
@@ -150,17 +208,25 @@ class AnthropicProvider:
             out.note = f"The model declined this request (category: {cat or 'unspecified'})."
             out.calls = []
         elif resp.stop_reason == "max_tokens":
-            out.note = "The reply hit the output limit and was cut short."
+            out.note = ("The reply hit the output limit and was cut short"
+                        + (" before its tool call was complete." if out.calls else "."))
+            out.calls = []
         return out
 
     def add_tool_outputs(self, outputs: list):
         blocks = []
         for o in outputs:
-            content = [{"type": "text", "text": o.text or "(no output)"}]
-            for path in o.images[:MAX_MODEL_IMAGES]:
-                media, data = image_b64(path)
+            take, note = _pick_images(o.images, self.images_sent)
+            content = [{"type": "text", "text": (o.text or "(no output)")
+                        + (f"\n[{note}]" if note else "")}]
+            for path in take:
+                try:
+                    media, data = image_b64(path)
+                except OSError:
+                    continue
                 content.append({"type": "image",
                                 "source": {"type": "base64", "media_type": media, "data": data}})
+                self.images_sent += 1
             blocks.append({"type": "tool_result", "tool_use_id": o.call_id,
                            "content": content, "is_error": bool(o.is_error)})
         self.messages.append({"role": "user", "content": blocks})
@@ -183,6 +249,7 @@ class OpenAICompatProvider:
         self.timeout = float(timeout)
         self.messages: list = []
         self.tools: list = []
+        self.images_sent = 0
 
     def settings(self) -> dict:
         return {"model": self.model, "base_url": self.base_url, "vision": self.vision}
@@ -206,7 +273,15 @@ class OpenAICompatProvider:
                      **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {})})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+                raw = r.read().decode("utf-8", "replace")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ProviderError(f"The model server sent a reply that isn't JSON: "
+                                    f"{raw[:200]!r}") from exc
+        except TimeoutError as exc:
+            raise ProviderError(f"The model server took longer than {self.timeout:.0f}s to "
+                                "reply.") from exc
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")[:500]
             raise ProviderError(f"Local model server returned {exc.code}: {body}") from exc
@@ -223,22 +298,37 @@ class OpenAICompatProvider:
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError(f"Unexpected reply from the model server: {str(data)[:300]}") \
                 from exc
-        keep = {"role": "assistant", "content": msg.get("content") or ""}
-        if msg.get("tool_calls"):
-            keep["tool_calls"] = msg["tool_calls"]
-        self.messages.append(keep)
-        out = Step(text=msg.get("content") or "", stop=choice.get("finish_reason") or "",
+        if not isinstance(msg, dict):
+            raise ProviderError(f"Unexpected reply from the model server: {str(data)[:300]}")
+        text = msg.get("content") if isinstance(msg.get("content"), str) else ""
+        out = Step(text=text, stop=choice.get("finish_reason") or "",
                    thinking=msg.get("reasoning_content") or msg.get("reasoning") or "")
+        stored_calls = []
         for i, tc in enumerate(msg.get("tool_calls") or []):
-            fn = tc.get("function", {})
-            raw = fn.get("arguments") or "{}"
+            tc = tc if isinstance(tc, dict) else {}
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            cid = tc.get("id") or f"call_{len(self.messages)}_{i}"
+            raw = fn.get("arguments")
+            err = ""
             try:
-                args = json.loads(raw) if isinstance(raw, str) else dict(raw)
-                err = ""
+                args = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(args, str):                       # double-encoded
+                    args = json.loads(args)
             except json.JSONDecodeError as exc:
                 args, err = {}, f"tool arguments were not valid JSON: {exc}"
-            out.calls.append(ToolCall(tc.get("id") or f"call_{len(self.messages)}_{i}",
-                                      fn.get("name", ""), args, err))
+            if args is None:
+                args = {}
+            if not isinstance(args, dict) and not err:
+                args, err = {}, "tool arguments must be a JSON object"
+            name = fn.get("name") or ""
+            # the stored call carries the same id the tool result will answer
+            stored_calls.append({"id": cid, "type": "function",
+                                 "function": {"name": name, "arguments": json.dumps(args)}})
+            out.calls.append(ToolCall(cid, name, args, err))
+        keep = {"role": "assistant", "content": text}
+        if stored_calls:
+            keep["tool_calls"] = stored_calls
+        self.messages.append(keep)
         u = data.get("usage") or {}
         out.usage = {"input_tokens": u.get("prompt_tokens", 0),
                      "output_tokens": u.get("completion_tokens", 0), "model": self.model}
@@ -249,16 +339,23 @@ class OpenAICompatProvider:
     def add_tool_outputs(self, outputs: list):
         images = []
         for o in outputs:
-            text = ("ERROR: " if o.is_error else "") + (o.text or "(no output)")
+            text = ("ERROR: " if o.is_error and not o.text.startswith("ERROR") else "") \
+                + (o.text or "(no output)")
             self.messages.append({"role": "tool", "tool_call_id": o.call_id, "content": text})
             images += o.images
         if self.vision and images:          # tool messages can't carry images on most servers
+            take, _note = _pick_images(images, self.images_sent)
             parts = [{"type": "text", "text": "Images produced by the tool calls above:"}]
-            for path in images[:MAX_MODEL_IMAGES]:
-                media, data = image_b64(path)
+            for path in take:
+                try:
+                    media, data = image_b64(path)
+                except OSError:
+                    continue
                 parts.append({"type": "image_url",
                               "image_url": {"url": f"data:{media};base64,{data}"}})
-            self.messages.append({"role": "user", "content": parts})
+                self.images_sent += 1
+            if len(parts) > 1:
+                self.messages.append({"role": "user", "content": parts})
 
 
 def make_provider(cfg: dict):

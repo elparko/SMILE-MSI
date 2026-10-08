@@ -153,6 +153,8 @@ aside .content { padding: 14px 16px; overflow-y: auto; }
     <div class="field" data-for="local"><label for="s-url">Server URL</label><input id="s-url" placeholder="http://localhost:11434/v1"></div>
     <div class="field" data-for="local"><label><input type="checkbox" id="s-vision" style="width:auto"> Model can read images</label>
       <div class="hint">Turn on for vision models so they see the figures they make.</div></div>
+    <div class="field"><label><input type="checkbox" id="s-scripts" style="width:auto"> Ask before every script the model runs</label>
+      <div class="hint">Creating or editing tools always asks. Scripts run as ordinary Python with your permissions; turn this on to review each one.</div></div>
     <button class="primary" id="s-save">Save &amp; start new conversation</button>
     <p class="hint" id="s-logpath" style="font-size:12px;color:var(--muted);word-break:break-all"></p>
   </div>
@@ -269,9 +271,9 @@ function handle(ev) {
       figures(c, ev.images, ev.files); if (nearBottom()) scrollEl.scrollTop = scrollEl.scrollHeight; $("working").textContent = "Thinking…"; break; }
     case "approval_request": {
       const a = el("div", "approval");
-      const verb = { create_tool: "Create a new tool", edit_tool: "Edit tool", delete_tool: "Delete tool" }[ev.tool] || ev.title;
+      const verb = { create_tool: "Create a new tool", edit_tool: "Edit tool", delete_tool: "Delete tool", run_script: "Run a script" }[ev.tool] || ev.title;
       const params = ev.parameters ? `<div class="label">Parameters</div><pre>${esc(JSON.stringify(ev.parameters, null, 1))}</pre>` : "";
-      a.innerHTML = `<h3>${esc(verb)}: <code>${esc(ev.target)}</code></h3>
+      a.innerHTML = `<h3>${esc(verb)}${ev.target ? `: <code>${esc(ev.target)}</code>` : ""}</h3>
         ${ev.description ? `<div class="desc">${esc(ev.description)}</div>` : ""}${ev.note ? `<div class="desc"><i>${esc(ev.note)}</i></div>` : ""}
         ${params}${ev.code ? `<div class="label">Code · sha256 ${esc(ev.sha256.slice(0, 12))}</div><pre>${esc(ev.code)}</pre>` : ""}
         <div class="row"><input placeholder="Optional note to the assistant"><button class="primary">Approve</button><button class="danger">Reject</button></div>`;
@@ -324,6 +326,7 @@ $("btn-settings").onclick = async () => {
   const c = await api("/api/config");
   $("s-provider").value = c.provider || "claude"; $("s-model").value = c.model || ""; $("s-url").value = c.base_url || "";
   $("s-effort").value = c.effort || "high"; $("s-vision").checked = !!c.vision; $("s-key").value = "";
+  $("s-scripts").checked = !!c.approve_scripts;
   $("s-key-hint").innerHTML = (c.has_key ? "<b>A key is set.</b> Leave empty to keep it. " : "") +
     "Kept in memory only — never logged or saved. Optional if ANTHROPIC_API_KEY is set or you ran <code>ant auth login</code>.";
   $("s-logpath").textContent = c.log_path ? "This session's log: " + c.log_path : (c.error || "");
@@ -331,7 +334,8 @@ $("btn-settings").onclick = async () => {
 };
 $("s-save").onclick = async () => {
   try { await api("/api/config", { provider: $("s-provider").value, model: $("s-model").value.trim(), api_key: $("s-key").value,
-      base_url: $("s-url").value.trim(), effort: $("s-effort").value, vision: $("s-vision").checked });
+      base_url: $("s-url").value.trim(), effort: $("s-effort").value, vision: $("s-vision").checked,
+      approve_scripts: $("s-scripts").checked });
     $("settings").classList.remove("open"); } catch (e) { alert(e.message); }
 };
 $("btn-lib").onclick = async () => {

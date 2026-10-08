@@ -342,6 +342,8 @@ def script_output(result, slide) -> dict:
         "tables": [_table_out(df, title or "script-table")
                    for title, df in (result.tables or [])],
     }
+    if getattr(result, "stdout", ""):                  # print() output
+        out["stdout"] = result.stdout[-4000:]
     if result.error:
         out["error"] = result.error
     if result.images:

@@ -7,12 +7,25 @@ Each thing that happens is written to the :class:`~smile_msi.agent.log.SessionLo
 passed to ``emit`` so a front end can show it live — the model's text, its reasoning summary,
 each tool call as it starts and finishes, and every image a tool produced.
 
-Tools flagged ``approval`` (create / edit / delete a tool) block on ``approve(request)`` — the
-front end shows the code and the user decides; a rejection goes back to the model as the
-tool's error so it can adjust.
+**Every tool call gets exactly one result.** Model APIs reject a conversation in which a
+tool call was never answered, and every later request would fail — so whatever goes wrong
+between the model asking and the result going back (a tool raising anything, even
+``SystemExit``; a result that can't be rendered; a malformed approval request) becomes an
+error *result* for that call, and a turn that dies mid-step still answers every call first.
+
+Tools flagged ``approval`` (create / edit / delete a tool, and ``run_script`` when the user
+turns that on) block on ``approve(request)`` after a pre-check — a request that would fail
+anyway (bad name, duplicate, syntax error) is refused without bothering the user. A rejection
+goes back to the model as the tool's error so it can adjust.
+
+The approval gate is a review step, not a sandbox: ``run_script`` runs ordinary Python with
+the user's permissions unless the user requires approval for it too.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import threading
 import time
 
@@ -36,21 +49,24 @@ and why, then do it. Ask when a choice is genuinely the scientist's (which regio
 which tissue, which comparison matters) rather than guessing.
 - Keep the scientist oriented: short progress notes between steps, a clear summary at the \
 end with what was done, what was found, and what is still uncertain.
+- A tool result with "ok": false or an "error" failed — say so; don't build on it.
 
 Scientific standards (a reviewer will read this analysis)
 - Separate what was measured from what you infer. Mark interpretations and biological \
 context as such, and say how confident you are.
 - Lipid identities from m/z alone are putative and at sum-composition level (e.g. \
 "putatively PC 34:1, [M+H]+, 1.8 ppm"); never present them as confirmed without MS/MS.
-- Report effect sizes and the test used, not just p-values; correct for multiple testing; \
-remember that pixels are not independent replicates — say so when n is pixels.
+- Report effect sizes and the test used, not just p-values; correct for multiple testing. \
+Pixels are not independent replicates: with one region per group, p-values describe pixels, \
+not biological replication — say so, and lean on effect sizes.
 - Flag likely artefacts: matrix peaks, isotopes/adducts of another feature, \
-normalisation-driven differences, edge effects, low signal.
+normalisation-driven differences, edge effects, off-tissue background, low signal.
 
 Tools
 - Start with list_slides / slide_state to see the scientist's saved work, or \
 open_slide('demo') for a synthetic slide. Read scripting_guide before writing run_script \
-code. Tables come back as a preview plus a CSV path.
+code. Tables come back as a preview plus a CSV path. Save figures with image() rather than \
+writing files yourself.
 - If no tool fits and the need will recur, you may create one with create_tool (the \
 scientist approves the code first). Prefer existing tools; write new ones general \
 (parameters, not hard-coded values) and test them right after approval.
@@ -65,27 +81,43 @@ def system_prompt() -> str:
     return SYSTEM_PROMPT + mcpserver.INSTRUCTIONS
 
 
+def _failed(result) -> str:
+    """The error message of a tool result that reports its own failure, else ``""``."""
+    if isinstance(result, dict):
+        if result.get("ok") is False:
+            return str(result.get("error") or "the tool reported ok: false")
+        if result.get("completed") is False:                      # a flow that stopped
+            bad = [s for s in result.get("steps", []) if not s.get("ok")]
+            return f"flow stopped at step {bad[0]['step']}: {bad[0].get('error')}" if bad \
+                else "flow did not complete"
+    return ""
+
+
 class Agent:
     """One conversation. ``emit(event: dict)`` receives live events; ``approve(request)``
     returns ``(approved: bool, note: str)`` and may block until the user decides."""
 
     def __init__(self, provider, *, emit=None, approve=None, log: SessionLog | None = None,
-                 registry: tools.Registry | None = None, max_steps: int = 40):
+                 registry: tools.Registry | None = None, max_steps: int = 40,
+                 approve_scripts: bool = False):
         self.provider = provider
         self.emit = emit or (lambda ev: None)
         self.approve = approve or (lambda req: (False, "no approver connected"))
         self.log = log or SessionLog()
         self.registry = registry or tools.Registry(tools.builtin_tools())
+        if approve_scripts and "run_script" in self.registry:
+            self.registry.get("run_script").approval = True
         self.toolbox = custom.Toolbox(self.registry)
         self.max_steps = int(max_steps)
         self._stop = threading.Event()
         self.busy = False
-        self._tool_names = tuple(self.registry.names())
+        self._tool_sig = self._signature()
+        self._dataset_seen = None
         provider.start(system_prompt(), self.registry.api_defs())
         from .. import __version__
 
         self._event("session", provider=provider.name, version=__version__,
-                    **provider.settings())
+                    approve_scripts=bool(approve_scripts), **provider.settings())
 
     # ------------------------------------------------------------------ #
     def _event(self, type_: str, **data) -> dict:
@@ -108,96 +140,136 @@ class Agent:
                 self._sync_tools()
                 self._event("status", state="thinking")
                 step = self.provider.step()
-                self._event("usage", **step.usage)
-                if step.thinking:
-                    self._event("thinking", text=step.thinking)
-                if step.text:
-                    self._event("assistant", text=step.text)
-                if step.note:
-                    self._event("notice", text=step.note)
-                if not step.calls:
-                    break
-                outputs = [self._run_call(c) for c in step.calls]
-                self.provider.add_tool_outputs(outputs)
-                if self._stop.is_set():
-                    self._event("notice", text="Stopped — the results so far are kept.")
+                if self._answer_step(step):
                     break
             else:
                 self._event("notice", text=f"Paused after {self.max_steps} steps. "
                                            "Say 'continue' to keep going.")
         except ProviderError as exc:
             self._event("error", message=str(exc))
-        except Exception as exc:  # noqa: BLE001 — surface, never kill the server thread
+        except BaseException as exc:  # noqa: BLE001 — surface, never kill the server thread
             self._event("error", message=f"{type(exc).__name__}: {exc}")
+            if isinstance(exc, KeyboardInterrupt):
+                raise
         finally:
             self.busy = False
             self._event("done")
 
+    def _answer_step(self, step) -> bool:
+        """Report one model step and run its tool calls. Returns True when the turn ends.
+        Whatever happens, every call the model made is answered before this returns."""
+        outputs: dict[str, ToolOutput] = {}
+        try:
+            self._event("usage", **step.usage)
+            if step.thinking:
+                self._event("thinking", text=step.thinking)
+            if step.text:
+                self._event("assistant", text=step.text)
+            if step.note:
+                self._event("notice", text=step.note)
+            for call in step.calls:
+                outputs[call.id] = self._run_call(call)
+        finally:
+            if step.calls:
+                for call in step.calls:                # a dying step still answers every call
+                    if call.id not in outputs:
+                        outputs[call.id] = ToolOutput(call.id, "ERROR: not run — the turn "
+                                                      "was interrupted", is_error=True)
+                self.provider.add_tool_outputs([outputs[c.id] for c in step.calls])
+        if not step.calls:
+            return True
+        if self._stop.is_set():
+            self._event("notice", text="Stopped — the results so far are kept.")
+            return True
+        return False
+
+    def _signature(self) -> str:
+        return json.dumps(self.registry.api_defs(), sort_keys=True, default=str)
+
     def _sync_tools(self):
-        """A tool created or deleted last step changes what the model can call next."""
-        names = tuple(self.registry.names())
-        if names != self._tool_names:
-            self._tool_names = names
+        """A tool created, edited or deleted last step changes what the model can call."""
+        sig = self._signature()
+        if sig != self._tool_sig:
+            self._tool_sig = sig
             self.provider.set_tools(self.registry.api_defs())
 
     # ------------------------------------------------------------------ #
     def _run_call(self, call) -> ToolOutput:
-        self._event("tool_call", call_id=call.id, name=call.name, args=call.args)
-        spec = self.registry.get(call.name)
         t0 = time.perf_counter()
+        try:
+            self._event("tool_call", call_id=call.id, name=call.name,
+                        args=call.args if isinstance(call.args, dict) else repr(call.args))
+        except BaseException:  # noqa: BLE001 — logging must not lose the call
+            pass
 
         def fail(msg):
-            self._event("tool_result", call_id=call.id, name=call.name, ok=False, error=msg,
-                        duration_s=time.perf_counter() - t0, text=msg)
+            try:
+                self._event("tool_result", call_id=call.id, name=call.name, ok=False,
+                            error=msg, duration_s=time.perf_counter() - t0, text=msg)
+            except BaseException:  # noqa: BLE001
+                pass
             return ToolOutput(call.id, f"ERROR: {msg}", is_error=True)
 
-        if call.parse_error:
-            return fail(call.parse_error)
-        if spec is None:
-            return fail(f"no tool named {call.name!r}")
-        if spec.approval:
-            req = self._approval_request(spec, call)
-            self._event("approval_request", **req)
-            ok, note = self.approve(req)
-            self._event("approval", call_id=call.id, tool=call.name, target=req["target"],
-                        decision="approved" if ok else "rejected", note=note,
-                        sha256=req.get("sha256", ""))
-            if not ok:
-                return fail("the scientist rejected this" + (f": {note}" if note else "") +
-                            ". Ask what they would like instead.")
         try:
+            spec = self.registry.get(call.name)
+            if call.parse_error:
+                return fail(call.parse_error)
+            if spec is None:
+                return fail(f"no tool named {call.name!r}")
+            if not isinstance(call.args, dict):
+                return fail(f"arguments must be a JSON object, got {type(call.args).__name__}")
+            if spec.approval:
+                problem = self.toolbox.precheck(call.name, call.args)
+                if problem:
+                    return fail(problem)
+                req = self._approval_request(spec, call)
+                self._event("approval_request", **req)
+                ok, note = self.approve(req)
+                self._event("approval", call_id=call.id, tool=call.name, target=req["target"],
+                            decision="approved" if ok else "rejected", note=note,
+                            sha256=req.get("sha256", ""))
+                if not ok:
+                    return fail("the scientist rejected this" + (f": {note}" if note else "")
+                                + ". Ask what they would like instead.")
             result = spec.fn(**call.args)
-        except Exception as exc:  # noqa: BLE001 — tool errors go back to the model
-            return fail(f"{type(exc).__name__}: {exc}")
-        rendered = tools.render(result)
-        self._event("tool_result", call_id=call.id, name=call.name, ok=True, text=rendered.text,
-                    images=rendered.images, files=rendered.files,
-                    duration_s=time.perf_counter() - t0)
-        if call.name == "open_slide":
-            self._log_dataset(call.args.get("ref", "demo"))
-        return ToolOutput(call.id, rendered.text, images=rendered.images)
+            rendered = tools.render(result)
+            err = _failed(result)
+            self._event("tool_result", call_id=call.id, name=call.name, ok=not err,
+                        error=err or None, text=rendered.text, images=rendered.images,
+                        files=rendered.files, duration_s=time.perf_counter() - t0)
+            self._check_dataset()
+            return ToolOutput(call.id, rendered.text, images=rendered.images, is_error=bool(err))
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:  # noqa: BLE001 — incl. SystemExit from user scripts
+            msg = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            self._check_dataset()
+            return fail(msg)
 
     @staticmethod
     def _approval_request(spec, call) -> dict:
-        import hashlib
-
-        code = call.args.get("code") or ""
+        a = call.args
+        code = a.get("code") if isinstance(a.get("code"), str) else ""
         return {"call_id": call.id, "tool": call.name, "title": spec.title,
-                "target": call.args.get("name", ""),
-                "description": call.args.get("description", ""),
-                "parameters": call.args.get("parameters"),
-                "note": call.args.get("note", ""), "code": code,
+                "target": str(a.get("name", "")),
+                "description": str(a.get("description", "")),
+                "parameters": a.get("parameters"), "note": str(a.get("note", "")),
+                "code": code,
                 "sha256": hashlib.sha256(code.encode()).hexdigest() if code else ""}
 
-    def _log_dataset(self, ref):
+    def _check_dataset(self):
+        """Log the open slide's fingerprint whenever it changes — however it was opened
+        (a tool, a flow, a script) and also when a conversation starts on an open slide."""
         from .. import library, mcpserver
 
         slide = mcpserver._open.get("slide")
-        if slide is None:
+        if slide is None or slide is self._dataset_seen:
             return
+        self._dataset_seen = slide
         try:
             fp = library.dataset_fingerprint(slide.ds)
         except Exception:  # noqa: BLE001 — a fingerprint is provenance, not a blocker
             fp = "unavailable"
-        self._event("dataset", ref=str(ref), source=slide.source, fingerprint=fp,
-                    n_pixels=int(slide.ds.n_pixels))
+        self._event("dataset", ref=str(mcpserver._open.get("ref", "")), source=slide.source,
+                    fingerprint=fp, n_pixels=int(slide.ds.n_pixels),
+                    cwd=os.getcwd())

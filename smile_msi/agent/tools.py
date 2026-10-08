@@ -27,6 +27,10 @@ MAX_RESULT_CHARS = 20_000
 MAX_MODEL_IMAGES = 4
 
 _IMAGE_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+#: File types the chat may show / serve (anything else a result mentions stays a plain path).
+SHAREABLE_EXT = {".png", ".jpg", ".jpeg", ".csv"}
+#: Largest image file sent to a model (the API caps base64 image data at 5 MB).
+MAX_IMAGE_BYTES = 3_700_000
 _JSON_TYPE = {float: "number", int: "integer", bool: "boolean", str: "string",
               list: "array", tuple: "array", dict: "object"}
 
@@ -34,8 +38,8 @@ _JSON_TYPE = {float: "number", int: "integer", bool: "boolean", str: "string",
 @dataclass
 class ToolSpec:
     """One callable tool. ``fn(**args)`` runs it; ``approval`` marks tools that need the user's
-    OK before every call (creating or editing a tool — the only actions that let a model put
-    new code on the user's machine)."""
+    OK before every call (creating, editing or deleting a tool; ``run_script`` too when the user
+    asks for that)."""
     name: str
     description: str
     schema: dict
@@ -142,13 +146,57 @@ class Rendered:
     is_error: bool = False
 
 
-def _walk_paths(obj, out):
-    if isinstance(obj, dict):
-        for v in obj.values():
-            _walk_paths(v, out)
-    elif isinstance(obj, (list, tuple)):
-        for v in obj:
-            _walk_paths(v, out)
+def share_roots() -> list[str]:
+    """Folders whose files the chat may show: the SMILE MSI home (sessions, agent data) and
+    the tool results folder."""
+    from .. import library, mcpserver
+
+    return [os.path.realpath(library.home_dir()), os.path.realpath(mcpserver.results_dir())]
+
+
+def shareable(path: str) -> bool:
+    """True for a PNG/JPG/CSV file that really lives (symlinks resolved) under
+    :func:`share_roots` — the only files the chat shows or serves."""
+    real = os.path.realpath(path)
+    if os.path.splitext(real)[1].lower() not in SHAREABLE_EXT or not os.path.isfile(real):
+        return False
+    return any(os.path.commonpath([real, root]) == root for root in share_roots())
+
+
+def image_kind(path: str) -> str:
+    """The image's real media type from its first bytes (``""`` if not PNG/JPEG) — the API
+    rejects an image whose declared type doesn't match its content."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return ""
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    return ""
+
+
+def model_image_ok(path: str) -> bool:
+    """Whether ``path`` can be sent to a model as an image (real PNG/JPEG, not too big)."""
+    try:
+        return bool(image_kind(path)) and os.path.getsize(path) <= MAX_IMAGE_BYTES
+    except OSError:
+        return False
+
+
+def _walk_paths(obj, out, _seen=None, _depth=0):
+    """Collect absolute file paths mentioned anywhere in a result (cycle- and depth-safe)."""
+    _seen = set() if _seen is None else _seen
+    if _depth > 20:
+        return
+    if isinstance(obj, (dict, list, tuple)):
+        if id(obj) in _seen:
+            return
+        _seen.add(id(obj))
+        for v in (obj.values() if isinstance(obj, dict) else obj):
+            _walk_paths(v, out, _seen, _depth + 1)
     elif isinstance(obj, str) and len(obj) < 1024 and os.path.isabs(obj) and os.path.isfile(obj):
         out.append(obj)
 
@@ -156,6 +204,8 @@ def _walk_paths(obj, out):
 def _jsonable(obj):
     if isinstance(obj, dict):
         return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, float) and obj != obj:
+        return None
     if isinstance(obj, (list, tuple, set)):
         return [_jsonable(v) for v in obj]
     if isinstance(obj, (str, int, float, bool)) or obj is None:
@@ -169,16 +219,21 @@ def render(result, *, is_error: bool = False) -> Rendered:
     """Turn a tool's return value into a :class:`Rendered` (text + the files it points at)."""
     paths: list[str] = []
     _walk_paths(result, paths)
-    images = [p for p in dict.fromkeys(paths) if os.path.splitext(p)[1].lower() in _IMAGE_EXT]
-    files = [p for p in dict.fromkeys(paths) if p not in images]
-    text = result if isinstance(result, str) else json.dumps(_jsonable(result), indent=1)
+    paths = [os.path.realpath(p) for p in dict.fromkeys(paths) if shareable(p)]
+    images = [p for p in paths if os.path.splitext(p)[1].lower() in _IMAGE_EXT]
+    files = [p for p in paths if p not in images]
+    try:
+        text = result if isinstance(result, str) else json.dumps(_jsonable(result), indent=1)
+    except (RecursionError, ValueError, TypeError) as exc:     # e.g. a self-referencing value
+        text = f"(result could not be shown: {type(exc).__name__})"
     if len(text) > MAX_RESULT_CHARS:
         text = text[:MAX_RESULT_CHARS] + f"\n… [truncated {len(text) - MAX_RESULT_CHARS} chars]"
     return Rendered(text=text, images=images, files=files, is_error=is_error)
 
 
 def image_b64(path: str) -> tuple[str, str]:
-    """``(media_type, base64 data)`` of an image file, for a model's image block."""
-    media = _IMAGE_EXT.get(os.path.splitext(path)[1].lower(), "image/png")
+    """``(media_type, base64 data)`` of an image file, for a model's image block. The media
+    type comes from the file's bytes, not its extension."""
+    media = image_kind(path) or _IMAGE_EXT.get(os.path.splitext(path)[1].lower(), "image/png")
     with open(path, "rb") as fh:
         return media, base64.standard_b64encode(fh.read()).decode("ascii")
