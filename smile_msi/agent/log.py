@@ -13,6 +13,7 @@ as each event happens, so a crash mid-analysis still leaves the full trail. Ever
 ``approval``     a create/edit/delete-tool request and the user's decision (with code sha256)
 ``dataset``      fingerprint of a slide when one is opened (ties results to the exact data)
 ``usage``        tokens per model step
+``review``       a referee pass: rule findings, the model's report, and which model wrote it
 ``error``        anything that went wrong outside a tool
 
 :meth:`SessionLog.markdown` renders the same record as a readable report, ending with the
@@ -41,6 +42,26 @@ def _quote(text: str) -> str:
 
 def _inline(text) -> str:
     return " ".join(str(text).split())
+
+
+def _review_markdown(r: dict, t: str) -> list[str]:
+    """A ``review`` record as a "## Review" section: findings, then the model's report."""
+    lines = ["## Review", "",
+             f"*{t}*" + (f" · model `{r['model']}`" if r.get("model") else ""), ""]
+    findings = r.get("findings") or []
+    if findings:
+        for f in findings:
+            ev = ", ".join(str(e) for e in f.get("evidence") or [])
+            lines += [f"- **{f.get('severity')}** — {_inline(f.get('title', ''))}: "
+                      f"{_inline(f.get('detail', ''))}" + (f" _(log: {ev})_" if ev else "")]
+        lines += [""]
+    else:
+        lines += ["No rule-based findings.", ""]
+    if r.get("llm"):
+        lines += [_quote(r["llm"]), ""]
+    elif r.get("llm_error"):
+        lines += [f"_The model review failed: {_inline(r['llm_error'])}_", ""]
+    return lines
 
 
 def _now() -> str:
@@ -99,9 +120,11 @@ class SessionLog:
                               "args": res.get("effective_args") or r.get("args", {})})
         return steps
 
-    def markdown(self) -> str:
+    def markdown(self, include_reviews: bool = True) -> str:
         """The session as a readable report: conversation, every tool call with its
-        arguments and outcome, approvals, datasets, token use — and a replayable flow."""
+        arguments and outcome, approvals, datasets, token use — and a replayable flow.
+        ``include_reviews=False`` leaves out earlier ``review`` sections (what the reviewer
+        itself reads, so one review does not anchor the next)."""
         lines = [f"# SMILE MSI analysis log — {self.started}", ""]
         tokens_in = tokens_out = 0
         for r in self.records:
@@ -163,6 +186,9 @@ class SessionLog:
                 ds = "; ".join(f"{d['arg']} = {d['used']} (setup {d['setup']})"
                                for d in r.get("deviations", []))
                 lines += [f"  - **deviation from setup** in {r.get('name')}: {ds}"]
+            elif kind == "review":
+                if include_reviews:
+                    lines += _review_markdown(r, t)
             elif kind == "notice":
                 lines += [f"- `{t}` _{r.get('text')}_"]
             elif kind == "error":

@@ -148,6 +148,20 @@ aside .content { padding: 14px 16px; overflow-y: auto; }
 .setup-card .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
 .setup-card .err { color: var(--bad); font-size: 13px; }
 .setup-note { border-left: 3px solid var(--accent); padding: 6px 12px; margin: 12px 0; font-size: 13.5px; color: var(--muted); }
+.review { border: 1px solid var(--line); border-left: 4px solid var(--accent); background: var(--panel); border-radius: 12px;
+  padding: 12px 16px; margin: 16px 0; }
+.review h3 { margin: 0 0 2px; font-size: 15px; }
+.review .meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.review ul.findings { list-style: none; margin: 8px 0; padding: 0; }
+.review ul.findings li { border-left: 3px solid var(--muted); background: var(--soft); border-radius: 0 8px 8px 0; padding: 6px 10px; margin: 6px 0; }
+.review ul.findings li.major { border-left-color: var(--bad); }
+.review ul.findings li.minor { border-left-color: var(--warn); }
+.review .sev { font: 700 11px var(--sans); text-transform: uppercase; letter-spacing: .06em; margin-right: 6px; color: var(--muted); }
+.review li.major .sev { color: var(--bad); }
+.review li.minor .sev { color: var(--warn); }
+.review .detail { font-size: 13.5px; margin-top: 2px; }
+.review .evidence { font: 11.5px var(--mono); color: var(--muted); margin-top: 2px; }
+.review .report { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 4px; }
 .dev { color: var(--warn); font: 600 11.5px var(--sans); white-space: nowrap; }
 @media (max-width: 600px) { header h1 span { display: none; } .pill { max-width: 32vw; } .sgrid { grid-template-columns: 1fr; } }
 </style>
@@ -159,6 +173,7 @@ aside .content { padding: 14px 16px; overflow-y: auto; }
   <div class="spacer"></div>
   <button id="btn-lib" title="Your tools and flows">Library</button>
   <button id="btn-log" title="Download the full session log (Markdown)">Log</button>
+  <button id="btn-review" title="Referee report on the analysis so far">Review</button>
   <button id="btn-setup" title="Analysis setup">Setup</button>
   <button id="btn-settings">Settings</button>
   <button id="btn-new" title="Start a new conversation">New</button>
@@ -353,9 +368,23 @@ function figures(card, images, files) {
 function setBusy(b) { busy = b; $("send").hidden = b; $("stop").hidden = !b; if (!b) $("working").textContent = ""; }
 function header() { $("model").textContent = modelLabel + (tokensIn + tokensOut ? ` · ${(tokensIn / 1000).toFixed(1)}k in / ${(tokensOut / 1000).toFixed(1)}k out` : ""); }
 
+function reviewCard(ev) {
+  const c = el("div", "review");
+  const fs = ev.findings || [], sev = (s) => (["major", "minor", "note"].includes(s) ? s : "note");
+  c.innerHTML = `<h3>Review</h3><div class="meta">${esc(fs.length)} automatic check${fs.length === 1 ? "" : "s"} flagged` +
+    `${ev.model ? " · report by " + esc(ev.model) : ""}</div>` +
+    (fs.length ? `<ul class="findings">${fs.map((f) => `<li class="${sev(f.severity)}"><span class="sev">${esc(sev(f.severity))}</span><b>${esc(f.title)}</b>` +
+      `<div class="detail">${esc(f.detail)}</div>` +
+      ((f.evidence || []).length ? `<div class="evidence">log: ${f.evidence.map((e) => esc(typeof e === "number" ? "#" + e : e)).join(", ")}</div>` : "") + `</li>`).join("")}</ul>`
+      : `<p class="notice">The automatic checks found nothing to flag.</p>`) +
+    (ev.llm ? `<div class="report md">${md(ev.llm)}</div>` : "") +
+    (ev.llm_error ? `<div class="error">The model review failed: ${esc(ev.llm_error)}</div>` : "");
+  return c;
+}
+
 function handle(ev) {
   const empt = logEl.querySelector(".empty");
-  if (empt && ["user", "assistant", "tool_call", "error", "notice"].includes(ev.type)) empt.remove();
+  if (empt && ["user", "assistant", "tool_call", "error", "notice", "review"].includes(ev.type)) empt.remove();
   switch (ev.type) {
     case "reset": tokensIn = tokensOut = 0; Object.keys(tools).forEach((k) => delete tools[k]); SETUP.current = null; empty(); setBusy(false); loadSetup(); break;
     case "setup": {
@@ -372,7 +401,8 @@ function handle(ev) {
       break; }
     case "session": modelLabel = `${ev.provider === "local" ? "local" : "Claude"} · ${ev.model}`; header(); break;
     case "usage": tokensIn += ev.input_tokens || 0; tokensOut += ev.output_tokens || 0; header(); break;
-    case "status": setBusy(true); $("working").textContent = "Thinking…"; break;
+    case "status": setBusy(true); $("working").textContent = ev.state === "reviewing" ? "Reviewing…" : "Thinking…"; break;
+    case "review": add(reviewCard(ev)); break;
     case "user": add(el("div", "msg user", `<div class="bubble">${esc(ev.text)}</div>`)); setBusy(true); break;
     case "assistant": add(el("div", "msg assistant md", md(ev.text))); break;
     case "thinking": { const d = el("details", "thinking"); d.innerHTML = `<summary>Reasoning</summary><div class="md">${md(ev.text)}</div>`; add(d); break; }
@@ -432,6 +462,12 @@ input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey)
 $("send").onclick = send;
 $("stop").onclick = () => api("/api/stop", {});
 $("btn-setup").onclick = () => $("side").classList.toggle("open");
+$("btn-review").onclick = async () => {
+  if (busy) return;
+  setBusy(true); $("working").textContent = "Reviewing…";      // before the POST: "done" may beat its reply
+  try { await api("/api/review", { llm: true }); }
+  catch (e) { setBusy(false); handle({ type: "error", message: e.message }); }
+};
 $("btn-new").onclick = () => api("/api/reset", {}).catch((e) => alert(e.message));
 $("btn-log").onclick = async () => {
   const r = await fetch("/api/log.md", { headers: { "X-SMILE-Token": T } }); if (!r.ok) return alert("No log yet.");
