@@ -341,6 +341,12 @@ def _block(type_, **kw):
     return types.SimpleNamespace(type=type_, **kw)
 
 
+def _client(create):
+    """A stand-in for ``anthropic.Anthropic()`` exposing ``beta.messages.create``."""
+    return types.SimpleNamespace(beta=types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=create)))
+
+
 def test_anthropic_complete_is_a_one_shot_call():
     p = AnthropicProvider(model="m", api_key="sk-test", effort="medium")
     p.add_user("hello")
@@ -352,15 +358,15 @@ def test_anthropic_complete_is_a_one_shot_call():
             _block("thinking", thinking="hmm"), _block("text", text="Part one."),
             _block("text", text="Part two.")])
 
-    p.client = types.SimpleNamespace(messages=types.SimpleNamespace(create=create))
+    p.client = _client(create)
     assert p.complete("SYS", "TEXT") == "Part one.\n\nPart two."
     assert seen == {"model": "m", "max_tokens": 16000, "system": "SYS",
                     "messages": [{"role": "user", "content": "TEXT"}],
-                    "thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"}}
+                    "thinking": {"type": "adaptive"}, "output_config": {"effort": "medium"},
+                    "betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
     assert p.messages == [{"role": "user", "content": "hello"}]        # history untouched
 
-    p.client = types.SimpleNamespace(messages=types.SimpleNamespace(
-        create=lambda **kw: types.SimpleNamespace(stop_reason="refusal", content=[])))
+    p.client = _client(lambda **kw: types.SimpleNamespace(stop_reason="refusal", content=[]))
     assert "declined" in p.complete("S", "T")
 
 
@@ -375,7 +381,7 @@ def test_anthropic_complete_maps_sdk_errors():
         raise anthropic.RateLimitError("slow down", response=httpx.Response(429, request=req),
                                        body=None)
 
-    p.client = types.SimpleNamespace(messages=types.SimpleNamespace(create=boom))
+    p.client = _client(boom)
     with pytest.raises(ProviderError, match="Rate limited"):
         p.complete("S", "T")
 

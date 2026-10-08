@@ -236,10 +236,12 @@ class AnthropicProvider:
         read nor changed. Used for the reviewer."""
         a = self._anthropic
         try:
-            resp = self.client.messages.create(
+            resp = self.client.beta.messages.create(
                 model=self.model, max_tokens=16000, system=system,
                 messages=[{"role": "user", "content": text}],
-                thinking={"type": "adaptive"}, output_config={"effort": self.effort})
+                thinking={"type": "adaptive"}, output_config={"effort": self.effort},
+                # as in step(): a safety-classifier decline is re-run on the recommended model
+                betas=["server-side-fallback-2026-07-01"], fallbacks="default")
         except TypeError as exc:                 # the SDK found no API key / token / profile
             if "auth" in str(exc).lower():
                 raise ProviderError("No Claude credentials found — paste an API key in "
