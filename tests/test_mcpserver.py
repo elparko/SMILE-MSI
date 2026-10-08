@@ -195,7 +195,7 @@ def test_every_tool_is_registered_with_a_title_and_a_description():
             return (await client.list_tools()).tools
 
     tools = asyncio.run(go())
-    assert len(tools) == len(mcpserver.TOOLS)
+    assert {fn.__name__ for fn, *_ in mcpserver.TOOLS} <= {t.name for t in tools}
     for tool in tools:
         assert tool.title and tool.description
         assert not tool.description.startswith(" ")          # docstring was de-indented
@@ -211,7 +211,9 @@ def test_read_only_tools_are_annotated_read_only():
     ann = asyncio.run(go())
     assert ann["list_slides"].read_only_hint is True
     assert ann["run_analysis"].read_only_hint is False
-    assert all(a.destructive_hint is False for a in ann.values())
+    # only the agent bridge's create/edit/delete_tool are destructive (tests/test_agent_mcp.py)
+    assert all(a.destructive_hint is False for n, a in ann.items()
+               if n in {fn.__name__ for fn, *_ in mcpserver.TOOLS})
 
 
 def test_schemas_come_from_the_type_hints():
