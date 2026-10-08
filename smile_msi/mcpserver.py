@@ -584,6 +584,9 @@ def build_server():
                         description=inspect.cleandoc(fn.__doc__ or ""),
                         annotations=ToolAnnotations(read_only_hint=read_only,
                                                     destructive_hint=False))
+    from .agent import mcp_bridge
+
+    mcp_bridge.register(server, ToolAnnotations, _guarded)
     return server
 
 
