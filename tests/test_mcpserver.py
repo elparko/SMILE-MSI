@@ -126,6 +126,7 @@ def test_run_script_surfaces_logs_tables_and_captures_print(demo_slide):
         "print('to stdout')\nlog('picked')\ntable(compare('Group A', 'Group B').head(2), 'cmp')")
     assert out["ok"] is True
     assert "picked" in out["logs"]
+    assert out["stdout"] == "to stdout\n"
     assert out["tables"][0]["n_rows"] == 2
 
 
@@ -138,6 +139,47 @@ def test_annotate_identifies_the_demo_lipids(demo_slide):
     out = mcpserver.annotate(mode="negative")
     assert out["table"]["n_rows"] == 12
     assert "lipid" in out["table"]["columns"]
+
+
+def test_mean_spectrum_reports_the_same_mz_as_find_peaks(demo_slide):
+    picked = set(mcpserver.find_peaks(snr=3, max_peaks=12)["mz"])
+    listed = [p["mz"] for p in mcpserver.mean_spectrum(top_n=12)["top_peaks"]]
+    assert listed == sorted(listed)                     # m/z order, as documented
+    assert set(listed) == picked                        # one peak, one m/z, in both tools
+
+
+def test_annotate_measures_the_demo_fatty_acid_isotopes(demo_slide):
+    import pandas as pd
+
+    mcpserver.find_peaks(snr=3, max_peaks=40)
+    out = mcpserver.annotate(mz=[281.2486, 282.2516])
+    fa, m1 = pd.read_csv(out["table"]["csv"]).to_dict("records")
+    assert fa["lipid"] == "FA 18:1" and fa["isotope_ok"] and fa["confidence"] == "High"
+    assert 0.15 < fa["isotope_m1"] < 0.25
+    assert fa["intensity"] > 0 and fa["snr"] > 0
+    assert m1["isotopologue"] and "M+1 isotopologue of 281.2486" in m1["confidence_why"]
+
+
+def test_a_pixel_level_test_carries_its_warning(demo_slide):
+    out = mcpserver.run_analysis("multigroup_features", groups=["left", "right"])
+    assert "pseudoreplication" in out["summary"]
+    assert "pseudoreplication" in out["warning"]
+
+
+def test_segmentation_reports_its_mask_and_background_clusters(demo_slide):
+    whole = mcpserver.run_analysis("auto_segment", {"n_clusters": 2})
+    seg = whole["segmentation"]
+    assert seg["n_pixels_clustered"] == demo_slide.ds.n_pixels
+    assert seg["background_clusters"] and "mask=" in seg["note"]
+    left = mcpserver.run_analysis("auto_segment", {"n_clusters": 2}, mask="left")
+    assert left["mask"] == {"name": "left", "n_pixels": 792}
+    assert left["segmentation"]["n_pixels_clustered"] == 792
+    assert "note" not in left["segmentation"]
+
+
+def test_slide_state_explains_the_demo_has_no_session():
+    with pytest.raises(ValueError, match="open_slide"):
+        mcpserver.slide_state("demo")
 
 
 def test_state_requires_an_open_slide():

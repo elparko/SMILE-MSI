@@ -87,3 +87,20 @@ def test_effect_match_summarizes_the_auc_too():
     m = spatial.roi_comparison(ds, a, b, peaks, samples=samples)              # effect='match'
     assert m.attrs["unit"] == "sample" and "effect_unit" not in m.attrs
     assert not np.allclose(m["AUC"].to_numpy(), px["AUC"].to_numpy(), equal_nan=True)
+
+
+def test_pixel_level_summaries_say_the_p_values_describe_pixels():
+    """A per-pixel test's one-line summary ("N ions q<0.05") must not read as N findings:
+    with one ROI per group its p-values describe pixels, not replicates."""
+    from smile_msi import registry
+
+    ds, peaks = _ds_and_peaks()
+    q = ds.n_pixels // 5
+    labels = np.full(ds.n_pixels, -1, int)
+    labels[:q], labels[2 * q:3 * q], labels[3 * q:4 * q] = 0, 1, 2      # one ROI per group
+    multi = spatial.multigroup_features(ds, labels, peaks)
+    assert "pseudoreplication" in registry.REGISTRY["multigroup_features"].summary(multi)
+    cmp = registry.REGISTRY["roi_comparison"].summary
+    assert "pseudoreplication" in cmp(spatial.roi_comparison(ds, labels == 0, labels == 1, peaks))
+    a, b, samples = _two_roi_per_side(ds)
+    assert "pseudoreplication" not in cmp(spatial.roi_comparison(ds, a, b, peaks, samples=samples))
