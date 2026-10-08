@@ -641,6 +641,7 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
             source=self.ds.source, settings=self._current_settings(), peaks=self.peaks,
             active_mz=self.active_mz, labels=(self.seg.labels if self.seg else None),
             n_clusters=(self.seg.n_clusters if self.seg else None),
+            seg_colors=(getattr(self.seg, "colors", None) if self.seg else None),
             named_regions=self.regions, n_pixels=self.ds.n_pixels,
             dataset_fingerprint=library.dataset_fingerprint(self.ds),
             feature_lists=self._feature_lists, feature_scopes=self._feature_scopes,
@@ -1084,7 +1085,8 @@ class MainWindow(AuditMixin, ScopeMixin, IonTabMixin, FeaturesTabMixin, SegmentT
                     self.seg = spatial.Segmentation(
                         labels=labels, label_image=ds.to_image(labels),
                         peaks=[p["mz"] for p in peaks], n_clusters=int(seg["n_clusters"]),
-                        explained_variance=float("nan"), silhouette=float("nan"))
+                        explained_variance=float("nan"), silhouette=float("nan"),
+                        colors=(list(seg["colors"]) if seg.get("colors") else None))
                     self._on_seg(self.seg)                  # note: this resets self.regions
             named = data.get("named_regions") or []
             # restore after _on_seg cleared regions. Regions in a slide's session belong to

@@ -51,7 +51,7 @@ def _peak_record(p) -> dict:
 
 
 def build_session(*, source, settings, peaks, active_mz=None, labels=None,
-                  n_clusters=None, region_a=None, region_b=None,
+                  n_clusters=None, seg_colors=None, region_a=None, region_b=None,
                   named_regions=None, n_pixels=None, dataset_fingerprint=None,
                   feature_lists=None, feature_scopes=None,
                   active_feature_scope=None, flist_name=None, optical=None,
@@ -81,6 +81,8 @@ def build_session(*, source, settings, peaks, active_mz=None, labels=None,
     seg = None
     if labels is not None:
         seg = {"labels": np.asarray(labels).astype(int).tolist(), "n_clusters": int(n_clusters)}
+        if seg_colors:                       # tree-aware segment colours (treecolors)
+            seg["colors"] = [str(c) for c in seg_colors]
     return {
         "version": VERSION,
         "source": source,

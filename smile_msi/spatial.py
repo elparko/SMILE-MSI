@@ -59,6 +59,9 @@ class Segmentation:
     n_clusters: int
     explained_variance: float   # fraction captured by the PCA components used
     silhouette: float = float("nan")
+    # per-cluster hex colours when the cut came from a granularity tree (tree-aware: related
+    # segments share a hue family — :mod:`smile_msi.treecolors`); None → cycle a palette
+    colors: list = None
 
     def mask(self, cluster: int) -> np.ndarray:
         return self.labels == cluster
@@ -407,22 +410,42 @@ def _relabel_by_size(macro_of_micro, micro_sizes):
     return np.array([remap[int(m)] for m in macro_of_micro], dtype=int)
 
 
+def _micro_to_macro(hier: Hierarchy, n_clusters: int) -> np.ndarray:
+    """Cluster id (size-ordered ``0..k-1``) of every micro-cluster for the cut at
+    ``n_clusters`` — the tree-level half of :func:`cut`."""
+    from scipy.cluster.hierarchy import fcluster
+
+    k = int(max(1, min(int(n_clusters), hier.max_clusters)))
+    if k <= 1 or hier.linkage.shape[0] == 0:
+        return np.zeros(hier.n_micro, dtype=int)
+    micro_sizes = np.bincount(hier.micro_labels, minlength=hier.n_micro)
+    macro = fcluster(hier.linkage, t=k, criterion="maxclust")   # 1..≤k, len n_micro
+    return _relabel_by_size(macro, micro_sizes)
+
+
 def cut(hier: Hierarchy, n_clusters: int) -> np.ndarray:
     """Slice ``hier`` into ``n_clusters`` segments → per-pixel labels ``0..k-1``
     (size-ordered). Clamped to ``[1, hier.max_clusters]``. Microsecond-cheap, so a
     Detail slider can call this on every tick. ``fcluster`` may merge below the
     requested count when the tree has fewer well-separated branches; the result is
     compacted so labels stay contiguous."""
-    from scipy.cluster.hierarchy import fcluster
+    return _micro_to_macro(hier, n_clusters)[hier.micro_labels]
 
-    k = int(max(1, min(int(n_clusters), hier.max_clusters)))
-    micro_sizes = np.bincount(hier.micro_labels, minlength=hier.n_micro)
-    if k <= 1 or hier.linkage.shape[0] == 0:
-        micro_to_macro = np.zeros(hier.n_micro, dtype=int)
-    else:
-        macro = fcluster(hier.linkage, t=k, criterion="maxclust")   # 1..≤k, len n_micro
-        micro_to_macro = _relabel_by_size(macro, micro_sizes)
-    return micro_to_macro[hier.micro_labels]
+
+def segment_colors(hier: Hierarchy, n_clusters: int) -> list:
+    """Tree-aware hex colour per segment of the cut at ``n_clusters`` (indexed like
+    :func:`cut`'s labels): each segment takes its subtree's colour, so siblings share a
+    hue family and a segment keeps its hue family as the cut gets finer
+    (:mod:`smile_msi.treecolors`). The per-node colours are computed once per tree and
+    cached on it, so a live slider pays only for the cut."""
+    from . import treecolors
+
+    node_hex = getattr(hier, "_node_colors", None)
+    if node_hex is None:
+        node_hex = treecolors.node_colors(hier.linkage)
+        hier._node_colors = node_hex
+    return treecolors.cluster_colors(hier.linkage, _micro_to_macro(hier, n_clusters),
+                                     node_hex=node_hex)
 
 
 def silhouette(hier: Hierarchy, labels, sample: int = 4000, random_state: int = 0) -> float:
@@ -452,8 +475,10 @@ def segmentation_at(ds, hier: Hierarchy, n_clusters: int,
         labels = np.full(int(getattr(hier, "n_total", 0) or ds.n_pixels), -1, dtype=int)
         labels[mask] = sub
         img_src = np.where(labels < 0, np.nan, labels.astype(float))
+    colors = segment_colors(hier, n_clusters) if k else None
     return Segmentation(labels=labels, label_image=ds.to_image(img_src), peaks=list(hier.peaks),
-                        n_clusters=k, explained_variance=hier.explained_variance, silhouette=sil)
+                        n_clusters=k, explained_variance=hier.explained_variance, silhouette=sil,
+                        colors=colors)
 
 
 # --------------------------------------------------------------------------- #
@@ -599,6 +624,7 @@ def joint_segmentation_at(datasets, jh: JointHierarchy, n_clusters: int,
     sub = cut(jh.hier, n_clusters)                       # per pooled-pixel labels, sample-concat
     k = int(sub.max()) + 1 if sub.size else 0
     sil = silhouette(jh.hier, sub) if with_silhouette else float("nan")
+    colors = segment_colors(jh.hier, n_clusters) if k else None
     out, off = [], 0
     for i, ds in enumerate(datasets):
         n = jh.sample_sizes[i]
@@ -614,7 +640,8 @@ def joint_segmentation_at(datasets, jh: JointHierarchy, n_clusters: int,
             img_src = np.where(labels < 0, np.nan, labels.astype(float))
         out.append(Segmentation(labels=labels, label_image=ds.to_image(img_src),
                                 peaks=list(jh.hier.peaks), n_clusters=k,
-                                explained_variance=jh.hier.explained_variance, silhouette=sil))
+                                explained_variance=jh.hier.explained_variance, silhouette=sil,
+                                colors=colors))
     return out
 
 

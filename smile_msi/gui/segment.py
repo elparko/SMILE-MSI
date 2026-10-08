@@ -358,6 +358,15 @@ class SegmentTabMixin:
         self._refresh_seg_run_state()
 
     # ----- segment -> region builder --------------------------------------- #
+    def _seg_color(self, cl):
+        """Colour of segment ``cl``: its tree-aware colour when the segmentation was cut
+        from a granularity tree (siblings share a hue family — :mod:`smile_msi.treecolors`),
+        else the cycling categorical palette (k-means / restored / older segmentations)."""
+        cols = getattr(self.seg, "colors", None) if getattr(self, "seg", None) else None
+        if cols and 0 <= cl < len(cols):
+            return cols[cl]
+        return PALETTE[cl % len(PALETTE)]
+
     @staticmethod
     def _color_icon(hexc, size=14):
         pix = QtGui.QPixmap(size, size)
@@ -400,11 +409,11 @@ class SegmentTabMixin:
         self.seg_legend.setText(text)
 
     def _render_seg_base(self):
-        self._set_seg_image(lambda cl: PALETTE[cl % len(PALETTE)])
+        self._set_seg_image(lambda cl: self._seg_color(cl))
         lin = getattr(self, "_seg_lineage", {})
         hidden = set(getattr(self, "_seg_hidden", ()))
         vis = [cl for cl in range(self.seg.n_clusters) if cl not in hidden] if self.seg else []
-        pairs = [(PALETTE[cl % len(PALETTE)], lin.get(cl, str(cl))) for cl in vis[:16]]
+        pairs = [(self._seg_color(cl), lin.get(cl, str(cl))) for cl in vis[:16]]
         note = f"+{len(vis) - 16} more" if len(vis) > 16 else ""
         if hidden:
             note = (note + " · " if note else "") + f"{len(hidden)} hidden"
@@ -423,7 +432,7 @@ class SegmentTabMixin:
                 return None
             if cl == hover and cl not in pinned:         # the peek pops white, on top
                 return "#ffffff"
-            return PALETTE[cl % len(PALETTE)]
+            return self._seg_color(cl)
 
         self._set_seg_image(color_for, dim=True, ignore_hidden=True)
         lin = getattr(self, "_seg_lineage", {})
@@ -435,7 +444,7 @@ class SegmentTabMixin:
                 lab += " · hover"
             elif cl in pinned:
                 lab += " ✓"
-            pairs.append(("#ffffff" if is_peek else PALETTE[cl % len(PALETTE)], lab))
+            pairs.append(("#ffffff" if is_peek else self._seg_color(cl), lab))
         note = ("✓ ticked stays shown · hover or arrow-key a row to peek"
                 if (pinned or hover is not None) else "highlighted")
         self._update_seg_legend(pairs, note)
@@ -544,7 +553,7 @@ class SegmentTabMixin:
             disp = ("    " * depth) + ("› " if depth else "") + label
             is_hidden = cl in hidden
             chk = QtWidgets.QTableWidgetItem()            # tick box + cluster color swatch
-            chk.setIcon(self._color_icon("#555555" if is_hidden else PALETTE[cl % len(PALETTE)]))
+            chk.setIcon(self._color_icon("#555555" if is_hidden else self._seg_color(cl)))
             chk.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
                          | QtCore.Qt.ItemIsUserCheckable)
             chk.setCheckState(QtCore.Qt.Unchecked)
@@ -665,7 +674,7 @@ class SegmentTabMixin:
         def color_for(cl):
             if cl == hover:
                 return "#ffffff"
-            return cmap.get(cl) if has_regions else PALETTE[cl % len(PALETTE)]
+            return cmap.get(cl) if has_regions else self._seg_color(cl)
 
         self._set_seg_image(color_for, dim=has_regions)
 
@@ -1621,11 +1630,11 @@ class SegmentTabMixin:
         if by_cluster:
             cls = np.unique(base[sel2d & np.isfinite(base)]).astype(int)
             for cl in cls:
-                c = QtGui.QColor(PALETTE[int(cl) % len(PALETTE)])
+                c = QtGui.QColor(self._seg_color(int(cl)))
                 rgba[sel2d & (base == cl)] = [c.red(), c.green(), c.blue(), 255]
             self.seg_img_item.setImage(rgba)
             lin = getattr(self, "_seg_lineage", {})
-            pairs = [(PALETTE[int(cl) % len(PALETTE)], lin.get(int(cl), str(int(cl))))
+            pairs = [(self._seg_color(int(cl)), lin.get(int(cl), str(int(cl))))
                      for cl in cls[:16]]
             self._update_seg_legend(pairs or [(color, label)], note)
             return
@@ -1681,9 +1690,10 @@ class SegmentTabMixin:
         outside a region-scoped tree's mask. Whole-slide trees pass straight through."""
         return self._lift_to_full(sub_labels, np.nan, float)
 
-    def _render_label_image(self, labels):
+    def _render_label_image(self, labels, colors=None):
         """Paint the seg canvas straight from a per-pixel ``labels`` array, without
-        touching self.seg / the table / regions — for live slider previews."""
+        touching self.seg / the table / regions — for live slider previews. ``colors``
+        (hex per label, e.g. :func:`spatial.segment_colors`) overrides the palette."""
         if self.ds is None:
             return
         img = self.ds.to_image(self._full_pixel_labels(labels))   # (h,w), NaN off-tissue/region
@@ -1697,7 +1707,8 @@ class SegmentTabMixin:
             k = int(np.nanmax(img)) + 1
             lut = np.zeros((k + 1, 4), dtype=np.ubyte)
             for cl in range(k):
-                c = QtGui.QColor(PALETTE[cl % len(PALETTE)])
+                hexc = colors[cl] if colors and cl < len(colors) else PALETTE[cl % len(PALETTE)]
+                c = QtGui.QColor(hexc)
                 lut[cl + 1] = [c.red(), c.green(), c.blue(), 255]
             idx = np.zeros((h, wd), dtype=np.intp)
             idx[finite] = img[finite].astype(np.intp) + 1
@@ -1707,7 +1718,7 @@ class SegmentTabMixin:
     def _preview_cut(self, k):
         """Live recolour for the cut at ``k`` segments (no commit) — sub-millisecond."""
         labels = spatial.cut(self.hier, k)
-        self._render_label_image(labels)
+        self._render_label_image(labels, spatial.segment_colors(self.hier, k))
         self._refresh_branch_preview()        # keep lit-branch pixels visible while dragging detail
         self._sync_dendrogram(k)
         n = int(labels.max()) + 1 if labels.size else 0
@@ -1853,6 +1864,18 @@ class SegmentTabMixin:
         self.seg.n_clusters = int(labels.max()) + 1
         # off-region pixels (-1, region-scoped runs) stay transparent, like off-tissue
         self.seg.label_image = self.ds.to_image(np.where(labels < 0, np.nan, labels.astype(float)))
+        if self.seg.colors:                               # children = shades of the parent
+            from .. import treecolors
+            cols = list(self.seg.colors)
+            for c, newids in produced.items():
+                base = self._seg_color(int(c))
+                for nid, shade in zip(newids, treecolors.shades(base, len(newids))):
+                    cols.extend([PALETTE[i % len(PALETTE)] for i in range(len(cols), nid)])
+                    if nid < len(cols):
+                        cols[nid] = shade
+                    else:
+                        cols.append(shade)
+            self.seg.colors = cols
         lin = getattr(self, "_seg_lineage", {})
         for c, newids in produced.items():
             parent = lin.get(c, str(c))
