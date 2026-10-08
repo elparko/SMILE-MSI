@@ -1336,6 +1336,26 @@ class MSIDataset:
         return out
 
     # ----- pass 2: compact feature matrix (pixels x peaks) ----------------- #
+    def _half_windows(self, centers, tol_ppm):
+        """Half-width (Da) of the extraction window around each of ``centers``: ``tol_ppm``,
+        widened to half the local sampling step where a shared profile axis is sampled more
+        coarsely than that. A narrower window can fall between two samples and extract
+        nothing (on a 10 mDa grid a 10 ppm window at m/z 282 is 5.6 mDa wide), so a real
+        peak reads as absent: an isotopologue at its theoretical m/z, or a centroid that sits
+        between samples. Half a step is the narrowest window that always holds the nearest
+        sample. A step more than twice its neighbours' is a gap in the axis, not sampling,
+        and is not bridged."""
+        centers = np.asarray(centers, dtype=float)
+        win = centers * tol_ppm / 1e6
+        axis = self.store.shared_axis()
+        if axis is None or len(axis) < 4:
+            return win
+        j = np.clip(np.searchsorted(axis, centers) - 1, 1, len(axis) - 3)   # j, j+1 straddle it
+        step = axis[j + 1] - axis[j]
+        neighbour = np.minimum(axis[j] - axis[j - 1], axis[j + 2] - axis[j + 1])
+        half = np.where(step <= 2.0 * neighbour, 0.5 * step * (1 + 1e-9), 0.0)
+        return np.maximum(win, half)
+
     def build_features(self, peaks, tol_ppm: float = DEFAULT_TOL_PPM, reduce: str = "sum",
                        progress=None) -> np.ndarray:
         """Stream once to extract integrated intensity at each peak m/z for every
@@ -1343,7 +1363,7 @@ class MSIDataset:
         peaks = np.asarray(peaks, dtype=float)
         n, p = self.n_pixels, len(peaks)
         mat = np.zeros((n, p), dtype=np.float32)
-        win = peaks * tol_ppm / 1e6
+        win = self._half_windows(peaks, tol_ppm)
         lo = peaks - win
         hi = peaks + win
         # When peaks densely cover the spectrum a prefix-sum is cheaper; otherwise
@@ -1469,8 +1489,8 @@ class MSIDataset:
             # spectra (scale over this subset; a global constant z-scoring later removes anyway).
             order = {int(r): k for k, r in enumerate(rows)}
             out = np.zeros((rows.size, peaks.size), dtype=np.float32)
-            lo = peaks - peaks * tol_ppm / 1e6
-            hi = peaks + peaks * tol_ppm / 1e6
+            win = self._half_windows(peaks, tol_ppm)
+            lo, hi = peaks - win, peaks + win
             facs = np.ones(rows.size)
             want_norm = norm not in (None, "none", "")
             for i, mz, inten in self._read_many(rows):
@@ -1488,7 +1508,7 @@ class MSIDataset:
                 g = _finalize_norm(facs, float(getattr(self, "tic_max_amp", 3.0)))
                 out = out / g[:, None]
             return out
-        win = peaks * tol_ppm / 1e6                       # norm_factors() primes lazily if norm!=none
+        win = self._half_windows(peaks, tol_ppm)          # norm_factors() primes lazily if norm!=none
         a0 = np.searchsorted(shared, peaks - win, side="left")
         b0 = np.searchsorted(shared, peaks + win, side="right")
         sub = M[rows]                                    # (len(rows) × bins) — bounded by the cap
@@ -2010,7 +2030,7 @@ class MSIDataset:
         :meth:`_stream_ion` for the same window/reduce, just vectorized."""
         M = self._dense()
         axis = self.store.shared_axis()
-        win = mz * tol_ppm / 1e6
+        win = float(self._half_windows(mz, tol_ppm))
         a = int(np.searchsorted(axis, mz - win, side="left"))
         b = int(np.searchsorted(axis, mz + win, side="right"))
         if b <= a:
@@ -2035,7 +2055,7 @@ class MSIDataset:
         return vals
 
     def _stream_ion(self, mz, tol_ppm, reduce):
-        win = mz * tol_ppm / 1e6
+        win = float(self._half_windows(mz, tol_ppm))
         lo, hi = mz - win, mz + win
         vals = np.zeros(self.n_pixels)
         # Read through the parallel _read_many pool (disk-read+decode overlap across cores)

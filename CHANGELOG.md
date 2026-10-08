@@ -65,6 +65,33 @@ All notable changes to SMILE MSI. Format loosely follows
   (`preprocess.recalibrate_regions`, `intake.measure_calibration_offset(mask=…)`).
 
 ### Fixed
+- **A narrow extraction window no longer misses the peak it is centred on.** On a profile
+  axis sampled more coarsely than the tolerance window (the demo's 10 mDa grid against 10 ppm,
+  5.6 mDa at m/z 282), a window between two samples extracted nothing, so FA 18:1's real M+1
+  read as absent (M+1/M 0.0, isotope co-localisation 0.00). Every window on a shared profile
+  axis now holds at least the nearest sample; a gap in the axis is never bridged. FA 18:1 now
+  measures M+1/M 0.19 against a theoretical 0.20.
+- **"High" confidence needs a passing isotope check.** Mass accuracy, Moran's I and sibling
+  adducts could add up to High with no isotope envelope at all; such an ID is now Medium,
+  and says why. An unidentified isotopologue names its parent ("M+1 isotopologue of
+  890.6388"), and scripted/assistant `annotate()` fills the intensity and S/N columns from the
+  picked peaks.
+- **Pixel-level statistics say so.** Multi-group, A-vs-B and discriminating-feature summaries
+  note when their p/q values describe pixels rather than replicates (pseudoreplication), and
+  the MCP `run_analysis` result carries the step's warning.
+- **Discriminating features filter first, then cap.** The per-group `top_n` cut ran before the
+  enriched/q filters, so a group's depleted ions used up its slots and real markers were
+  dropped without a word, and a cut through a run of tied AUCs kept one of them arbitrarily.
+  Ties at the cut are now kept, and the summary reports how many passed but were over the cap.
+- **Scripted and assistant runs use the session's seed and tolerance.** Segmentation, PCA,
+  NMF, embedding, DGMM, cross-validation and SHAP took a fixed seed instead of the active
+  profile's, and `run(step_id, …)` extracted at the registry's default tolerance instead of the
+  session's.
+- **Segmentation reports what it clustered.** `segment()` takes `mask=`; the MCP result echoes
+  the mask and, for a whole-slide run, names the clusters that look like off-tissue background.
+  `threshold_mask` keeps filling holes by default but logs when filling closed a ring, and the
+  scripting guide documents it, the percentile semantics, `print()` → `stdout` and
+  `ds.ratio_image`. `mean_spectrum` reports the same centroid m/z as `find_peaks`.
 - **Ticking a feature list in the Export Studio no longer hangs the app.** Ticking a list's parent
   row cascades `itemChanged` over every ion under it, and both listeners — the All/None/Invert
   bar's live count and the dialog's `n sections × n ions` recount — walked the whole tree on every

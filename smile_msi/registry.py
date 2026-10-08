@@ -213,6 +213,10 @@ class _DiscResult(_NamedGroups):
     min_auc = 0.5
     max_q = 1.0
     enriched_only = True
+    top_n = 0
+    n_tested = None
+    n_capped: dict = {}
+    warning = ""
     _save_lists = False
 
 
@@ -241,6 +245,24 @@ def _disc_survivors(r):
 # --------------------------------------------------------------------------- #
 # step run/wiring callables  (engine imports are lazy, inside each)
 # --------------------------------------------------------------------------- #
+def _pixel_note(df) -> str:
+    """Summary suffix for a test run on pixels: its p/q describe pixels, which are spatially
+    correlated, not replicates — so a q<0.05 count there is not a count of findings."""
+    if (getattr(df, "attrs", None) or {}).get("unit") == "pixel":
+        return " — per-pixel test: p/q describe pixels, not replicates (pseudoreplication)"
+    return ""
+
+
+def _seed(p) -> int:
+    """The random seed a stochastic step runs with: an explicit ``random_state`` param, else
+    the active profile's seed — the one the GUI's own calls pass — so a scripted or MCP run
+    clusters (embeds, cross-validates …) exactly as the app does."""
+    if p.get("random_state") is not None:
+        return int(p["random_state"])
+    from . import profiles
+    return profiles.active_seed()
+
+
 def _run_find_spatial(ds, inp, p):
     from . import spatial
     # ``inputs["progress"]`` is the worker's reporter when the caller has one (AnalysisDialog);
@@ -279,11 +301,13 @@ def _run_segment(ds, inp, p):
         from . import multivariate
         return multivariate.spatial_segment(ds, mzs, n_clusters=nc, tol_ppm=p["tol_ppm"],
                                              norm=p["norm"], spatial_sigma=p.get("spatial_sigma", 1.0),
-                                             mask=mask)
+                                             mask=mask, random_state=_seed(p))
     from . import spatial
     if nc is None:
-        return spatial.auto_segment(ds, mzs, tol_ppm=p["tol_ppm"], norm=p["norm"], mask=mask)
-    return spatial.segment(ds, mzs, n_clusters=nc, tol_ppm=p["tol_ppm"], norm=p["norm"], mask=mask)
+        return spatial.auto_segment(ds, mzs, tol_ppm=p["tol_ppm"], norm=p["norm"], mask=mask,
+                                    random_state=_seed(p))
+    return spatial.segment(ds, mzs, n_clusters=nc, tol_ppm=p["tol_ppm"], norm=p["norm"], mask=mask,
+                           random_state=_seed(p))
 
 
 def _run_roi_comparison(ds, inp, p):
@@ -362,24 +386,54 @@ def _run_class_composition(ds, inp, p):
         tol_ppm=p["tol_ppm"], norm=p.get("norm", "tic"))
 
 
+def _top_n_with_ties(d, n):
+    """The first ``n`` rows of a discriminating table (sorted present-first, then by
+    |AUC−0.5|), plus every row tied with the n-th — a cut through a tie would keep one of
+    several equally discriminating ions and drop the rest for no reason."""
+    import numpy as np
+    if n <= 0 or len(d) <= n:
+        return d
+    key = d["AUC"].astype(float).sub(0.5).abs().round(9)
+    last = (d["present"].iloc[n - 1], key.iloc[n - 1])
+    keep = (np.arange(len(d)) < n) | ((d["present"] == last[0]) & (key == last[1])).to_numpy()
+    return d[keep]
+
+
 def _run_discriminating(ds, inp, p):
     from . import spatial
+    # Rank every ion, filter, *then* cap: capping first spent top_n slots on ions the
+    # enriched/q filters then dropped (a group's depleted ions), silently losing markers.
     raw = spatial.discriminating_features(ds, inp["labels"], inp["mzs"], tol_ppm=p["tol_ppm"],
-                                          norm=p["norm"], top_n=int(p.get("top_n", 50)))
+                                          norm=p["norm"], top_n=len(inp["mzs"]))
     res = _DiscResult(raw)
     res.names = inp.get("names")
     res.enriched_only = bool(p.get("enriched_only", True))
     res.min_auc = float(p.get("min_auc", 0.5))
     res.max_q = float(p.get("max_q", 0.05))
+    res.top_n = int(p.get("top_n", 50))
     res._save_lists = bool(p.get("save_lists", False))
+    res.n_tested = len(inp["mzs"])
+    res.n_capped = {}                                     # passed the filters, beyond top_n
     for cl, df in list(res.items()):                      # keep markers: enriched + significant
         d = df
         if res.enriched_only:
             d = d[d["AUC"].astype(float) >= res.min_auc]
         if res.max_q < 1.0:
             d = d[d["q_value"].astype(float) <= res.max_q]
-        res[cl] = d.reset_index(drop=True)
+        kept = _top_n_with_ties(d, res.top_n)
+        res.n_capped[cl] = len(d) - len(kept)
+        res[cl] = kept.reset_index(drop=True)
+    res.warning = ("one-vs-rest test over pixels: spatially-correlated pixels are not "
+                   "independent replicates, so p/q are anti-conservative (pseudoreplication)")
     return res
+
+
+def _disc_summary(r) -> str:
+    capped = sum(r.n_capped.values())
+    tested = f" of {r.n_tested} ions" if r.n_tested else ""
+    cap = f"; {capped} more passed but over the {r.top_n}/group cap" if capped else ""
+    return (f"{len(r)} groups · kept {sum(len(d) for d in r.values())} markers{tested} "
+            f"(AUC ≥ {r.min_auc:.2f}, q ≤ {r.max_q:g}{cap}) — per-pixel p/q (pseudoreplication)")
 
 
 def _run_multigroup(ds, inp, p):
@@ -413,7 +467,8 @@ def _run_dgmm(ds, inp, p):
     image, the sorted component means, and the m/z)."""
     from . import multivariate
     mz = float(inp["target_mz"])
-    labels, means = multivariate.spatial_dgmm(ds, mz, k=int(p.get("k", 3)), norm=p["norm"])
+    labels, means = multivariate.spatial_dgmm(ds, mz, k=int(p.get("k", 3)), norm=p["norm"],
+                                              random_state=_seed(p))
     return {"image": ds.to_image(labels.astype(float)),
             "means": [float(m) for m in means], "mz": mz, "k": int(p.get("k", 3))}
 
@@ -467,19 +522,21 @@ def _region_corr_table(res):
 def _run_pca(ds, inp, p):
     from . import multivariate
     return multivariate.pca_images(ds, inp["mzs"], n_components=int(p.get("n_components", 5)),
-                                   tol_ppm=p["tol_ppm"], norm=p["norm"], mask=inp.get("mask"))
+                                   tol_ppm=p["tol_ppm"], norm=p["norm"], mask=inp.get("mask"),
+                                   random_state=_seed(p))
 
 
 def _run_nmf(ds, inp, p):
     from . import multivariate
     return multivariate.nmf_images(ds, inp["mzs"], n_components=int(p.get("n_components", 5)),
-                                   tol_ppm=p["tol_ppm"], norm=p["norm"], mask=inp.get("mask"))
+                                   tol_ppm=p["tol_ppm"], norm=p["norm"], mask=inp.get("mask"),
+                                   random_state=_seed(p))
 
 
 def _run_embedding(ds, inp, p):
     from . import multivariate
     return multivariate.embedding(ds, inp["mzs"], method=p.get("method", "umap"),
-                                  tol_ppm=p["tol_ppm"], norm=p["norm"])
+                                  tol_ppm=p["tol_ppm"], norm=p["norm"], random_state=_seed(p))
 
 
 def _run_plsda(ds, inp, p):
@@ -496,7 +553,8 @@ def _run_classify_cv(ds, inp, p):
     r = multivariate.cross_validate(
         ds, inp["mzs"], inp["labels"], samples=samples,
         n_components=int(p.get("n_components", 2)), tol_ppm=p["tol_ppm"], norm=p["norm"],
-        orthogonal=p.get("orthogonal", False), n_folds=int(p.get("n_folds", 5)))
+        orthogonal=p.get("orthogonal", False), n_folds=int(p.get("n_folds", 5)),
+        random_state=_seed(p))
     # Class ids are integer group labels; relabel with the group names so the confusion-matrix
     # rows/columns read 'Normal'/'Trt' not '0'/'1'. The matrix stays index-aligned to this list.
     names = inp.get("names")
@@ -584,7 +642,7 @@ def _run_shap(ds, inp, p):
         ds, inp["mzs"], inp["labels"], names=inp.get("names"),
         n_estimators=int(p.get("n_estimators", 300)),
         max_pixels=int(p.get("max_pixels", 20000)),
-        tol_ppm=p["tol_ppm"], norm=p["norm"])
+        tol_ppm=p["tol_ppm"], norm=p["norm"], random_state=_seed(p))
 
 
 def _shap_rep_ions(r, n, ds=None):
@@ -866,7 +924,7 @@ _register(StepDef(
     to_table=lambda r: r,
     rep_ions=lambda r, n, ds=None: _rep_by_auc(r, n, "AUC"),
     lists=_roi_cmp_lists,
-    summary=lambda r: f"{int((r['q_value'] < 0.05).sum())} ions q<0.05 of {len(r)}"))
+    summary=lambda r: f"{int((r['q_value'] < 0.05).sum())} ions q<0.05 of {len(r)}{_pixel_note(r)}"))
 
 _register(StepDef(
     id="region_comparison", name="Region spectra (A vs B overlay)", category="Statistics",
@@ -961,7 +1019,8 @@ _register(StepDef(
             ParamSpec("max_q", "Max q-value", "float", 0.05, lo=0.0, hi=1.0, step=0.01,
                       help="FDR cutoff; 1.0 keeps everything regardless of significance."),
             ParamSpec("top_n", "Candidates / group", "int", 50, lo=3, hi=500, step=5,
-                      help="Rank by discrimination strength first, then apply the filters above."),
+                      help="Most markers kept per group, strongest first, after the filters "
+                           "above. Ions tied at the cut are all kept."),
             ParamSpec("save_lists", "Save per-group ★ marker lists", "bool", False,
                       help="Save each group's kept ions as a named feature list you can reuse."),
             _p_tol(), _p_norm()],
@@ -970,8 +1029,7 @@ _register(StepDef(
     to_table=_per_cluster_table,
     rep_ions=_per_cluster_rep,
     lists=lambda r: _disc_lists(r) if getattr(r, "_save_lists", True) else {},
-    summary=lambda r: (f"{len(r)} groups · kept {sum(len(d) for d in r.values())} markers "
-                       f"(AUC ≥ {r.min_auc:.2f}, q ≤ {r.max_q:g})")))
+    summary=_disc_summary))
 
 _register(StepDef(
     id="multigroup_features", name="Multi-group features", category="Statistics",
@@ -984,7 +1042,7 @@ _register(StepDef(
     run=_run_multigroup,
     to_table=lambda r: r,
     rep_ions=_rep_by_pvalue,
-    summary=lambda r: f"{int((r['q_value'] < 0.05).sum())} ions q<0.05 of {len(r)}"))
+    summary=lambda r: f"{int((r['q_value'] < 0.05).sum())} ions q<0.05 of {len(r)}{_pixel_note(r)}"))
 
 _register(StepDef(
     id="roi_localization", name="ROI localization", category="Statistics",

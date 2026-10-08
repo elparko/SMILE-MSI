@@ -35,6 +35,9 @@ PREVIEW_ROWS = 12
 
 _open: dict = {"slide": None, "ref": ""}
 
+#: References that open the synthetic demo slide (which has no session file).
+_DEMO_REFS = ("demo", "demo dataset", "synthetic")
+
 
 # --------------------------------------------------------------------------- #
 # small helpers
@@ -123,6 +126,10 @@ def slide_state(ref: str) -> dict:
     The analysis list comes from the run store on disk, which is the truth: the copy inside
     the session file is a snapshot from the last autosave and can miss a run that finished
     after it."""
+    if str(ref).lower() in _DEMO_REFS:
+        raise ValueError("'demo' is the synthetic slide: it has no saved session on disk. "
+                         "Open it with open_slide('demo'), then call state() for its regions, "
+                         "groups and settings.")
     path = headless.resolve_session_ref(ref)
     out = headless.session_summary(headless.read_session(path), path=path)
     out["analysis_runs"] = [
@@ -193,7 +200,7 @@ def open_slide(ref: str = "demo", stride: int = 1) -> dict:
     ``stride`` loads every Nth pixel for a quick look. Leave it 1 for real analysis — a
     strided slide has different pixel indices, so saved regions will not line up."""
     close_slide()
-    if str(ref).lower() in ("demo", "demo dataset", "synthetic"):
+    if str(ref).lower() in _DEMO_REFS:
         slide = headless.open_demo()
     else:
         slide = headless.open_slide(ref, stride=int(stride))
@@ -262,11 +269,15 @@ def run_analysis(step_id: str, params: dict | None = None, features: list | None
 
     Inputs default to the slide's state: the working feature set, the tagged groups (``a``
     and ``b`` default to the first two). Name regions or groups to override — ``a='Peri'``,
-    ``b='Endo'``, ``mask='ROI 1'`` to restrict a step to one region. ``params`` are the
-    step's own tunables; :func:`analysis_catalog` lists them with their defaults.
+    ``b='Endo'``, ``mask='ROI 1'`` to restrict a step to one region. ``groups`` takes a list
+    of region **or** group names (``groups=['core', 'rim', 'lesion']``) for multi-group
+    steps; a pixel in two of them counts for the first. ``params`` are the step's own
+    tunables; :func:`analysis_catalog` lists them with their defaults.
 
     Returns the step's one-line outcome plus a preview of its result table and the path to
-    the full CSV."""
+    the full CSV. ``warning`` is set when the result carries a caveat — most often that a
+    test ran on pixels, so its p/q values describe pixels rather than replicates. ``mask``
+    echoes the region a step was restricted to and its pixel count."""
     slide = _slide()
     step = registry.REGISTRY.get(step_id)
     if step is None:
@@ -301,9 +312,48 @@ def run_analysis(step_id: str, params: dict | None = None, features: list | None
         table = result
     if table is not None:
         out["table"] = _table_out(table, f"{step_id}", sort=_sort_column(table))
+    warning = _result_warning(result, table)
+    if warning:
+        out["warning"] = warning
+    if mask:
+        m = slide.api._mask(mask)
+        out["mask"] = {"name": mask, "n_pixels": int(m.sum())}
     if getattr(result, "labels", None) is not None:
-        out["segmentation"] = {"n_clusters": int(getattr(result, "n_clusters", 0))}
+        out["segmentation"] = _segmentation_out(slide, result, masked=bool(mask))
     out["working_features"] = len(slide.api.get_features())
+    return out
+
+
+def _result_warning(result, table) -> str:
+    """The caveat a step attached to its result (``attrs['warning']`` on a table, or a
+    ``warning`` attribute) — dropped by the CSV round-trip, so it is lifted out here."""
+    for obj in (result, table):
+        attrs = getattr(obj, "attrs", None)
+        w = (attrs.get("warning") if isinstance(attrs, dict) else None) or getattr(obj, "warning", None)
+        if isinstance(w, str) and w:
+            return w
+    return ""
+
+
+def _segmentation_out(slide, seg, *, masked: bool) -> dict:
+    """Cluster count, silhouette, how many pixels were clustered — and, for a run without a
+    mask, which clusters look like off-tissue background, because a 2-cluster cut of a slide
+    with background usually just separates tissue from background."""
+    import numpy as np
+
+    from . import spatial
+
+    labels = np.asarray(seg.labels)
+    out = {"n_clusters": int(getattr(seg, "n_clusters", 0)),
+           "silhouette": _round(float(getattr(seg, "silhouette", float("nan"))), 4),
+           "n_pixels_clustered": int((labels >= 0).sum())}
+    if not masked:
+        bg = spatial.background_clusters(slide.ds, seg, tol_ppm=slide.api.ppm)
+        if bg:
+            out["background_clusters"] = {str(c): n for c, n in bg.items()}
+            out["note"] = (f"clusters {sorted(bg)} ({sum(bg.values())} px) look like off-tissue "
+                           "background: no mask was given, so background pixels were "
+                           "clustered too — pass mask='<tissue region>' to cluster tissue only")
     return out
 
 
@@ -411,9 +461,11 @@ def _save_image(img, name: str, *, cmap: str = "viridis", title: str = "") -> st
 def ion_image(mz: float, cmap: str = "viridis", mask: str = "") -> dict:
     """Render one ion's spatial distribution to a PNG and report where its signal sits.
 
-    The image uses the slide's current tolerance, normalization and window reducer. ``mask``
-    restricts the reported statistics (not the image) to a named region, which is how you
-    ask "how much of this ion is in the endoneurium?"."""
+    The image uses the slide's current tolerance, normalization and window reducer. The
+    ``mean`` / ``max`` / ``nonzero_fraction`` statistics are over **every acquired pixel**,
+    off-tissue background included, so a small tissue on a large raster reads low. ``mask``
+    adds the same statistics inside a named region (and outside it) without changing the
+    image, which is how you ask "how much of this ion is in the endoneurium?"."""
     import numpy as np
 
     slide = _slide()
@@ -439,9 +491,13 @@ def ion_image(mz: float, cmap: str = "viridis", mask: str = "") -> dict:
 def mean_spectrum(region: str = "", top_n: int = 25) -> dict:
     """The mean spectrum of the whole slide, or of one named region, as its strongest peaks.
 
-    Returns the top ``top_n`` local maxima with their m/z and relative intensity, plus a PNG
-    of the spectrum — enough to see what is in the tissue before picking features."""
+    Returns the ``top_n`` most intense local maxima, **listed in m/z order** (not by
+    intensity), with their m/z and relative intensity, plus a PNG of the spectrum — enough to
+    see what is in the tissue before picking features. Each m/z is the same 3-point centroid
+    :func:`find_peaks` reports, so a peak reads the same in both tools."""
     import numpy as np
+
+    from .msi import _centroid
 
     slide = _slide()
     mask = slide.api._mask(region) if region else None
@@ -456,7 +512,7 @@ def mean_spectrum(region: str = "", top_n: int = 25) -> dict:
         "region": region or "whole slide",
         "n_points": int(spec.size),
         "mz_range": [_round(float(axis[0]), 4), _round(float(axis[-1]), 4)],
-        "top_peaks": [{"mz": _round(float(axis[i]), 4),
+        "top_peaks": [{"mz": _round(_centroid(axis, spec, i), 4),
                        "rel_intensity": _round(float(spec[i]) / peak, 4)} for i in top],
         "png": _spectrum_png(axis, spec, region),
     }

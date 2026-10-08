@@ -67,6 +67,26 @@ class Segmentation:
         return self.labels == cluster
 
 
+#: A cluster whose median summed signal is below this fraction of the brightest cluster's
+#: reads as off-tissue background (:func:`background_clusters`).
+BACKGROUND_FRAC = 0.1
+
+
+def background_clusters(ds, seg, tol_ppm: float = DEFAULT_TOL_PPM) -> dict:
+    """``{cluster: n_pixels}`` for the clusters of ``seg`` that look like off-tissue
+    background: their median summed signal over the segmentation's features is below
+    :data:`BACKGROUND_FRAC` of the brightest cluster's. A segmentation run without a mask
+    clusters the background too, and a 2-cluster cut of a slide with background usually
+    spends one cluster on it. The signal is un-normalized, because TIC normalization
+    divides background noise by its own small TIC and makes it look like tissue."""
+    labels = np.asarray(seg.labels)
+    total = feature_matrix(ds, seg.peaks, tol_ppm=tol_ppm, norm="none").sum(axis=1)
+    med = {int(c): float(np.median(total[labels == c])) for c in np.unique(labels[labels >= 0])}
+    top = max(med.values(), default=0.0)
+    return {c: int((labels == c).sum()) for c, v in med.items()
+            if top > 0 and v < BACKGROUND_FRAC * top}
+
+
 def _zscore_cols(X):
     """Per-feature z-score (mean 0, unit variance); zero-variance columns collapse to 0.
     Applied per sample before pooling several slides so a slide's overall intensity
