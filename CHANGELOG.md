@@ -13,6 +13,19 @@ All notable changes to SMILE MSI. Format loosely follows
   the session's tolerance and normalization, as the named wrappers always did.
 
 ### Added
+- **Reviewer for chat analyses.** A *Review* button referees the analysis so far: rule checks
+  over the session log (pixel-level p-values under pixel replication, tool failures the reply
+  never acknowledged, lipid IDs stated without hedging, p/q without an effect size, deviations
+  from the setup, no recorded question) plus a model-written referee report (major / minor /
+  well supported). Findings are cited by log entry and land in the Markdown log.
+- **Your chat tools and flows over MCP.** The MCP server gains a stable set of tools to list,
+  run, create, edit and delete user-made tools and to save / run flows — so Claude Desktop (or
+  any MCP client) can use what you built in the chat. Create / edit / delete are marked
+  destructive, so clients ask before running them.
+- **Atlas-style figures (`smile_msi.atlasviz`).** `dot_mosaic` draws an ion or segmentation image
+  as round dots on black (the "lipizones" look) with a scale bar and outline inset;
+  `splitter_movie` writes a GIF in which segments fade into their children level by level, in
+  the tree-aware colours, blended in OKLab.
 - **Plain-language analysis chat — `smile-msi chat`.** A browser chat (local server, standard
   library only) where you describe an analysis and a model runs it with the MCP server's tools:
   tool calls stream in as they run, figures appear inline (and the model sees them), and every

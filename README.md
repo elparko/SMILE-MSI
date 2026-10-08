@@ -130,6 +130,14 @@ seg  = spatial.auto_segment(ds, peaks)                       # regions
 disc = spatial.discriminating_features(ds, seg.labels, peaks)
 feat = annotate.build_feature_list(ds, peaks, mode="negative")   # identified feature list
 img  = ds.ion_image(peaks[0])                               # numpy (height, width)
+
+# atlas-style figures: tree-coloured segments as dots on black, and a coarse→fine movie
+from smile_msi import atlasviz
+hier = spatial.hierarchy(ds, peaks)
+k = 8
+labels = ds.to_image(spatial.cut(hier, k).astype(float))
+atlasviz.dot_mosaic(labels, "segments.png", colors=spatial.segment_colors(hier, k))
+atlasviz.splitter_movie(hier, ds, "splitting.gif")
 ```
 
 ### Reopen what the app saved (no GUI)
@@ -218,6 +226,11 @@ smile-msi chat --provider local --model qwen3:14b  # any OpenAI-compatible serve
 - **What approval does and doesn't do.** Approval is a review step for the model's tools, not a
   sandbox: `run_script` runs ordinary Python with your permissions. To review every script too,
   tick *Ask before every script* in Settings (or start with `--approve-scripts`).
+- **Review.** *Review* referees the analysis so far — automatic checks for pseudoreplication,
+  ignored tool failures, over-claimed lipid IDs, p-values without effect sizes and deviations
+  from the setup, plus a model-written referee report — all cited to the log.
+- **Use them from other assistants too.** The MCP server exposes your user-made tools and flows
+  (`list_user_tools`, `run_user_tool`, `run_flow`, …), so Claude Desktop can use what you built.
 - **When something hangs.** *Stop* ends the turn: a tool still running after a moment is
   interrupted (a runaway script stops at its next Python instruction; a long numerical call
   stops when it returns). *New* does the same and starts fresh at once.
