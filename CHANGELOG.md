@@ -6,6 +6,21 @@ All notable changes to SMILE MSI. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Plain-language analysis chat — `smile-msi chat`.** A browser chat (local server, standard
+  library only) where you describe an analysis and a model runs it with the MCP server's tools:
+  tool calls stream in as they run, figures appear inline (and the model sees them), and every
+  message, tool call, argument, result, approval, dataset fingerprint and token count goes to an
+  append-only session log, exportable as Markdown ending in a replayable list of tool calls.
+  Bring your own model: Claude through the official SDK (`[agent]` extra) or any
+  OpenAI-compatible local server (Ollama, LM Studio, llama.cpp, vLLM). The model can create,
+  edit and delete its own versioned analysis tools — each such change waits for your approval
+  and shows the code — and save analyses as replayable flows.
+- **Segments coloured by the tree.** Segmentations cut from the granularity tree are coloured
+  with Tree Colors (Tennekes & de Jonge 2014) in OKLCh instead of a 12-colour cycling palette:
+  sibling segments share a hue family, a segment keeps its hue family as Detail gets finer, and
+  colours no longer repeat past 12 segments. The segment map, live Detail preview, dendrogram,
+  figure export and joint segmentation all use them; manual splits get shades of the parent;
+  the colours are saved with the session.
 - **Copying a table copies the table.** Qt gives a grid no copy of its own, so ⌘C over a result
   table left the clipboard holding whatever was there before, and the one right-click *Copy* that
   existed sent the selected cells only — click a row, press copy, get one number. ⌘C / Ctrl+C now

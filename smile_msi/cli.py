@@ -2,6 +2,7 @@
 
     smile-msi                 open the app
     smile-msi data.imzML      open the app and load this dataset
+    smile-msi chat            plain-language analysis chat in your browser (see --help)
 
 The app is the whole interface; analysis is interactive (no command-line pipeline).
 """
@@ -12,6 +13,9 @@ import sys
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["chat"]:
+        from .agent.server import main as chat_main
+        return chat_main(argv[1:])
     open_path = None
     for a in argv:
         if not a.startswith("-") and a.lower().endswith(".imzml"):

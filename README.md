@@ -179,6 +179,34 @@ to `~/.smile-msi/mcp-results` and the tool returns the path. Start an assistant 
 a dataset. The tools are the same registry steps the app runs, so a result cannot drift from
 what the app would show.
 
+### Plain-language analysis chat (bring your own model)
+
+`smile-msi chat` opens a chat in your browser where you describe an analysis in plain language
+and a model runs it with the same tools the MCP server exposes. Every tool call is shown as it
+runs, figures appear inline as they are made, and the whole session is written to an
+append-only log (`~/.smile-msi/agent/logs/`, downloadable as Markdown with a replayable list of
+the tool calls).
+
+```bash
+uv pip install -e '.[agent]'                       # Claude via the official SDK
+smile-msi chat                                     # API key in Settings, ANTHROPIC_API_KEY, or `ant auth login`
+smile-msi chat --provider local --model qwen3:14b  # any OpenAI-compatible server (Ollama default URL)
+```
+
+- **Your model.** Claude (default `claude-opus-5-5`, effort selectable) or a local model behind an
+  OpenAI-compatible endpoint (Ollama, LM Studio, llama.cpp, vLLM — `--base-url`). A local setup
+  needs no extra package and sends nothing off the machine. Tool use is only as good as the
+  model's function calling.
+- **New tools on the fly.** The model can write a new analysis tool (a short script plus declared
+  parameters). Creating, editing or deleting a tool **asks for your approval** and shows the code;
+  running an approved tool does not. Tools are versioned in `~/.smile-msi/agent/tools/` — every
+  version is kept, and each run is logged with its version and code hash.
+- **Flows.** An analysis you like can be saved as a flow (an ordered list of tool calls with
+  `{{placeholders}}`) and replayed on another slide.
+- **Safety.** The server binds to `127.0.0.1`, checks the `Host` header and requires a per-launch
+  token, so other web pages can't drive it. An API key typed into Settings stays in memory —
+  never written to the log or to disk. It runs in its own process, separate from the desktop app.
+
 ## Scientific notes & caveats
 - **Lipid IDs are sum-composition level** (e.g. `PE 38:4`) and do not resolve true isobars or
   sn-position. The annotation FDR is high precisely because the in-silico database enumerates
