@@ -20,7 +20,10 @@ Endpoints (all but ``/`` need the token, ``?t=`` or the ``X-SMILE-Token`` header
     POST /api/approve       {"call_id", "approve", "note"}  answer an approval request
     GET  /api/config        current settings (``has_key``, never the key)
     POST /api/config        new settings → a new conversation (and a new log)
-    POST /api/reset         new conversation, same settings
+    POST /api/reset         new conversation, same settings — also the way out of a turn
+                            stuck in a long tool: the old turn is abandoned (its tool keeps
+                            running in the background until it returns; nothing it does
+                            reaches the new conversation)
     GET  /api/library       user-created tools and saved flows
     GET  /api/file?p=…      an image/CSV the session produced (only those)
     GET  /api/log.md        the session log as Markdown; /api/log.jsonl raw
@@ -57,28 +60,39 @@ class ChatState:
         self.pending: dict[str, dict] = {}
         self.agent: Agent | None = None
         self.config_error = ""
+        self.generation = 0
         self.new_conversation()
 
     # ------------------------------------------------------------------ #
-    def publish(self, ev: dict):
+    def publish(self, ev: dict, generation: int | None = None):
+        if generation is not None and generation != self.generation:
+            return                                   # an abandoned conversation's late event
+        from .tools import shareable
+
         for key in ("images", "files"):
             for p in ev.get(key) or ():
-                self.files.add(os.path.abspath(p))
+                if shareable(p):
+                    self.files.add(os.path.realpath(p))
         with self.lock:
             self.events.append(ev)
             listeners = list(self.listeners)
         for q in listeners:
             q.put(ev)
 
-    def approve(self, req: dict):
+    def approve(self, req: dict, agent=None, generation: int | None = None):
+        """Block until the user answers ``req`` — or its conversation is stopped/abandoned."""
+        if generation is not None and generation != self.generation:
+            return False, "conversation abandoned"
         slot = {"event": threading.Event(), "answer": (False, "")}
         self.pending[req["call_id"]] = slot
-        while not slot["event"].wait(0.5):
-            if self.agent is not None and self.agent._stop.is_set():
-                self.pending.pop(req["call_id"], None)
-                return False, "stopped by the user"
-        self.pending.pop(req["call_id"], None)
-        return slot["answer"]
+        try:
+            while not slot["event"].wait(0.5):
+                if (agent is not None and agent._stop.is_set()) or \
+                        (generation is not None and generation != self.generation):
+                    return False, "stopped by the user"
+            return slot["answer"]
+        finally:
+            self.pending.pop(req["call_id"], None)
 
     def answer(self, call_id: str, ok: bool, note: str) -> bool:
         slot = self.pending.get(call_id)
@@ -89,20 +103,31 @@ class ChatState:
         return True
 
     def new_conversation(self):
-        if self.agent is not None:
-            self.agent.stop()
+        old = self.agent
+        self.generation += 1
+        gen = self.generation
+        if old is not None:
+            old.stop()
             for slot in list(self.pending.values()):
                 slot["event"].set()
-            self.agent.log.close()
+            if old.busy:
+                old.log.write("notice", text="Conversation abandoned by the user (new "
+                                             "conversation started while a turn was running).")
+            old.log.close()
         with self.lock:
             self.events = []
+            self.files = set()
             listeners = list(self.listeners)
         for q in listeners:                      # open pages clear their transcript
             q.put({"type": "reset"})
         self.agent, self.config_error = None, ""
         try:
             provider = make_provider(self.config)
-            self.agent = Agent(provider, emit=self.publish, approve=self.approve)
+            holder: dict = {}
+            self.agent = Agent(provider, emit=lambda ev, g=gen: self.publish(ev, g),
+                               approve=lambda req, g=gen: self.approve(req, holder.get("a"), g),
+                               approve_scripts=bool(self.config.get("approve_scripts")))
+            holder["a"] = self.agent
         except ProviderError as exc:
             self.config_error = str(exc)
             self.publish({"type": "error", "message": str(exc), "seq": 0})
@@ -129,27 +154,37 @@ def make_handler(state: ChatState, token: str, port: int):
         def _deny(self, code=HTTPStatus.FORBIDDEN, msg="forbidden"):
             self._send(code, {"error": msg})
 
-        def _send(self, code, obj=None, *, body: bytes | None = None, ctype="application/json"):
+        def _send(self, code, obj=None, *, body: bytes | None = None, ctype="application/json",
+                  file: bool = False):
             data = body if body is not None else json.dumps(obj, default=str).encode()
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if file:                                     # served files can never run script
+                self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
             self.end_headers()
             self.wfile.write(data)
 
         def _ok_origin(self, q) -> bool:
             if self.headers.get("Host", "") not in allowed_hosts:
                 return False
+            origin = self.headers.get("Origin")
+            if origin and origin.split("//", 1)[-1] not in allowed_hosts:
+                return False
             supplied = self.headers.get("X-SMILE-Token") or (q.get("t") or [""])[0]
             return secrets.compare_digest(supplied, token)
 
         def _json_body(self) -> dict:
             n = int(self.headers.get("Content-Length") or 0)
-            if n > 2_000_000:
-                raise ValueError("request too large")
+            if n < 0 or n > 2_000_000:
+                raise ValueError("bad request size")
             raw = self.rfile.read(n) if n else b"{}"
-            return json.loads(raw.decode("utf-8") or "{}")
+            body = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(body, dict):
+                raise ValueError("request body must be a JSON object")
+            return body
 
         # -------------------------------------------------------------- #
         def do_GET(self):  # noqa: N802 — http.server API
@@ -170,12 +205,16 @@ def make_handler(state: ChatState, token: str, port: int):
             if url.path == "/api/library":
                 return self._library()
             if url.path == "/api/file":
-                path = os.path.abspath((q.get("p") or [""])[0])
-                if path not in state.files or not os.path.isfile(path):
+                from .tools import shareable
+
+                path = os.path.realpath((q.get("p") or [""])[0])
+                if path not in state.files or not shareable(path):
                     return self._deny(HTTPStatus.NOT_FOUND, "not a file from this session")
+                ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+                if ctype not in ("image/png", "image/jpeg"):
+                    ctype = "text/plain; charset=utf-8"           # CSV: shown as text, never HTML
                 with open(path, "rb") as fh:
-                    ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
-                    return self._send(HTTPStatus.OK, body=fh.read(), ctype=ctype)
+                    return self._send(HTTPStatus.OK, body=fh.read(), ctype=ctype, file=True)
             if url.path in ("/api/log.md", "/api/log.jsonl"):
                 if state.agent is None:
                     return self._deny(HTTPStatus.CONFLICT, "no conversation")
@@ -204,9 +243,11 @@ def make_handler(state: ChatState, token: str, port: int):
                                       state.config_error or "set up a model in Settings first")
                 if not text:
                     return self._deny(HTTPStatus.BAD_REQUEST, "empty message")
-                if agent.busy:
-                    return self._deny(HTTPStatus.CONFLICT, "still working on the last message")
-                agent.busy = True
+                with state.lock:
+                    if agent.busy:
+                        return self._deny(HTTPStatus.CONFLICT,
+                                          "still working on the last message")
+                    agent.busy = True
                 threading.Thread(target=agent.send, args=(text,), daemon=True).start()
                 return self._send(HTTPStatus.ACCEPTED, {"ok": True})
             if url.path == "/api/stop":
@@ -218,10 +259,8 @@ def make_handler(state: ChatState, token: str, port: int):
                                   body.get("note", ""))
                 return self._send(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"ok": ok})
             if url.path == "/api/config":
-                if agent is not None and agent.busy:
-                    return self._deny(HTTPStatus.CONFLICT, "stop the running turn first")
-                new = {k: body[k] for k in ("provider", "model", "base_url", "effort", "vision")
-                       if k in body}
+                new = {k: body[k] for k in ("provider", "model", "base_url", "effort", "vision",
+                                            "approve_scripts") if k in body}
                 if body.get("api_key"):
                     new["api_key"] = str(body["api_key"]).strip()
                 if new.get("provider") and new["provider"] != state.config.get("provider"):
@@ -230,8 +269,6 @@ def make_handler(state: ChatState, token: str, port: int):
                 state.new_conversation()
                 return self._send(HTTPStatus.OK, state.public_config())
             if url.path == "/api/reset":
-                if agent is not None and agent.busy:
-                    return self._deny(HTTPStatus.CONFLICT, "stop the running turn first")
                 state.new_conversation()
                 return self._send(HTTPStatus.OK, {"ok": True})
             return self._deny(HTTPStatus.NOT_FOUND, "unknown endpoint")
@@ -294,6 +331,11 @@ def build_server(config: dict, port: int = 8765):
 
 def serve(config: dict, port: int = 8765, open_browser: bool = True):
     """Run the chat server until Ctrl-C, printing the URL to open."""
+    from .. import mcpserver
+
+    # scripts that write relative paths land in the results folder, not wherever the
+    # terminal happened to be (e.g. inside a source checkout)
+    os.chdir(mcpserver.results_dir())
     httpd, state, url = build_server(config, port)
     print(f"SMILE MSI chat running — open:\n  {url}\nPress Ctrl-C to stop.", flush=True)
     if open_browser:
@@ -320,11 +362,13 @@ def main(argv=None):
     ap.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"],
                     help="Claude reasoning effort")
     ap.add_argument("--vision", action="store_true", help="local model can read images")
+    ap.add_argument("--approve-scripts", action="store_true",
+                    help="also ask before every run_script (model-written code)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-browser", action="store_true")
     a = ap.parse_args(argv)
     cfg = {"provider": a.provider, "model": a.model, "base_url": a.base_url,
-           "effort": a.effort, "vision": a.vision}
+           "effort": a.effort, "vision": a.vision, "approve_scripts": a.approve_scripts}
     serve(cfg, port=a.port, open_browser=not a.no_browser)
 
 

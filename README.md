@@ -203,9 +203,17 @@ smile-msi chat --provider local --model qwen3:14b  # any OpenAI-compatible serve
   version is kept, and each run is logged with its version and code hash.
 - **Flows.** An analysis you like can be saved as a flow (an ordered list of tool calls with
   `{{placeholders}}`) and replayed on another slide.
-- **Safety.** The server binds to `127.0.0.1`, checks the `Host` header and requires a per-launch
-  token, so other web pages can't drive it. An API key typed into Settings stays in memory —
-  never written to the log or to disk. It runs in its own process, separate from the desktop app.
+- **Safety.** The server binds to `127.0.0.1`, checks the `Host`/`Origin` headers and requires a
+  per-launch token, so other web pages can't drive it; it only shows or serves PNG/JPG/CSV files
+  from the SMILE MSI data folder, as inert content. An API key typed into Settings stays in
+  memory — never written to the log or to disk. It runs in its own process, separate from the
+  desktop app, with the results folder as its working directory.
+- **What approval does and doesn't do.** Approval is a review step for the model's tools, not a
+  sandbox: `run_script` runs ordinary Python with your permissions. To review every script too,
+  tick *Ask before every script* in Settings (or start with `--approve-scripts`).
+- **When something hangs.** *Stop* ends the turn after the current step. A tool stuck in a long
+  computation can't be interrupted, but *New* abandons it: the chat starts fresh at once and the
+  old tool finishes in the background, its output discarded.
 
 ## Scientific notes & caveats
 - **Lipid IDs are sum-composition level** (e.g. `PE 38:4`) and do not resolve true isobars or
