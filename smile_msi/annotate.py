@@ -95,6 +95,18 @@ def _rerank_by_msm(ds, cands, match_ppm, image_ppm, norm, iso_cache, k=RERANK_TO
     return reordered, scored[order[0]][2]
 
 
+def _isotope_parent(mz, peak_mzs, tol_ppm: float = 20.0, max_iso: int = 2):
+    """``"M+n isotopologue of <m/z>"`` for a peak :func:`isotopes.deisotope` flagged as a
+    satellite — the peak ``n`` ¹³C steps below it — or ``""`` when none is in the list."""
+    arr = np.asarray(peak_mzs, float)
+    for n in range(1, max_iso + 1):
+        d = np.abs(arr - (mz - n * isotopes.DELTA_C13))
+        j = int(np.argmin(d)) if d.size else -1
+        if j >= 0 and d[j] <= mz * tol_ppm / 1e6:
+            return f"M+{n} isotopologue of {arr[j]:.4f}"
+    return ""
+
+
 # ----- per-dataset self-calibration ---------------------------------------- #
 # A systematic m/z offset is applied to the DB match only when it is well-supported (>= this
 # many confident base-ion matches) AND materially non-zero (median |ppm| above this) — so an
@@ -214,6 +226,7 @@ def build_feature_list(ds, peaks, mode: str = "negative", match_ppm: float = 5.0
         else:
             iso = isotopes.isotope_consistency(ds, mz, charge=1, tol_ppm=image_ppm,
                                                norm=norm, cache=iso_cache)
+        parent = _isotope_parent(mz, peak_mzs) if iso_flag.get(mz, False) else ""
         if best:
             add = isotopes.corroborating_adducts(best.lipid.neutral_mass, mode, peak_mzs_q)
             # how decisively the top candidate beat the runner-up (score units ≈ ppm);
@@ -249,7 +262,8 @@ def build_feature_list(ds, peaks, mode: str = "negative", match_ppm: float = 5.0
                 "isotopologue": iso_flag.get(mz, False),
                 "spatial_morans_i": round(float(morans.get(mz, 0.0)), 3),
                 "confidence": cd["label"], "confidence_score": cd["score"],
-                "confidence_why": " · ".join(cd["reasons"]), "msi_level": msi_lvl,
+                "confidence_why": " · ".join(cd["reasons"] + ([parent] if parent else [])),
+                "msi_level": msi_lvl,
                 "pubmed_url": urls["pubmed"], "europepmc_url": urls["europepmc"], "scholar_url": urls["scholar"],
             })
         else:
@@ -266,7 +280,9 @@ def build_feature_list(ds, peaks, mode: str = "negative", match_ppm: float = 5.0
                 "isotope_ok": iso["consistent"], "adducts_seen": "", "n_adducts": 0,
                 "isotopologue": iso_flag.get(mz, False),
                 "spatial_morans_i": round(float(morans.get(mz, 0.0)), 3), "confidence": "unidentified",
-                "confidence_score": "", "confidence_why": "no match within tolerance", "msi_level": 5,
+                "confidence_score": "",
+                "confidence_why": " · ".join(["no match within tolerance"] + ([parent] if parent else [])),
+                "msi_level": 5,
                 "pubmed_url": "", "europepmc_url": "", "scholar_url": "",
             })
     df = pd.DataFrame(rows)

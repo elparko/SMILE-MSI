@@ -40,6 +40,10 @@ from . import registry, library, session
 
 VERSION = 1
 
+#: threshold_mask() logs a warning when filling holes grows the mask by more than this
+#: fraction — speckle holes are a few pixels; a filled annulus is its whole interior.
+FILL_WARN_FRAC = 0.10
+
 
 class ScriptError(Exception):
     """Raised for *user* mistakes (no features yet, unknown region, …) so the message is a
@@ -228,15 +232,26 @@ class ScriptAPI:
     def threshold_mask(self, values, cut, percentile: bool = True, fill_holes: bool = True,
                        min_pixels: int = 0):
         """Mask of pixels where a signal (per-pixel vector, or one m/z) reaches ``cut``.
-        ``cut`` is a percentile of the signal pixels by default (``percentile=False`` makes it
-        an absolute intensity); holes are filled and islands under ``min_pixels`` dropped."""
+        ``cut`` is a percentile of every pixel with signal > 0 by default — off-tissue pixels
+        with any noise count too (``percentile=False`` makes it an absolute intensity).
+        **Holes are filled by default**: a rim/annulus becomes a solid disc, so pass
+        ``fill_holes=False`` for one. Islands under ``min_pixels`` are dropped."""
         from . import spatial
         v = self.ion_vector(float(values)) if np.ndim(values) == 0 else np.asarray(values, float)
         if v.shape[0] != self.ds.n_pixels:
             raise ScriptError(f"threshold_mask() wants one value per pixel ({self.ds.n_pixels}), "
                               f"got {v.shape[0]}.")
-        return spatial.threshold_mask(self.ds, v, cut, percentile=percentile,
+        mask = spatial.threshold_mask(self.ds, v, cut, percentile=percentile,
                                       fill_holes=fill_holes, min_pixels=min_pixels)
+        if fill_holes:
+            raw = spatial.threshold_mask(self.ds, v, cut, percentile=percentile,
+                                         fill_holes=False, min_pixels=min_pixels)
+            added = int(mask.sum()) - int(raw.sum())
+            if added > FILL_WARN_FRAC * max(1, int(raw.sum())):
+                self._log(f"threshold_mask: filling holes added {added:,} px to "
+                          f"{int(raw.sum()):,} — if the signal is a rim or ring, pass "
+                          "fill_holes=False")
+        return mask
 
     def ring(self, mask, width_px=None, width_um=None, mode: str = "outer"):
         """A rim (inner) / collar (outer) / band of the given width around a mask's boundary.
@@ -398,14 +413,24 @@ class ScriptAPI:
 
     # ---- segmentation --------------------------------------------------- #
     def segment(self, features=None, n_clusters: int = 0, spatial: bool = True,
-                spatial_sigma: float = 1.0):
+                spatial_sigma: float = 1.0, mask=None):
         """Cluster pixels into regions (``n_clusters=0`` → auto by silhouette). Sets
-        ``self.segmentation``; ``.labels`` is the per-pixel cluster array."""
-        res = self._run_step("auto_segment", {"mzs": self._features(features)},
+        ``self.segmentation``; ``.labels`` is the per-pixel cluster array (``-1`` outside
+        ``mask``). Without ``mask`` every acquired pixel is clustered, off-tissue background
+        included — pass a tissue region to cluster the tissue alone."""
+        m = self._mask(mask)
+        res = self._run_step("auto_segment", {"mzs": self._features(features), "mask": m},
                              dict(n_clusters=n_clusters, spatial=spatial,
                                   spatial_sigma=spatial_sigma, tol_ppm=self.ppm, norm=self.norm))
         self.segmentation = res
-        self._log(f"segment → {res.n_clusters} clusters (silhouette {res.silhouette:.2f})")
+        where = "whole slide" if m is None else f"{int(m.sum()):,} px in mask"
+        self._log(f"segment → {res.n_clusters} clusters (silhouette {res.silhouette:.2f}; {where})")
+        if m is None:
+            from . import spatial as _spatial
+            bg = _spatial.background_clusters(self.ds, res, tol_ppm=self.ppm)
+            if bg:
+                self._log(f"segment: clusters {sorted(bg)} look like off-tissue background — "
+                          "pass mask= to cluster tissue only")
         return res
 
     # ---- statistics ----------------------------------------------------- #
@@ -505,8 +530,25 @@ class ScriptAPI:
     def annotate(self, features=None, mode: str = "negative", match_ppm: float = 5.0,
                  image_ppm: float = 10.0):
         """Match the feature set to the lipid database (isotopes + adducts + confidence) → DataFrame."""
-        return self._run_step("annotate", {"mzs": self._features(features)},
+        return self._run_step("annotate", {"mzs": self._peak_records(self._features(features))},
                               dict(mode=mode, match_ppm=match_ppm, image_ppm=image_ppm, norm=self.norm))
+
+    def _peak_records(self, mzs, tol_ppm: float = 2.0):
+        """``mzs`` as the last find_*() peak dicts where one sits within ``tol_ppm`` (so the
+        intensity / S/N columns are filled and isotopologues can be told from their parent),
+        else the bare m/z."""
+        if not self.last_peaks:
+            return mzs
+        known = np.array([float(p["mz"]) for p in self.last_peaks])
+        order = np.argsort(known)
+        known = known[order]
+        out = []
+        for mz in mzs:
+            i = int(np.searchsorted(known, mz))
+            j = min((k for k in (i - 1, i) if 0 <= k < len(known)), key=lambda k: abs(known[k] - mz))
+            hit = abs(known[j] - mz) <= mz * tol_ppm / 1e6
+            out.append(dict(self.last_peaks[order[j]], mz=float(mz)) if hit else mz)
+        return out
 
     # ---- generic escape hatch ------------------------------------------- #
     def run(self, step_id, features=None, groups=None, mask=None, target_mz=None, **params):
@@ -522,6 +564,12 @@ class ScriptAPI:
             inp["labels"], inp["names"] = self._labels(groups)
         if target_mz is not None:
             params.setdefault("target_mz", float(target_mz))
+        # the session's extraction settings, as the named wrappers pass them — the registry
+        # default tolerance would extract a different window than the session's ion images
+        step_defaults = registry.default_params(step_id)
+        for key, value in (("tol_ppm", self.ppm), ("norm", self.norm)):
+            if key in step_defaults:
+                params.setdefault(key, value)
         return self._run_step(step_id, inp, params)
 
     def _commit(self, sd, res):
@@ -966,8 +1014,10 @@ def capabilities_doc(api: ScriptAPI | None = None) -> str:
         "needed for the analysis functions — they are pre-bound bare names.",
         "- It runs **against the open slide**, exposed as `ds` (an `MSIDataset`). You do not "
         "load data; it is already there.",
-        "- There is no value to `return`. You surface results with the output helpers below; "
-        "anything you `print()` is captured into the run log too.",
+        "- There is no value to `return`. You surface results with the output helpers below. "
+        "`print()` output is captured separately from the run log, as the run's `stdout` (the "
+        "Script Console shows it under *stdout*; the MCP `run_script` result returns it as "
+        "`stdout`). Use `log()` for lines that belong in the run log.",
         "- Runs may take seconds (peak picking, segmentation, multivariate). That is normal.",
         "- The script is sandbox-free (full Python on the user's machine) but should avoid "
         "network access and writing files — use the console's *Export* for artifacts.",
@@ -978,6 +1028,9 @@ def capabilities_doc(api: ScriptAPI | None = None) -> str:
         "- `image(x, title='')` — show an ion image. `x` is an m/z (float), a per-pixel "
         "vector, or a 2-D array.",
         "- `record(name, value)` — stash a named value to inspect after the run.",
+        "- `ds.ratio_image(num_mz, den_mz, tol_ppm=…, norm='none', eps=1.0)` — an H×W image of "
+        "one ion over another (e.g. sulfatide/PC); show it with `image(...)`. It takes its own "
+        "`tol_ppm` (pass `api.ppm` to match the session) and `eps` keeps a ~0 denominator finite.",
         "",
         "## Core concepts",
         "- **Features** = the working set of m/z the analyses operate on. Produce it with "
@@ -990,10 +1043,20 @@ def capabilities_doc(api: ScriptAPI | None = None) -> str:
         "- **ppm / norm / reduce** are the extraction defaults; set `api.ppm = 5`, "
         "`api.norm = 'rms'` etc. once at the top to change them for the whole script.",
         "- **Regions by construction** — build masks from the signal instead of drawing: "
-        "`threshold_mask(composite([...m/z...]), 60)` (60th percentile of signal pixels, holes "
-        "filled), `ring(mask, width_px=6, mode='outer')` (a collar outside it), `invert(mask)` "
-        "(everything else). `add_region('name', mask)` stages a region the console can push "
-        "into the app (Apply to app ▸ Add regions to the slide) and makes it usable by name.",
+        "`threshold_mask(composite([...m/z...]), 60)`, `ring(mask, width_px=6, mode='outer')` "
+        "(a collar outside it), `invert(mask)` (everything else). `add_region('name', mask)` "
+        "stages a region the console can push into the app (Apply to app ▸ Add regions to the "
+        "slide) and makes it usable by name.",
+        "- **`threshold_mask` fills holes by default** (`fill_holes=True`): it is built for "
+        "solid compartments, so a **rim or ring** signal comes back as a solid disc covering "
+        "the core it encloses — pass `fill_holes=False` for one (the run log warns when "
+        "filling grew the mask a lot). The cut is a **percentile of every pixel with signal "
+        "> 0**, and off-tissue pixels with any noise count, so `60` is not the 60th "
+        "percentile of the tissue; for that, threshold `values * tissue_mask`, or pass "
+        "`percentile=False` and an absolute intensity.",
+        "- **Segmentation clusters every acquired pixel** unless you pass `mask=`: with "
+        "off-tissue background on the slide, `segment(n_clusters=2)` usually splits tissue "
+        "from background. Use `segment(mask=tissue)` to cluster the tissue alone.",
         "",
         "## Analysis functions (bare names)",
         _api_reference(),

@@ -345,3 +345,54 @@ def test_run_script_returns_staged_regions(api):
     assert [rg["name"] for rg in r.regions] == ["core"]
     assert "1 region(s)" in r.summary()
     assert any("add_region" in line for line in r.logs)
+
+
+# --------------------------------------------------------------------------- #
+# findings from an assistant-driven run of the demo slide
+# --------------------------------------------------------------------------- #
+def test_annotate_carries_the_picked_peaks_intensity_and_snr(api):
+    api.find_peaks(snr=5, max_peaks=10)
+    df = api.annotate()
+    assert (df["intensity"] != "").all() and (df["snr"] != "").all()
+    one = api.annotate(features=[round(api.features[0], 4)])   # an m/z read back off a table
+    assert one.iloc[0]["intensity"] != ""
+
+
+def test_threshold_mask_warns_when_filling_closes_a_ring(api):
+    rows, cols = api.ds._pixel_rows_cols()
+    r = np.hypot(rows - rows.mean(), cols - cols.mean())
+    ring = np.where((r > 3) & (r < 6), 10.0, 0.0)                # a bright annulus
+    out = scripting.run_script(
+        "record('n', (int(threshold_mask(v, 50).sum()),\n"
+        "             int(threshold_mask(v, 50, fill_holes=False).sum())))", api,
+        extra_globals={"v": ring})
+    assert out.ok, out.error
+    n_filled, n_open = out.values["n"]
+    assert n_filled > n_open                                     # the default fills the core
+    assert sum("fill_holes=False" in line for line in out.logs) == 1   # … and says so, once
+
+
+def test_segment_takes_a_mask_and_flags_background_without_one(api):
+    api.find_peaks(snr=5, max_peaks=20)
+    left = api.region("L")
+    seg = api.segment(n_clusters=2, mask="L")
+    assert (seg.labels[~left] == -1).all() and (seg.labels[left] >= 0).all()
+    out = scripting.run_script("segment(n_clusters=2)", api)
+    assert out.ok, out.error
+    assert any("off-tissue background" in line for line in out.logs)
+
+
+def test_run_uses_the_session_tolerance_like_the_named_wrappers(api):
+    api.find_peaks(snr=5, max_peaks=20)
+    assert registry.default_params("auto_segment")["tol_ppm"] != api.ppm
+    via_run = api.run("auto_segment", n_clusters=2)
+    via_wrapper = api.segment(n_clusters=2)
+    assert via_run.silhouette == via_wrapper.silhouette
+    assert np.array_equal(via_run.labels, via_wrapper.labels)
+
+
+def test_guide_documents_stdout_ratio_image_and_hole_filling():
+    doc = scripting.capabilities_doc()
+    assert "captured into the run log" not in doc and "`stdout`" in doc
+    assert "ds.ratio_image(" in doc
+    assert "fill_holes=False" in doc and "percentile of every pixel with signal" in doc
