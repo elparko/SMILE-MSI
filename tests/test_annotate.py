@@ -338,6 +338,31 @@ def test_isotopologue_not_flagged_when_no_intensity(pe_lipid):
     assert list(df["isotopologue"]) == [False, False]
 
 
+def test_unidentified_isotopologue_names_its_parent(pe_lipid):
+    """An M+1 with no database match of its own says whose isotopologue it is, instead of
+    reading as an unexplained unknown."""
+    mono = {"mz": MZ, "intensity": 1000.0}
+    sat = {"mz": MZ + DELTA_C13, "intensity": 200.0}
+    df = annotate.build_feature_list(None, [mono, sat], db=[pe_lipid])
+    assert df.iloc[1]["confidence"] == "unidentified"
+    assert f"M+1 isotopologue of {MZ:.4f}" in df.iloc[1]["confidence_why"]
+    assert "isotopologue" not in df.iloc[0]["confidence_why"]
+
+
+def test_demo_fatty_acid_isotope_envelope_is_seen():
+    """FA 18:1's M+1 sits between two samples of the demo's 10 mDa profile grid. The check
+    must still measure it (M+1/M ≈ 0.2 for C18), also when the M+1 was picked as a peak and
+    its 10 ppm feature column is what the image pull is served from."""
+    from smile_msi import demo
+
+    ds = demo.make_synthetic(width=16, height=12, seed=3)
+    df = annotate.build_feature_list(ds, [281.2486, 282.2516], image_ppm=10.0, match_ppm=5.0)
+    fa = df.iloc[0]
+    assert fa["lipid"] == "FA 18:1"
+    assert bool(fa["isotope_ok"]) and 0.15 < float(fa["isotope_m1"]) < 0.25
+    assert fa["confidence"] == "High"
+
+
 # --------------------------------------------------------------------------- #
 # multi-row integration: order preserved, mixed matched / unmatched
 # --------------------------------------------------------------------------- #
