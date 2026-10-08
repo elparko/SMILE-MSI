@@ -578,6 +578,13 @@ class ScriptAPI:
         a, b = params.pop("a", None), params.pop("b", None)
         region = params.pop("region", None)
         samples = params.pop("samples", None)
+        # the session's extraction settings, as the named wrappers pass them — a step's own
+        # registry default (e.g. 50 ppm) would otherwise extract a different m/z window than
+        # every ion image of the session, and the same ion's numbers would change scale
+        step_defaults = registry.default_params(step_id)
+        for key, value in (("tol_ppm", self.ppm), ("norm", self.norm)):
+            if key in step_defaults and key not in params:
+                params[key] = value
 
         inp = {"mask": self._mask(mask)}
         if "feature_set" in sd.needs or sd.produces == {"peaks"}:

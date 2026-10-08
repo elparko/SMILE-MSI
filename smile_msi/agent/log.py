@@ -83,11 +83,21 @@ class SessionLog:
 
     # ------------------------------------------------------------------ #
     def tool_calls(self) -> list[dict]:
-        """The successful tool calls in order, as flow steps (``{"tool", "args"}``)."""
-        ok = {r["call_id"] for r in self.records if r["type"] == "tool_result" and r.get("ok")}
-        return [{"tool": r["name"], "args": r.get("args", {})} for r in self.records
-                if r["type"] == "tool_call" and r["call_id"] in ok
-                and r["name"] not in _NOT_REPLAYABLE]
+        """The successful tool calls in order, as flow steps (``{"tool", "args"}``) — with
+        the arguments that actually ran (setup defaults filled in)."""
+        done = {r["call_id"]: r for r in self.records
+                if r["type"] == "tool_result" and r.get("ok")}
+        steps = []
+        for r in self.records:
+            if r["type"] != "tool_call" or r["call_id"] not in done:
+                continue
+            res = done[r["call_id"]]
+            if r["name"] == "run_flow":                 # a flow run: its steps, as they ran
+                steps += list(res.get("flow_steps") or [])
+            elif r["name"] not in _NOT_REPLAYABLE:
+                steps.append({"tool": r["name"],
+                              "args": res.get("effective_args") or r.get("args", {})})
+        return steps
 
     def markdown(self) -> str:
         """The session as a readable report: conversation, every tool call with its
@@ -131,6 +141,28 @@ class SessionLog:
             elif kind == "usage":
                 tokens_in += int(r.get("input_tokens") or 0)
                 tokens_out += int(r.get("output_tokens") or 0)
+            elif kind == "setup":
+                st, pr = r.get("study", {}), r.get("profile", {})
+                lines += ["## Analysis setup", "",
+                          f"*{r.get('how')}* · profile **{pr.get('name')}** v{pr.get('version')}"
+                          f" (`{str(pr.get('hash', ''))[:12]}`)"
+                          + (f" · changed: {', '.join(r.get('changed_from_profile') or [])}"
+                             if r.get("changed_from_profile") else ""), ""]
+                if st.get("question"):
+                    lines += [f"- **Question:** {_inline(st['question'])}"]
+                lines += [f"- **Replication unit:** {st.get('replicate')}",
+                          f"- **Significance:** q ≤ {st.get('max_q')}, AUC ≥ "
+                          f"{st.get('min_auc')}",
+                          "- **Method:** " + "; ".join(f"{k} = {v}" for k, v in
+                                                     (r.get("params") or {}).items()), ""]
+            elif kind == "setup_applied":
+                ch = "; ".join(f"{k} {v['was']} → {v['now']}"
+                               for k, v in (r.get("changes") or {}).items())
+                lines += [f"- `{t}` setup applied to **{r.get('ref')}**: {ch}"]
+            elif kind == "deviation":
+                ds = "; ".join(f"{d['arg']} = {d['used']} (setup {d['setup']})"
+                               for d in r.get("deviations", []))
+                lines += [f"  - **deviation from setup** in {r.get('name')}: {ds}"]
             elif kind == "notice":
                 lines += [f"- `{t}` _{r.get('text')}_"]
             elif kind == "error":

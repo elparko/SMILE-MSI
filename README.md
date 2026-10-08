@@ -201,6 +201,13 @@ smile-msi chat --provider local --model qwen3:14b  # any OpenAI-compatible serve
   parameters). Creating, editing or deleting a tool **asks for your approval** and shows the code;
   running an approved tool does not. Tools are versioned in `~/.smile-msi/agent/tools/` — every
   version is kept, and each run is logged with its version and code hash.
+- **Analysis setup first.** Before the first message the chat asks for the decisions that shape
+  every result — the question, the unit of replication, the FDR and effect-size thresholds, and
+  the method settings (polarity, mass tolerances, normalization, peak picking, segmentation) from
+  an **Analysis Profile** shared with the desktop app. The setup is logged, applied to the slide
+  and filled into tool calls automatically; a call that uses a different value is flagged in the
+  chat and logged as a deviation. It stays visible in a sidebar (*Setup* on narrow screens),
+  can be changed mid-analysis (recorded), and can be saved as a new profile.
 - **Flows.** An analysis you like can be saved as a flow (an ordered list of tool calls with
   `{{placeholders}}`) and replayed on another slide.
 - **Safety.** The server binds to `127.0.0.1`, checks the `Host`/`Origin` headers and requires a
@@ -211,9 +218,9 @@ smile-msi chat --provider local --model qwen3:14b  # any OpenAI-compatible serve
 - **What approval does and doesn't do.** Approval is a review step for the model's tools, not a
   sandbox: `run_script` runs ordinary Python with your permissions. To review every script too,
   tick *Ask before every script* in Settings (or start with `--approve-scripts`).
-- **When something hangs.** *Stop* ends the turn after the current step. A tool stuck in a long
-  computation can't be interrupted, but *New* abandons it: the chat starts fresh at once and the
-  old tool finishes in the background, its output discarded.
+- **When something hangs.** *Stop* ends the turn: a tool still running after a moment is
+  interrupted (a runaway script stops at its next Python instruction; a long numerical call
+  stops when it returns). *New* does the same and starts fresh at once.
 
 ## Scientific notes & caveats
 - **Lipid IDs are sum-composition level** (e.g. `PE 38:4`) and do not resolve true isobars or

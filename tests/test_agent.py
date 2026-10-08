@@ -576,3 +576,133 @@ def test_served_files_are_inert(server):
         assert "sandbox" in r.headers["Content-Security-Policy"]
         assert r.headers["X-Content-Type-Options"] == "nosniff"
     assert _req(f"{base}/api/file?p=/etc/passwd", token=state.token)[0] == 404
+
+
+# --------------------------------------------------------------------------- #
+# the analysis setup — decided before the analysis, enforced, logged
+# --------------------------------------------------------------------------- #
+from smile_msi.agent import setup as setup_mod  # noqa: E402
+
+
+def test_setup_validates_and_records_what_changed():
+    s = setup_mod.resolve({"ppm": 20, "question": "Which lipids mark the lesion?",
+                           "max_q": 0.01})
+    assert s["params"]["ppm"] == 20.0 and s["changed_from_profile"] == ["ppm"]
+    assert s["study"]["question"].startswith("Which") and s["study"]["max_q"] == 0.01
+    for bad in ({"ppm": "abc"}, {"ppm": 10_000}, {"norm": "nonsense"},
+                {"replicate": "vibes"}, {"no_such_key": 1}):
+        with pytest.raises(ValueError):
+            setup_mod.resolve(bad)
+
+
+def test_setup_fills_tool_defaults_and_flags_deviations():
+    s = setup_mod.resolve({"ppm": 20, "snr": 4})
+    args, dev = setup_mod.fill_defaults(s, "find_peaks", {})
+    assert args["snr"] == 4 and dev == []
+    args, dev = setup_mod.fill_defaults(s, "find_peaks", {"snr": 6})
+    assert args["snr"] == 6 and dev == [{"arg": "snr", "setup": 4.0, "used": 6}]
+    args, dev = setup_mod.fill_defaults(s, "run_analysis", {"step_id": "auto_segment"})
+    assert args["params"] == {"tol_ppm": 20.0, "norm": "tic"}
+    args, _ = setup_mod.fill_defaults(s, "annotate", {})
+    assert args == {"mode": "negative", "match_ppm": 5.0}
+
+
+def test_agent_briefs_the_model_applies_the_setup_and_logs_deviations():
+    s = setup_mod.resolve({"ppm": 15, "question": "q?"})
+    a, p, ev = _ragent([_call("open_slide", ref="demo"), _call("find_peaks", snr=9.0),
+                        Step(text="ok")], setup=s)
+    a.send("go")
+    assert p.users[0].startswith("[Analysis setup") and p.users[0].endswith("go")
+    assert mcpserver._slide().api.ppm == 15.0                      # applied to the slide
+    assert _by_type(ev, "setup_applied")
+    dev = _by_type(ev, "deviation")[0]
+    assert dev["deviations"][0]["arg"] == "snr"
+    md = a.log.markdown()
+    assert "## Analysis setup" in md and "deviation from setup" in md
+    # a mid-conversation change reaches the model as a diff, once
+    a.set_setup(setup_mod.resolve({"ppm": 10, "question": "q?"}))
+    p.script.append(Step(text="noted"))
+    a.send("continue")
+    assert "ppm: 15.0 → 10.0" in p.users[1]
+    assert mcpserver._slide().api.ppm == 10.0
+
+
+def test_skipping_the_setup_still_records_a_method():
+    a, p, ev = _ragent([Step(text="hi")])
+    a.send("hello")
+    rec = _by_type(ev, "setup")[0]
+    assert "without review" in rec["how"] and rec["profile"]["name"]
+
+
+def test_setup_can_be_saved_as_an_analysis_profile():
+    from smile_msi import profiles
+
+    s = setup_mod.resolve({"ppm": 12})
+    assert setup_mod.save_as_profile(s, "Lesion study")["version"] == 1
+    assert setup_mod.save_as_profile(s, "Lesion study")["version"] == 2
+    assert profiles.load("Lesion study")["params"]["ppm"] == 12.0
+    assert any(p["name"] == "Lesion study" for p in setup_mod.form()["profiles"])
+
+
+def test_run_analysis_uses_the_sessions_extraction_window():
+    """The same ion must read the same before and after a registry step builds its feature
+    matrix (it used to extract at the step's own 50 ppm default)."""
+    import numpy as np
+
+    mcpserver.open_slide("demo")
+    api = mcpserver._slide().api
+    before = float(np.mean(api.ion_vector(904.6186)))
+    mcpserver.find_peaks(spatial=True)
+    mcpserver.run_analysis("auto_segment")
+    assert float(np.mean(api.ion_vector(904.6186))) == pytest.approx(before)
+
+
+def test_server_setup_endpoints(server):
+    _httpd, state, url = server
+    base = url.split("/?")[0]
+    code, body = _req(base + "/api/setup", token=state.token)
+    form = json.loads(body)
+    assert code == 200 and form["current"] is None and form["form"]["fields"]
+    code, body = _req(base + "/api/setup", token=state.token, body={"values": {"ppm": "x"}})
+    assert code == 400
+    code, body = _req(base + "/api/setup", token=state.token,
+                      body={"values": {"ppm": 25, "question": "why"}})
+    assert code == 200 and json.loads(body)["setup"]["params"]["ppm"] == 25.0
+    assert state.agent.setup["study"]["question"] == "why"
+    assert state.last_setup is not None
+
+
+def test_stop_interrupts_a_runaway_script():
+    a, p, ev = _ragent([_call("open_slide", ref="demo"),
+                        _call("run_script", code="while True:\n    pass"),
+                        Step(text="never")])
+    th = threading.Thread(target=a.send, args=("spin",), daemon=True)
+    th.start()
+    for _ in range(200):                                  # wait until the loop is running
+        if any(e["type"] == "tool_call" and e["name"] == "run_script" for e in ev):
+            break
+        threading.Event().wait(0.05)
+    threading.Event().wait(0.3)
+    a.stop()
+    th.join(timeout=15)
+    assert not th.is_alive(), "the script was not interrupted"
+    res = [r for r in _by_type(ev, "tool_result") if r["name"] == "run_script"][0]
+    assert not res["ok"] and "interrupted" in res["error"]
+    assert _answered(p) and not a.busy
+
+
+def test_reproduce_list_includes_the_steps_of_flow_runs():
+    a, _p, _ev = _agent([])
+    a.toolbox.save_flow("look", "x", [{"tool": "open_slide", "args": {"ref": "demo"}},
+                                      {"tool": "ion_image", "args": {"mz": "{{mz}}"}}])
+    b, p, ev = _ragent([_call("run_flow", name="look", params={"mz": 885.55}), Step(text="k")])
+    b.send("go")
+    assert b.log.tool_calls() == [{"tool": "open_slide", "args": {"ref": "demo"}},
+                                  {"tool": "ion_image", "args": {"mz": 885.55}}]
+
+
+def test_show_file_does_not_reveal_whether_outside_files_exist():
+    a, _p, _ev = _agent([])
+    for path in ("/etc/hosts", "/etc/definitely_not_here_xyz"):
+        with pytest.raises(PermissionError):
+            a.toolbox.show_file(path)

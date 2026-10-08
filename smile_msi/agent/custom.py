@@ -441,7 +441,13 @@ class Toolbox:
         sessions) can be shown. Results of other tools already show their images."""
         from .tools import shareable
 
+        from .tools import share_roots
+
         path = os.path.realpath(os.path.expanduser(str(path)))
+        inside = any(os.path.commonpath([path, root]) == root for root in share_roots())
+        if not inside:                       # same answer whether or not the file exists
+            raise PermissionError("only PNG/JPG/CSV files under the SMILE MSI data folder "
+                                  "can be shown")
         if not os.path.isfile(path):
             raise FileNotFoundError(os.path.basename(path))
         if not shareable(path):

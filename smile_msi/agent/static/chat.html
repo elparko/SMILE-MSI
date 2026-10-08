@@ -115,7 +115,41 @@ aside .content { padding: 14px 16px; overflow-y: auto; }
 .lib-item { border-bottom: 1px solid var(--line); padding: 8px 0; }
 .lib-item b { font: 600 13px var(--mono); }
 .lib-item div { font-size: 13px; color: var(--muted); }
-@media (max-width: 600px) { header h1 span { display: none; } .pill { max-width: 32vw; } }
+.app { flex: 1; display: flex; min-height: 0; }
+.col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#side { width: 300px; flex: none; border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 14px 16px; }
+#side h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+#side .q { font-size: 14px; margin: 6px 0 10px; }
+.kv { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.kv span:first-child { color: var(--muted); }
+.kv span:last-child { font-family: var(--mono); font-size: 12.5px; text-align: right; }
+.kv.changed span:last-child { color: var(--accent); font-weight: 600; }
+.side-group { margin: 14px 0 4px; font-size: 12px; font-weight: 650; }
+#btn-setup { display: none; }
+@media (max-width: 1099px) {
+  #side { position: fixed; top: 0; right: 0; height: 100%; width: min(360px, 100%); z-index: 10;
+    transform: translateX(105%); transition: transform .2s ease; box-shadow: -8px 0 30px rgba(0,0,0,.12); }
+  #side.open { transform: none; }
+  #btn-setup { display: inline-block; }
+}
+.setup-card { text-align: left; max-width: 720px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 14px; padding: 18px 20px; color: var(--ink); }
+.setup-card h2 { margin: 0 0 4px; }
+.setup-card .lead { color: var(--muted); margin-bottom: 14px; }
+.sgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px; }
+.sgrid .wide { grid-column: 1 / -1; }
+.sfield label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+.sfield input, .sfield select, .sfield textarea { width: 100%; font: inherit; font-size: 14px; padding: 6px 9px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--bg); color: var(--ink); }
+.sfield textarea { resize: vertical; min-height: 44px; }
+.sfield .hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.setup-card details { margin-top: 14px; }
+.setup-card details summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 10px; }
+.setup-card .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+.setup-card .err { color: var(--bad); font-size: 13px; }
+.setup-note { border-left: 3px solid var(--accent); padding: 6px 12px; margin: 12px 0; font-size: 13.5px; color: var(--muted); }
+.dev { color: var(--warn); font: 600 11.5px var(--sans); white-space: nowrap; }
+@media (max-width: 600px) { header h1 span { display: none; } .pill { max-width: 32vw; } .sgrid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -125,9 +159,11 @@ aside .content { padding: 14px 16px; overflow-y: auto; }
   <div class="spacer"></div>
   <button id="btn-lib" title="Your tools and flows">Library</button>
   <button id="btn-log" title="Download the full session log (Markdown)">Log</button>
+  <button id="btn-setup" title="Analysis setup">Setup</button>
   <button id="btn-settings">Settings</button>
   <button id="btn-new" title="Start a new conversation">New</button>
 </header>
+<div class="app"><div class="col">
 <main id="scroll"><div id="log"></div></main>
 <div id="working"></div>
 <footer>
@@ -137,6 +173,9 @@ aside .content { padding: 14px 16px; overflow-y: auto; }
     <button class="danger" id="stop" hidden>Stop</button>
   </div>
 </footer>
+</div>
+<div id="side" aria-label="Analysis setup"></div>
+</div>
 
 <aside id="settings">
   <div class="top"><h2>Model settings</h2><button data-close>Close</button></div>
@@ -218,8 +257,78 @@ function md(src) {
 // ---- transcript ----------------------------------------------------------------------
 const nearBottom = () => scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 160;
 function add(node) { const stick = nearBottom(); logEl.appendChild(node); if (stick) scrollEl.scrollTop = scrollEl.scrollHeight; return node; }
+let SETUP = { form: null, current: null, last: null };
+const STUDY_KEYS = ["question", "replicate", "max_q", "min_auc"];
+function setupValue(setup, key) { return setup ? (STUDY_KEYS.includes(key) ? setup.study[key] : setup.params[key]) : undefined; }
+function fieldEl(f, value) {
+  const w = el("div", "sfield" + (f.key === "question" ? " wide" : ""));
+  const id = "sf-" + f.key; let input;
+  if (f.kind === "choice") { input = el("select"); f.choices.forEach((c) => { const o = el("option", "", esc(c)); o.value = c; input.appendChild(o); }); }
+  else if (f.key === "question") { input = el("textarea"); input.rows = 2; input.placeholder = "e.g. Which lipids distinguish the lesion from surrounding white matter?"; }
+  else { input = el("input"); if (f.kind === "float" || f.kind === "int") { input.type = "number"; input.step = f.kind === "int" ? "1" : "any";
+      if (f.lo != null) input.min = f.lo; if (f.hi != null) input.max = f.hi; } }
+  input.id = id; input.dataset.key = f.key; input.dataset.kind = f.kind; input.value = value ?? f.default ?? "";
+  w.innerHTML = `<label for="${id}">${esc(f.label)}</label>`; w.appendChild(input);
+  if (f.help) w.appendChild(el("div", "hint", esc(f.help)));
+  return w;
+}
+function setupCard(onDone, title) {
+  const form = SETUP.form; const base = SETUP.current || SETUP.last;
+  const card = el("div", "setup-card");
+  card.innerHTML = `<h2>${esc(title || "Before we start: analysis setup")}</h2>
+    <div class="lead">These decisions shape every result, so they're fixed up front, written into the log, and applied automatically. You can change them later — changes are recorded.</div>`;
+  const prof = fieldEl({ key: "_profile", label: "Start from profile", kind: "choice", choices: form.profiles.map((p) => p.name),
+    help: "Analysis Profiles are shared with the desktop app." }, base ? base.profile.name : form.profiles[0].name);
+  const ess = el("div", "sgrid"), more = el("div", "sgrid");
+  ess.appendChild(prof);
+  form.fields.forEach((f) => (f.essential ? ess : more).appendChild(fieldEl(f, setupValue(base, f.key))));
+  card.appendChild(ess);
+  const det = el("details"); det.innerHTML = "<summary>More settings</summary>"; det.appendChild(more); card.appendChild(det);
+  prof.querySelector("select").onchange = (e) => {
+    const p = form.profiles.find((x) => x.name === e.target.value); if (!p) return;
+    Object.entries(p.params).forEach(([k, v]) => { const i = card.querySelector(`[data-key="${k}"]`); if (i) i.value = v; }); };
+  const act = el("div", "actions");
+  act.innerHTML = `<button class="primary">${SETUP.current ? "Apply changes" : "Start with these settings"}</button><button>Save as profile…</button><span class="err"></span>`;
+  const [go, save] = act.querySelectorAll("button"), err = act.querySelector(".err");
+  const submit = async (saveAs) => {
+    const values = {}; card.querySelectorAll("[data-key]").forEach((i) => { if (i.dataset.key !== "_profile") values[i.dataset.key] = i.value; });
+    err.textContent = "";
+    try { const r = await api("/api/setup", { profile: prof.querySelector("select").value, values, save_as: saveAs || undefined });
+      SETUP.current = r.setup; SETUP.last = r.setup; if (r.saved_profile) { const f = await api("/api/setup"); SETUP.form = f.form; }
+      renderSide(); onDone && onDone(); } catch (e) { err.textContent = e.message; } };
+  go.onclick = () => submit();
+  save.onclick = () => { const n = prompt("Profile name (an existing name gets a new version):"); if (n) submit(n.trim()); };
+  card.appendChild(act);
+  return card;
+}
+function renderSide() {
+  const side = $("side"), c = SETUP.current;
+  if (!SETUP.form) { side.innerHTML = ""; return; }
+  if (!c) { side.innerHTML = `<h2>Analysis setup</h2><p class="notice">Not set yet — choose it before your first message (the card in the chat). If you skip it, the default profile is recorded as “accepted without review”.</p>`; return; }
+  const ch = new Set(c.changed_from_profile || []);
+  const label = (k) => (SETUP.form.fields.find((f) => f.key === k) || { label: k }).label;
+  let h = `<h2>Analysis setup</h2><div class="kv"><span>Profile</span><span>${esc(c.profile.name)} v${esc(c.profile.version)}</span></div>`;
+  if (c.study.question) h += `<div class="q">“${esc(c.study.question)}”</div>`;
+  h += `<div class="side-group">Study</div>` + ["replicate", "max_q", "min_auc"].map((k) => `<div class="kv"><span>${esc(label(k))}</span><span>${esc(c.study[k])}</span></div>`).join("");
+  h += `<div class="side-group">Method</div>` + Object.entries(c.params).map(([k, v]) => `<div class="kv${ch.has(k) ? " changed" : ""}"><span>${esc(label(k))}</span><span>${esc(v)}</span></div>`).join("");
+  h += `<div style="margin-top:14px"><button id="side-edit">Edit setup</button></div><p class="hint" style="font-size:12px;color:var(--muted)">Highlighted values differ from the profile. Tool calls that use other values are flagged in the chat.</p>`;
+  side.innerHTML = h;
+  $("side-edit").onclick = () => { const host = el("div", "msg"); host.appendChild(setupCard(() => host.remove(), "Change the analysis setup")); add(host);
+    scrollEl.scrollTop = scrollEl.scrollHeight; side.classList.remove("open"); };
+}
+async function loadSetup() {
+  try { SETUP = await api("/api/setup"); } catch (e) { return; }
+  renderSide(); if (logEl.querySelector(".empty")) empty();
+}
 function empty() {
   logEl.innerHTML = "";
+  if (SETUP.form && !SETUP.current) {
+    const host = el("div", "empty setup-host"); host.style.paddingTop = "4vh";
+    host.appendChild(setupCard(() => host.replaceWith(suggestions()))); logEl.appendChild(host); return;
+  }
+  logEl.appendChild(suggestions());
+}
+function suggestions() {
   const e = el("div", "empty", `<h2>What would you like to find out?</h2>
     <div>Describe the analysis in plain language. Every step, figure and tool call is shown here and written to the session log.</div>`);
   const s = el("div", "suggest");
@@ -227,7 +336,7 @@ function empty() {
    "Which lipids best separate the regions on the demo slide?",
    "What can you do, and what are your limits?"].forEach((t) => {
     const b = el("button", "", esc(t)); b.onclick = () => { input.value = t; send(); }; s.appendChild(b); });
-  e.appendChild(s); logEl.appendChild(e);
+  e.appendChild(s); return e;
 }
 function argSummary(args) {
   const parts = Object.entries(args || {}).map(([k, v]) => {
@@ -248,7 +357,19 @@ function handle(ev) {
   const empt = logEl.querySelector(".empty");
   if (empt && ["user", "assistant", "tool_call", "error", "notice"].includes(ev.type)) empt.remove();
   switch (ev.type) {
-    case "reset": tokensIn = tokensOut = 0; Object.keys(tools).forEach((k) => delete tools[k]); empty(); setBusy(false); break;
+    case "reset": tokensIn = tokensOut = 0; Object.keys(tools).forEach((k) => delete tools[k]); SETUP.current = null; empty(); setBusy(false); loadSetup(); break;
+    case "setup": {
+      SETUP.current = { profile: ev.profile, params: ev.params, study: ev.study, changed_from_profile: ev.changed_from_profile }; renderSide();
+      const host = logEl.querySelector(".setup-host"); if (host) host.replaceWith(suggestions());
+      add(el("div", "setup-note", `Analysis setup ${esc(ev.how)} — profile <b>${esc(ev.profile.name)} v${esc(ev.profile.version)}</b>` +
+        (ev.changed_from_profile && ev.changed_from_profile.length ? `, changed: ${esc(ev.changed_from_profile.join(", "))}` : "") +
+        (ev.study.question ? `<br>Question: “${esc(ev.study.question)}”` : ""))); break; }
+    case "setup_applied": add(el("div", "chip", `setup applied to ${esc(ev.ref)}: ` + Object.entries(ev.changes || {}).map(([k, v]) => `${esc(k)} ${esc(v.was)} → ${esc(v.now)}`).join(", "))); break;
+    case "deviation": {
+      const c = tools[ev.call_id]; const txt = ev.deviations.map((d) => `${d.arg} = ${d.used} (setup ${d.setup})`).join("; ");
+      if (c) { const b = el("span", "dev", "⚠ differs from setup"); b.title = txt; c.querySelector(".head").insertBefore(b, c.querySelector(".time"));
+        c.querySelector(".body").insertAdjacentHTML("afterbegin", `<div class="label" style="color:var(--warn)">Deviation from setup</div><pre>${esc(txt)}</pre>`); }
+      break; }
     case "session": modelLabel = `${ev.provider === "local" ? "local" : "Claude"} · ${ev.model}`; header(); break;
     case "usage": tokensIn += ev.input_tokens || 0; tokensOut += ev.output_tokens || 0; header(); break;
     case "status": setBusy(true); $("working").textContent = "Thinking…"; break;
@@ -310,6 +431,7 @@ input.addEventListener("input", autosize);
 input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
 $("send").onclick = send;
 $("stop").onclick = () => api("/api/stop", {});
+$("btn-setup").onclick = () => $("side").classList.toggle("open");
 $("btn-new").onclick = () => api("/api/reset", {}).catch((e) => alert(e.message));
 $("btn-log").onclick = async () => {
   const r = await fetch("/api/log.md", { headers: { "X-SMILE-Token": T } }); if (!r.ok) return alert("No log yet.");
@@ -350,7 +472,7 @@ $("btn-lib").onclick = async () => {
   $("library").classList.add("open");
 };
 if (!T) { logEl.innerHTML = `<div class="error">Open this page from the link <code>smile-msi chat</code> printed in your terminal — it carries the access token.</div>`; }
-else { empty(); connect(); }
+else { empty(); loadSetup().then(connect); }
 </script>
 </body>
 </html>

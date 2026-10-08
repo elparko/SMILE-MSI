@@ -333,9 +333,16 @@ def script_output(result, slide) -> dict:
     """Shape a :class:`~smile_msi.scripting.ScriptResult` into a tool result — logs, values,
     table previews (+ CSV paths), saved images, staged regions. Shared by :func:`run_script`
     and the agent's user-created tools (:mod:`smile_msi.agent.custom`)."""
+    made = [f"{len(x)} {name}" for x, name in ((result.tables or [], "table(s)"),
+                                                (result.images or [], "image(s)"),
+                                                (result.values or {}, "value(s)")) if x]
     out = {
         "ok": bool(result.ok),
-        "summary": result.summary(),
+        # what *this script* produced — not the session's feature count, which it may not
+        # have touched
+        "summary": (result.summary() if result.error
+                    else ", ".join(made) or "ran (no tables, images or values recorded)"),
+        "working_features": len(slide.api.get_features()),
         "logs": list(result.logs)[-80:],
         "values": {k: _round(v) if not hasattr(v, "shape") else f"<array {v.shape}>"
                    for k, v in (result.values or {}).items()},

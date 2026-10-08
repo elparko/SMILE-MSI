@@ -5,6 +5,13 @@ All notable changes to SMILE MSI. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+- **The same ion no longer changes intensity mid-session.** `run_analysis(...)` in scripts (and
+  the MCP / chat tool of the same name) let a registry step extract at its own default window
+  (50 ppm) instead of the session's tolerance, so after e.g. segmentation an ion's values were
+  read from a wider window — a 0.81 → 1.39 jump for the same ion on the demo slide. It now uses
+  the session's tolerance and normalization, as the named wrappers always did.
+
 ### Added
 - **Plain-language analysis chat — `smile-msi chat`.** A browser chat (local server, standard
   library only) where you describe an analysis and a model runs it with the MCP server's tools:
@@ -15,6 +22,13 @@ All notable changes to SMILE MSI. Format loosely follows
   OpenAI-compatible local server (Ollama, LM Studio, llama.cpp, vLLM). The model can create,
   edit and delete its own versioned analysis tools — each such change waits for your approval
   and shows the code — and save analyses as replayable flows.
+- **Analysis setup before the chat starts.** A setup card (then a sidebar) fixes the question,
+  replication unit, q and AUC thresholds and the method settings from an Analysis Profile before
+  any analysis runs. It is logged, applied to the slide, filled into tool calls, and any call that
+  differs is flagged as a deviation; it can be saved as a profile the desktop app can load.
+- **Chat hardening.** Adversarial testing (model-driven and code review) found ways to wedge a
+  conversation, read files outside the data folder, and get misleading "ok" results; all fixed,
+  with a regression test each (see the commit for the list).
 - **Segments coloured by the tree.** Segmentations cut from the granularity tree are coloured
   with Tree Colors (Tennekes & de Jonge 2014) in OKLCh instead of a 12-colour cycling palette:
   sibling segments share a hue family, a segment keeps its hue family as Detail gets finer, and
