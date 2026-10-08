@@ -30,6 +30,7 @@ import threading
 import time
 
 from . import custom, tools
+from . import setup as setup_mod
 from .log import SessionLog
 from .providers import ProviderError, ToolOutput
 
@@ -81,6 +82,28 @@ def system_prompt() -> str:
     return SYSTEM_PROMPT + mcpserver.INSTRUCTIONS
 
 
+class ToolInterrupted(BaseException):
+    """Raised inside a running tool when the user stops or abandons the turn. A
+    BaseException so analysis code (and scripts) that catch ``Exception`` can't swallow it."""
+
+
+def _interrupt_thread(thread_id: int) -> bool:
+    """Raise :class:`ToolInterrupted` in another thread at its next Python instruction (a
+    pure-Python loop stops at once; a long C call stops when it returns)."""
+    import ctypes
+
+    n = ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id),
+                                                   ctypes.py_object(ToolInterrupted))
+    if n > 1:                                   # should never happen: undo, report failure
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(thread_id), None)
+        return False
+    return n == 1
+
+
+#: Seconds a tool gets to finish on its own after Stop before it is interrupted.
+STOP_GRACE_S = 1.5
+
+
 def _failed(result) -> str:
     """The error message of a tool result that reports its own failure, else ``""``."""
     if isinstance(result, dict):
@@ -99,7 +122,7 @@ class Agent:
 
     def __init__(self, provider, *, emit=None, approve=None, log: SessionLog | None = None,
                  registry: tools.Registry | None = None, max_steps: int = 40,
-                 approve_scripts: bool = False):
+                 approve_scripts: bool = False, setup: dict | None = None):
         self.provider = provider
         self.emit = emit or (lambda ev: None)
         self.approve = approve or (lambda req: (False, "no approver connected"))
@@ -111,13 +134,45 @@ class Agent:
         self.max_steps = int(max_steps)
         self._stop = threading.Event()
         self.busy = False
+        self._tool_lock = threading.Lock()
+        self._tool_thread: int | None = None      # thread running a tool right now
         self._tool_sig = self._signature()
         self._dataset_seen = None
+        self.setup: dict | None = None
+        self._model_note = ""                # setup brief/diff prefixed to the next message
         provider.start(system_prompt(), self.registry.api_defs())
         from .. import __version__
 
         self._event("session", provider=provider.name, version=__version__,
                     approve_scripts=bool(approve_scripts), **provider.settings())
+        if setup is not None:
+            self.set_setup(setup)
+
+    # ------------------------------------------------------------------ #
+    def set_setup(self, setup: dict, how: str = "confirmed by the scientist"):
+        """Lock (or change) the analysis setup: log it, apply it to the open slide, and
+        tell the model with the next message."""
+        old = self.setup
+        self.setup = setup
+        self._event("setup", how=how, **setup)
+        if old is None:
+            self._model_note = setup_mod.brief(setup)
+        else:
+            note = setup_mod.diff_brief(old, setup)
+            self._model_note = (self._model_note + "\n\n" + note).strip() if note \
+                else self._model_note
+        self._apply_setup_to_slide()
+
+    def _apply_setup_to_slide(self):
+        from .. import mcpserver
+
+        slide = mcpserver._open.get("slide")
+        if slide is None or self.setup is None:
+            return
+        changes = setup_mod.apply_to_slide(self.setup, slide)
+        if changes:
+            self._event("setup_applied", ref=str(mcpserver._open.get("ref", "")),
+                        changes={k: {"was": a, "now": b} for k, (a, b) in changes.items()})
 
     # ------------------------------------------------------------------ #
     def _event(self, type_: str, **data) -> dict:
@@ -126,16 +181,33 @@ class Agent:
         return rec
 
     def stop(self):
-        """Ask the running turn to stop after the current step."""
+        """Stop the running turn: it ends after the current step, and a tool still running
+        after a short grace period is interrupted (so a runaway script can't keep the
+        process busy)."""
         self._stop.set()
+        with self._tool_lock:
+            running = self._tool_thread
+        if running is not None:
+            def later():
+                with self._tool_lock:
+                    if self._tool_thread == running:
+                        _interrupt_thread(running)
+            t = threading.Timer(STOP_GRACE_S, later)
+            t.daemon = True
+            t.start()
 
     def send(self, text: str):
         """Run one user turn to completion (blocking — call from a worker thread)."""
         self.busy = True
         self._stop.clear()
         try:
+            if self.setup is None:                 # never analyse without a recorded method
+                self.set_setup(setup_mod.resolve(),
+                               how="defaults accepted without review (the setup card was "
+                                   "skipped)")
             self._event("user", text=text)
-            self.provider.add_user(text)
+            note, self._model_note = self._model_note, ""
+            self.provider.add_user(f"{note}\n\n{text}" if note else text)
             for _ in range(self.max_steps):
                 self._sync_tools()
                 self._event("status", state="thinking")
@@ -231,16 +303,36 @@ class Agent:
                 if not ok:
                     return fail("the scientist rejected this" + (f": {note}" if note else "")
                                 + ". Ask what they would like instead.")
-            result = spec.fn(**call.args)
+            args, deviations = (setup_mod.fill_defaults(self.setup, call.name, call.args)
+                                if self.setup else (call.args, []))
+            if deviations:
+                self._event("deviation", call_id=call.id, name=call.name,
+                            deviations=deviations)
+            with self._tool_lock:
+                self._tool_thread = threading.get_ident()
+            try:
+                result = spec.fn(**args)
+            finally:
+                with self._tool_lock:
+                    self._tool_thread = None
             rendered = tools.render(result)
             err = _failed(result)
+            flow_steps = None
+            if call.name == "run_flow" and isinstance(result, dict):   # for the Reproduce list
+                flow_steps = [{"tool": st["tool"], "args": st.get("args", {})}
+                              for st in result.get("steps", []) if st.get("ok")]
             self._event("tool_result", call_id=call.id, name=call.name, ok=not err,
                         error=err or None, text=rendered.text, images=rendered.images,
-                        files=rendered.files, duration_s=time.perf_counter() - t0)
+                        files=rendered.files, duration_s=time.perf_counter() - t0,
+                        effective_args=args if args != call.args else None,
+                        flow_steps=flow_steps)
             self._check_dataset()
             return ToolOutput(call.id, rendered.text, images=rendered.images, is_error=bool(err))
         except KeyboardInterrupt:
             raise
+        except ToolInterrupted:
+            self._check_dataset()
+            return fail("interrupted — the scientist stopped this tool")
         except BaseException as exc:  # noqa: BLE001 — incl. SystemExit from user scripts
             msg = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             self._check_dataset()
@@ -266,6 +358,7 @@ class Agent:
         if slide is None or slide is self._dataset_seen:
             return
         self._dataset_seen = slide
+        self._apply_setup_to_slide()
         try:
             fp = library.dataset_fingerprint(slide.ds)
         except Exception:  # noqa: BLE001 — a fingerprint is provenance, not a blocker

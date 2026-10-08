@@ -25,6 +25,8 @@ Endpoints (all but ``/`` need the token, ``?t=`` or the ``X-SMILE-Token`` header
                             running in the background until it returns; nothing it does
                             reaches the new conversation)
     GET  /api/library       user-created tools and saved flows
+    GET  /api/setup         the analysis-setup form, profiles, and the current/last setup
+    POST /api/setup         {"profile", "values", "save_as"?}  lock or change the setup
     GET  /api/file?p=…      an image/CSV the session produced (only those)
     GET  /api/log.md        the session log as Markdown; /api/log.jsonl raw
 """
@@ -61,6 +63,7 @@ class ChatState:
         self.agent: Agent | None = None
         self.config_error = ""
         self.generation = 0
+        self.last_setup: dict | None = None      # pre-fills the next conversation's card
         self.new_conversation()
 
     # ------------------------------------------------------------------ #
@@ -204,6 +207,14 @@ def make_handler(state: ChatState, token: str, port: int):
                 return self._send(HTTPStatus.OK, state.public_config())
             if url.path == "/api/library":
                 return self._library()
+            if url.path == "/api/setup":
+                from . import setup as setup_mod
+
+                agent = state.agent
+                return self._send(HTTPStatus.OK, {
+                    "form": setup_mod.form(),
+                    "current": agent.setup if agent else None,
+                    "last": state.last_setup})
             if url.path == "/api/file":
                 from .tools import shareable
 
@@ -268,6 +279,27 @@ def make_handler(state: ChatState, token: str, port: int):
                 state.config.update(new)
                 state.new_conversation()
                 return self._send(HTTPStatus.OK, state.public_config())
+            if url.path == "/api/setup":
+                from . import setup as setup_mod
+
+                if agent is None:
+                    return self._deny(HTTPStatus.CONFLICT,
+                                      state.config_error or "set up a model first")
+                if agent.busy:
+                    return self._deny(HTTPStatus.CONFLICT,
+                                      "wait for the current turn (or Stop) before changing "
+                                      "the setup")
+                values = body.get("values") if isinstance(body.get("values"), dict) else {}
+                try:
+                    new = setup_mod.resolve(values, str(body.get("profile") or ""))
+                    saved = (setup_mod.save_as_profile(new, str(body["save_as"]))
+                             if body.get("save_as") else None)
+                except (ValueError, OSError, KeyError) as exc:
+                    return self._deny(HTTPStatus.BAD_REQUEST, str(exc))
+                agent.set_setup(new, how="changed by the scientist" if agent.setup
+                                else "confirmed by the scientist")
+                state.last_setup = new
+                return self._send(HTTPStatus.OK, {"setup": new, "saved_profile": saved})
             if url.path == "/api/reset":
                 state.new_conversation()
                 return self._send(HTTPStatus.OK, {"ok": True})
