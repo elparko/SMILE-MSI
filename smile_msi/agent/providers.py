@@ -231,6 +231,39 @@ class AnthropicProvider:
                            "content": content, "is_error": bool(o.is_error)})
         self.messages.append({"role": "user", "content": blocks})
 
+    def complete(self, system: str, text: str) -> str:
+        """One stand-alone model call — no tools, and the conversation history is neither
+        read nor changed. Used for the reviewer."""
+        a = self._anthropic
+        try:
+            resp = self.client.messages.create(
+                model=self.model, max_tokens=16000, system=system,
+                messages=[{"role": "user", "content": text}],
+                thinking={"type": "adaptive"}, output_config={"effort": self.effort})
+        except TypeError as exc:                 # the SDK found no API key / token / profile
+            if "auth" in str(exc).lower():
+                raise ProviderError("No Claude credentials found — paste an API key in "
+                                    "Settings, set ANTHROPIC_API_KEY, or run "
+                                    "`ant auth login`.") from exc
+            raise
+        except a.AuthenticationError as exc:
+            raise ProviderError("Claude rejected the API key — check it in Settings.") from exc
+        except a.PermissionDeniedError as exc:
+            raise ProviderError(f"This key can't use {self.model}: {exc.message}") from exc
+        except a.NotFoundError as exc:
+            raise ProviderError(f"Unknown model {self.model!r}: {exc.message}") from exc
+        except a.RateLimitError as exc:
+            raise ProviderError("Rate limited by the API — wait a moment and retry.") from exc
+        except a.BadRequestError as exc:
+            raise ProviderError(f"Claude rejected the request: {exc.message}") from exc
+        except a.APIStatusError as exc:
+            raise ProviderError(f"Claude API error {exc.status_code}: {exc.message}") from exc
+        except a.APIConnectionError as exc:
+            raise ProviderError("Can't reach the Claude API — check the network.") from exc
+        if resp.stop_reason == "refusal":
+            return "(The model declined to write this review.)"
+        return "\n\n".join(b.text for b in resp.content if b.type == "text")
+
 
 # --------------------------------------------------------------------------- #
 # local / OpenAI-compatible
@@ -288,6 +321,18 @@ class OpenAICompatProvider:
         except urllib.error.URLError as exc:
             raise ProviderError(f"Can't reach {self.base_url} — is the model server running? "
                                 f"({exc.reason})") from exc
+
+    def complete(self, system: str, text: str) -> str:
+        """One stand-alone call without tools; the conversation history is untouched."""
+        data = self._post({"model": self.model,
+                           "messages": [{"role": "system", "content": system},
+                                        {"role": "user", "content": text}]})
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ProviderError(f"Unexpected reply from the model server: {str(data)[:300]}") \
+                from exc
+        return content if isinstance(content, str) else ""
 
     def step(self) -> Step:
         data = self._post({"model": self.model, "messages": self.messages,
