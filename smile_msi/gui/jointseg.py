@@ -389,7 +389,7 @@ class CohortSegMixin:
         names = list(self._jseg_names)
         panels = [(names[i] if i < len(names) else f"Slide {i + 1}", seg.label_image)
                   for i, seg in enumerate(segs)]
-        colors = {cl: PALETTE[cl % len(PALETTE)] for cl in range(self._jseg_k)}
+        colors = {cl: self._jseg_color(cl) for cl in range(self._jseg_k)}
 
         def render(opts):
             # one scale bar per slide panel (slides can differ in pixel size)
@@ -410,10 +410,17 @@ class CohortSegMixin:
                            default_name="joint_segmentation.png",
                            title="Export segmentation").exec()
 
+    def _jseg_color(self, cl):
+        """Shared colour of joint cluster ``cl`` — tree-aware (siblings share a hue family)
+        from the first slide's cut, else the cycling palette."""
+        segs = getattr(self, "_jseg_segs", None) or []
+        cols = getattr(segs[0], "colors", None) if segs else None
+        return cols[cl] if cols and cl < len(cols) else PALETTE[cl % len(PALETTE)]
+
     @staticmethod
     def _jseg_rgba(seg):
-        """Paint a segmentation onto an (h,w,4) image: each cluster its palette colour,
-        off-tissue (label_image NaN) transparent."""
+        """Paint a segmentation onto an (h,w,4) image: each cluster its (tree-aware)
+        colour, off-tissue (label_image NaN) transparent."""
         lab = seg.label_image
         h, wd = lab.shape
         rgba = np.zeros((h, wd, 4), dtype=np.ubyte)
@@ -421,14 +428,15 @@ class CohortSegMixin:
             mask = lab == cl
             if not mask.any():
                 continue
-            col = QtGui.QColor(PALETTE[cl % len(PALETTE)])
+            cols = getattr(seg, "colors", None)
+            col = QtGui.QColor(cols[cl] if cols and cl < len(cols) else PALETTE[cl % len(PALETTE)])
             rgba[mask] = [col.red(), col.green(), col.blue(), 255]
         return rgba
 
     def _jseg_update_legend(self, k):
         chips = []
         for cl in range(min(k, 16)):
-            col = PALETTE[cl % len(PALETTE)]
+            col = self._jseg_color(cl)
             chips.append(f'<span style="background:{col}">&nbsp;&nbsp;&nbsp;</span>&nbsp;{cl}')
         note = f"  (+{k - 16} more)" if k > 16 else ""
         self.jseg_legend.setText(" &nbsp; ".join(chips)

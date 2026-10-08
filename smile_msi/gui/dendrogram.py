@@ -370,6 +370,7 @@ class DendrogramView(QtWidgets.QWidget):
         # each collapsed block sits wholly in one segment (k ≤ P), so a representative
         # micro fixes the block's segment id.
         block_seg = {g: int(relab[m]) for g, m in self._group_rep.items()}
+        seg_hex = spatial.segment_colors(self._hier, k)   # tree-aware, == the seg map's colours
 
         node_seg = {}                 # shown node id → its segment, or -1 if it spans two
         segs = {}                     # colour hex → [xs, ys] with NaN gaps between U-links
@@ -382,7 +383,8 @@ class DendrogramView(QtWidgets.QWidget):
             ca, cb = kids
             seg = ca if (ca == cb and ca >= 0) else -1
             node_seg[int(self._link_node[idx])] = seg
-            color = GUIDE_LINE if seg < 0 else PALETTE[seg % len(PALETTE)]
+            color = (GUIDE_LINE if seg < 0 else seg_hex[seg] if seg < len(seg_hex)
+                     else PALETTE[seg % len(PALETTE)])
             xs, ys = segs.setdefault(color, ([], []))
             lx, ly = self._link_x[idx], self._link_y[idx]
             xs += [lx[0], lx[1], lx[2], lx[3], np.nan]

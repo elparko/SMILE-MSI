@@ -1791,8 +1791,10 @@ class ExportMixin:
                     colors[int(cl)] = r["color"]
                 legend.append((r["color"], r["name"]))
             return colors, legend
-        colors = {cl: PALETTE[cl % len(PALETTE)] for cl in range(n)}
-        legend = [(PALETTE[cl % len(PALETTE)], f"cluster {cl}") for cl in range(min(n, 16))]
+        tree = getattr(self.seg, "colors", None) or []   # tree-aware colours when cut from a tree
+        colors = {cl: (tree[cl] if cl < len(tree) else PALETTE[cl % len(PALETTE)])
+                  for cl in range(n)}
+        legend = [(colors[cl], f"cluster {cl}") for cl in range(min(n, 16))]
         return colors, legend
 
     # ----- the book -------------------------------------------------------- #
