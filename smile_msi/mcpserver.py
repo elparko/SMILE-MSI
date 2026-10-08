@@ -326,7 +326,13 @@ def run_script(code: str) -> dict:
     from . import scripting
 
     slide = _slide()
-    result = scripting.run_script(code, slide.api)
+    return script_output(scripting.run_script(code, slide.api), slide)
+
+
+def script_output(result, slide) -> dict:
+    """Shape a :class:`~smile_msi.scripting.ScriptResult` into a tool result — logs, values,
+    table previews (+ CSV paths), saved images, staged regions. Shared by :func:`run_script`
+    and the agent's user-created tools (:mod:`smile_msi.agent.custom`)."""
     out = {
         "ok": bool(result.ok),
         "summary": result.summary(),
